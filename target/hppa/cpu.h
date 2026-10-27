@@ -281,6 +281,7 @@ typedef struct CPUArchState {
      */
     QemuSpin tlb_lock;
 
+    target_ulong cpu_hpa;      /* HPA of this CPU */
     target_ulong kernel_entry; /* Linux kernel was loaded here */
     target_ulong cmdline_or_bootorder;
     target_ulong initrd_base, initrd_end;
