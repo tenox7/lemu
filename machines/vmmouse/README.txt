@@ -24,16 +24,17 @@ Which file
 ----------
 vmmouse-binaries.zip holds one installer per CPU:
     vmmouse-i386.exe    Intel     NT 3.1, 3.5, 3.51, 4.0
-    vmmouse-mips.exe    MIPS      NT 4.0  (Magnum/Jazz, RM200)
-    vmmouse-alpha.exe   Alpha     NT 4.0  (Jensen)
+    vmmouse-mips.exe    MIPS      NT 3.1, 3.5, 3.51, 4.0  (Magnum/Jazz, RM200)
+    vmmouse-alpha.exe   Alpha     NT 3.1, 3.5, 3.51, 4.0  (Jensen)
     vmmouse-ppc.exe     PowerPC   NT 4.0  (40P)
 
 Unzip it on the host: NT has no unzip. Each .exe carries the driver
 inside itself, so the one for your CPU is all you need to copy to a
 guest. The mouse icon on the window is just so you can tell it apart.
 
-The MIPS, Alpha and PowerPC ones are built with NT 4.0 compilers.
-They are not tested on NT 3.1 and may not run there.
+The Intel, MIPS and Alpha ones are built with the Windows NT 3.1 SDK,
+so they run on NT 3.1, 3.5, 3.51 and 4.0. The PowerPC one is built
+with Visual C++ 4.1 and needs NT 4.0.
 
 
 Install
@@ -94,17 +95,18 @@ If Windows NT does not start
 Tested (November 2026, LEMU)
 ----------------------------
 - NT 3.1 SP3, Intel:          pointer, clicks. The wheel does nothing.
+- NT 3.1, MIPS Magnum (Jazz): pointer, clicks. The wheel does nothing.
+- NT 3.1, Alpha Jensen:       pointer, clicks. The wheel does nothing.
 - NT 4.0 SP6, Intel:          pointer, clicks, wheel.
 - NT 4.0, MIPS RM200:         pointer, wheel.
-- NT 4.0, MIPS Magnum (Jazz): pointer, wheel.
+- NT 4.0, MIPS Magnum (Jazz): pointer, clicks, wheel.
 - NT 4.0, Alpha Jensen:       pointer, wheel.
 - NT 4.0, PowerPC 40P:        pointer, clicks, keyboard, wheel.
 The wheel test: 5 notches in Notepad scroll exactly 15 lines (NT 4.0
 scrolls 3 lines a notch), then 5 notches back to the top.
 On Intel with no backdoor (QEMU -machine vmport=off, like a real PC)
 the driver does not start, and the normal mouse works.
-Not tested yet: NT 3.5, NT 3.51, NT 3.1 on MIPS or Alpha, the Pica 61,
-VMware, real PCs.
+Not tested yet: NT 3.5, NT 3.51, the Pica 61, VMware, real PCs.
 
 
 Other CPUs (MIPS, Alpha, PowerPC)
@@ -135,8 +137,19 @@ Build on that NT machine: its compiler only runs there. Each CPU has a
 folder of batch files. They expect this folder on the guest as
 T:\NTOS\vmmouse, for example on a share mapped with
     net use T: \\<host>\<share>
+NT 3.1 needs the host's name there, not its IP address: put the name
+in the guest's LMHOSTS file with #PRE.
 For another place, change T:\NTOS\vmmouse in the batch files.
-Then run, in this order:
+
+MIPS and Alpha, with the Windows NT 3.1 SDK on NT 3.1. This is how the
+zip's MIPS and Alpha installers are made. Run:
+    T:\NTOS\vmmouse\mipsbuild\build31.bat    on NT 3.1 for MIPS
+    T:\NTOS\vmmouse\alphabuild\build31.bat   on NT 3.1 for Alpha
+Each makes vmmouse.sys and vmmsetup.exe (driver inside), in
+D:\TEMP\vmb31 or D:\TEMP\vmb31axp.
+
+Visual C++ 4 on NT 4.0: PowerPC, or MIPS and Alpha for NT 4.0 only.
+Run, in this order:
     T:\NTOS\vmmouse\<folder>\build.bat   makes vmmouse.sys
     T:\NTOS\vmmouse\<folder>\setup.bat   makes vmmsetup.exe, driver inside
     T:\NTOS\vmmouse\<folder>\inst.bat    installs it, no window
@@ -151,6 +164,17 @@ has no compiler of its own.
 The .def files make the ntoskrnl import library (and the hal one on
 Alpha). On MIPS and PowerPC, READ/WRITE_REGISTER_ULONG are macros in
 the DDK, not exports, so mips-reg.c and ppc-reg.c supply them.
+
+Two NT 3.1 SDK lessons:
+- Its MIPS and Alpha compilers call memcpy and memset instead of
+  inlining them (ntmini.h's RtlCopyMemory and RtlZeroMemory), and the
+  Alpha one also calls OtsMove. The NT 3.1 kernel exports none of
+  them, so build31.bat links libc.lib into the driver. On MIPS, libc's
+  memcpy and memset call RtlMoveMemory and RtlFillMemory, so
+  mipsbuild\ntoskrnl.def lists those too.
+- NT 3.1's SET refuses a value with an equals sign in it ("The syntax
+  of the command is incorrect"), so build31.bat writes the -D flags
+  out on each command line.
 
 
 Files

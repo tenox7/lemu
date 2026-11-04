@@ -22,3 +22,5 @@ EXPORTS
     RtlWriteRegistryValue
     MmMapIoSpace
     MmUnmapIoSpace
+    RtlFillMemory
+    RtlMoveMemory
