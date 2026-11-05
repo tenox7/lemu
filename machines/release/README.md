@@ -12,7 +12,7 @@ compiles the same code 15 times, with slightly different features.
 | qemu-system-ppc | aix325rs6000 | `../7006/release/mkrelease.sh` |
 | qemu-system-ppc64 | aix53pseries, aix61pseries, aix71pseries, aix72pseries | `../pseries/release/mkrelease.sh` |
 | qemu-system-alpha | nt31axp, nt40axp | `../jensen/release/pack.sh` |
-| qemu-system-mips64el | nt31mips, nt4-rm200, nt4-rm200-smp, nt4srv-rm300-smp4 | `../rm200/release/pack.sh` |
+| qemu-system-mips64el | nt31mips, nt4-jazz, nt4-rm200, nt4-rm200-smp, nt4srv-rm300-smp4 | `../rm200/release/pack.sh` |
 | qemu-system-mips64 | sinixn545 | `../rm200/release/pack.sh` |
 
 Run them on an Apple Silicon Mac with Homebrew and Docker. The Linux and

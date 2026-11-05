@@ -16,6 +16,7 @@ done
 kit=$(cd "$1" && pwd)
 case $(basename "$kit") in
 nt31mips-qemu) g=jazz/nt31 ;;
+nt4-jazz-qemu) g=jazz/nt40 ;;
 NTRM200) g=rm200/nt40 ;;
 NTRM200-SMP) g=rm200/nt40smp ;;
 NTRM300-SMP4) g=rm200/nt40srv ;;

@@ -2,11 +2,12 @@
 
 Scripts that build the portable QEMU for the MIPS kits on macOS, Linux and
 Windows, check that nothing is missing, and pack the kits. One build serves
-all five kits:
+all six kits:
 
 | Kit | Binary | Machine | Run scripts |
 |---|---|---|---|
 | nt31mips-qemu | qemu-system-mips64el | magnum (NT 3.1) | `machines/jazz/nt31` |
+| nt4-jazz-qemu | qemu-system-mips64el | magnum (NT 4.0) | `machines/jazz/nt40` |
 | nt4-rm200-qemu | qemu-system-mips64el | sni-rm200 (NT 4.0) | `machines/rm200/nt40` |
 | nt4-rm200-smp-qemu | qemu-system-mips64el | sni-rm300, 2 CPUs (NT 4.0) | `machines/rm200/nt40smp` |
 | nt4srv-rm300-smp4-qemu | qemu-system-mips64el | sni-rm300, 4 CPUs (NT 4.0 Server) | `machines/rm200/nt40srv` |
