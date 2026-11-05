@@ -739,10 +739,16 @@ void ics_set_irq_type(ICSState *ics, int srcno, bool lsi)
     ics->irqs[srcno].flags |=
         lsi ? XICS_FLAGS_IRQ_LSI : XICS_FLAGS_IRQ_MSI;
 
+    /*
+     * A source starts masked when it is claimed, as after a reset. A
+     * source that was freed has priority 0, which is not masked, and AIX
+     * checks that a new MSI is masked before it enables it.
+     */
+    ics_reset_irq(ics->irqs + srcno);
+
     if (kvm_irqchip_in_kernel()) {
         Error *local_err = NULL;
 
-        ics_reset_irq(ics->irqs + srcno);
         ics_set_kvm_state_one(ics, srcno, &local_err);
         if (local_err) {
             error_report_err(local_err);
