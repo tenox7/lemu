@@ -14,6 +14,7 @@ compiles the same code 15 times, with slightly different features.
 | qemu-system-alpha | nt31axp, nt40axp | `../jensen/release/pack.sh` |
 | qemu-system-mips64el | nt31mips, nt4-jazz, nt4-rm200, nt4-rm200-smp, nt4srv-rm300-smp4 | `../rm200/release/pack.sh` |
 | qemu-system-mips64 | sinixn545 | `../rm200/release/pack.sh` |
+| qemu-system-hppa | hpux1020b160l | `../hppa/release/mkrelease.sh` |
 
 Run them on an Apple Silicon Mac with Homebrew and Docker. The Linux and
 Windows builds run in Docker.
@@ -64,6 +65,7 @@ these folders in place of their own build, for example:
     sh ../pseries/release/mkrelease.sh aix53 VMDIR STAGE/ppc64 aix53pseries-qemu.tar.lz
     sh ../jensen/release/pack.sh nt40 SRCDIR STAGE/alpha nt40axp-qemu.tar.lz
     sh ../rm200/release/pack.sh KITDIR qemu-system-mips64el STAGE/mips nt4-rm200-qemu.tar.lz
+    sh ../hppa/release/mkrelease.sh hpux1020 VMDIR STAGE/hppa hpux1020b160l-qemu.tar.lz
 
 - `VMDIR`, `SRCDIR` and `KITDIR` hold the guest files: disk, NVRAM and
   firmware. See each machine's notes.
