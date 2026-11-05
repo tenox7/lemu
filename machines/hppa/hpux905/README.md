@@ -54,7 +54,14 @@ came from QEMU's "hppa-715-2" series (Helge Deller, Keith Monahan).
 - **Artist.** A write to one of the 16 VRAM buffers that the model does not have aborted
   QEMU (HP PEX Drive does it); it is ignored now and logged with `-d unimp`.
 - **FPU.** The trap for a disabled FPU is taken only while PSW.Q is set, as HP-UX 10.20
-  starts its other CPUs with the FPU off and Q = 0.
+  starts its other CPUs with the FPU off and Q = 0. `fmpyadd` and `fmpysub` read both operand
+  sets before they write either result: the HP compiler lets the add take the register that
+  the multiply writes, and wants the old value.
+- **Artist colour maps.** The X server gives a window with its own colour map (an 8 bit
+  TrueColor window, as the Battalion game opens) a second bank of 256 colours at 0x800 of
+  the colour map memory, and tags the pixels with a window id through the control plane.
+  The display now looks such pixels up in the second bank. Before, those windows had wrong
+  colours and vertical streaks.
 
 ## Notes
 
