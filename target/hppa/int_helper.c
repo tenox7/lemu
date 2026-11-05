@@ -46,7 +46,7 @@ static uint64_t io_eir_read(void *opaque, hwaddr addr, unsigned size)
     HPPACPU *cpu = opaque;
 
     /* ??? What does a read of this register over the GSC bus do?  */
-    return cpu->env.cr[CR_EIRR];
+    return qatomic_read(&cpu->env.cr[CR_EIRR]);
 }
 
 static void io_eir_write(void *opaque, hwaddr addr,
@@ -63,7 +63,11 @@ static void io_eir_write(void *opaque, hwaddr addr,
     }
     le_bit = ~data & widthm1;
 
-    env->cr[CR_EIRR] |= 1ull << le_bit;
+    /*
+     * The target CPU may be clearing bits of EIRR at the same time, from its
+     * own thread and without the BQL: see HELPER(write_eirr).
+     */
+    qatomic_or(&env->cr[CR_EIRR], 1ull << le_bit);
     eval_interrupt(cpu);
 }
 
@@ -84,7 +88,11 @@ void hppa_cpu_alarm_timer(void *opaque)
 
 void HELPER(write_eirr)(CPUHPPAState *env, target_ulong val)
 {
-    env->cr[CR_EIRR] &= ~val;
+    /*
+     * Another CPU can send an IPI, and a device can raise an interrupt, while
+     * this CPU runs the guest. A plain read-modify-write here could lose it.
+     */
+    qatomic_and(&env->cr[CR_EIRR], ~val);
     bql_lock();
     eval_interrupt(env_archcpu(env));
     bql_unlock();
