@@ -156,7 +156,7 @@ config ATI_VGA
 config S3_VGA
     bool
     default y if PCI_DEVICES
-    depends on PCI
+    depends on PCI && ISA_BUS
     select VGA
     select BITBANG_I2C
     select DDC
