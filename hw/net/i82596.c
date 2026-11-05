@@ -555,6 +555,22 @@ static int i82596_tx_copy_buffers(I82596State *s, hwaddr tfd_addr,
         total_len = frame_len;
 
     } else {
+        /*
+         * In flexible mode the first TCB byte count bytes of the frame sit in
+         * the TCB itself, after its 16 byte header, and the buffers of the TBD
+         * chain follow them. HP-UX 9 keeps the Ethernet header there.
+         */
+        uint16_t inline_len = desc->tcb_count & SIZE_MASK;
+
+        if (inline_len > sizeof(s->tx_buffer)) {
+            return -1;
+        }
+        if (inline_len) {
+            address_space_read(s->dma_as, tfd_addr + 16,
+                              MEMTXATTRS_UNSPECIFIED, s->tx_buffer, inline_len);
+            total_len = inline_len;
+        }
+
         tbd_addr = desc->tbd_addr;
         while (tbd_addr != I596_NULL && tbd_addr != 0) {
             uint16_t buf_size;
@@ -597,8 +613,18 @@ static int i82596_tx_process_frame(I82596State *s, bool insert_crc)
         return 0;
     }
 
-    if (I596_NO_SRC_ADD_IN == 0 && total_len >= ETH_ALEN * 2) {
+    if (I596_NO_SRC_ADD_IN == 0 && total_len >= ETH_ALEN) {
+        /*
+         * The chip inserts its individual address after the destination
+         * address: the frame the driver supplies has no source address.
+         */
+        if (total_len + ETH_ALEN > sizeof(s->tx_buffer)) {
+            return 0;
+        }
+        memmove(&s->tx_buffer[ETH_ALEN * 2], &s->tx_buffer[ETH_ALEN],
+                total_len - ETH_ALEN);
         memcpy(&s->tx_buffer[ETH_ALEN], s->conf.macaddr.a, ETH_ALEN);
+        total_len += ETH_ALEN;
     }
 
     if (I596_PADDING && total_len < I596_MIN_FRAME_LEN) {
@@ -1745,9 +1771,15 @@ skip_status_update:
 
         bool stop = false;
 
+        /*
+         * A CU that leaves the active state sets CNA and asserts INT, even
+         * when the command that ended the list had no I bit: HP-UX 9 sends
+         * its frames as a single EL command and waits for this interrupt.
+         */
         if (cmd & CMD_SUSP) {
             s->cu_status = CU_SUSPENDED;
             s->scb_status |= SCB_STATUS_CNA;
+            s->send_irq = 1;
             stop = true;
         }
 
@@ -1755,6 +1787,7 @@ skip_status_update:
             s->cmd_p = I596_NULL;
             s->cu_status = CU_IDLE;
             s->scb_status |= SCB_STATUS_CNA;
+            s->send_irq = 1;
             stop = true;
         } else if (!stop) {
             if (next_addr == 0 || next_addr == I596_NULL ||
@@ -1762,6 +1795,7 @@ skip_status_update:
                 s->cmd_p = I596_NULL;
                 s->cu_status = CU_IDLE;
                 s->scb_status |= SCB_STATUS_CNA;
+                s->send_irq = 1;
                 stop = true;
             } else {
                 s->cmd_p = next_addr;
@@ -1988,6 +2022,9 @@ static void signal_ca(I82596State *s)
     if (s->send_irq) {
         s->send_irq = 0;
         qemu_set_irq(s->irq, 1);
+    } else if (!(s->scb_status & SCB_ACK_MASK)) {
+        /* The driver acknowledged every interrupt status bit: INT goes low */
+        qemu_set_irq(s->irq, 0);
     }
 }
 
