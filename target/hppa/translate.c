@@ -4857,10 +4857,12 @@ static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env)
  * counter to the end of the counting loop, as offsets from the first one.
  * Nothing is masked: another build of the server is left alone.
  */
-static const struct {
+typedef struct {
     int16_t off;
     uint32_t insn;
-} hpux_x11_calibrate[] = {
+} HpuxInsnWord;
+
+static const HpuxInsnWord hpux_x11_calibrate[] = {
     { 0x00, 0x6bc03f99 },       /* stw   r0,-34(sp)           count = 0 */
     { 0x04, 0x4bd73f99 },       /* ldw   -34(sp),r23 */
     { 0x08, 0x88f74030 },       /* cmpb,>>= r23,r7,done */
@@ -4873,19 +4875,32 @@ static const struct {
 };
 
 /*
+ * The X server of HP-UX 9.05 (X11R5, built in 1995) does the same count in
+ * a loop of two insns that keeps the counter in r31, with the bound 200000
+ * in r7.
+ */
+static const HpuxInsnWord hpux9_x11_calibrate[] = {
+    { 0x00, 0x0800025f },       /* copy  r0,r31               count = 0 */
+    { 0x04, 0x37ff0002 },       /* ldo   1(r31),r31           count++ */
+    { 0x08, 0x8be77ff7 },       /* cmpb,>,n r7,r31,loop */
+    { 0x0c, 0x37ff0002 },       /* ldo   1(r31),r31 */
+};
+
+/*
  * At the first insn of a TB: if it starts that counting, let
  * helper_hpux_x11_pace() make the round last long enough to count.
  */
-static void gen_hpux_x11_pace(DisasContext *ctx, CPUHPPAState *env)
+static void gen_hpux_x11_pace(DisasContext *ctx, CPUHPPAState *env,
+                              const HpuxInsnWord *words, int n)
 {
     vaddr pc = ctx->base.pc_next;
 
-    for (int i = 0; i < ARRAY_SIZE(hpux_x11_calibrate); i++) {
-        vaddr addr = pc + hpux_x11_calibrate[i].off;
+    for (int i = 0; i < n; i++) {
+        vaddr addr = pc + words[i].off;
 
         if (!translator_is_same_page(&ctx->base, addr) ||
             translator_ldl_end(env, &ctx->base, addr, mo_endian(ctx))
-            != hpux_x11_calibrate[i].insn) {
+            != words[i].insn) {
             return;
         }
     }
@@ -5010,9 +5025,14 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
             && ctx->iaq_b.disp == ctx->iaq_f.disp + 4) {
             gen_hpux_idle(ctx, env);
         }
-        if (ctx->hpux_x11_pace && ctx->base.num_insns == 1
-            && insn == hpux_x11_calibrate[0].insn) {
-            gen_hpux_x11_pace(ctx, env);
+        if (ctx->hpux_x11_pace && ctx->base.num_insns == 1) {
+            if (insn == hpux_x11_calibrate[0].insn) {
+                gen_hpux_x11_pace(ctx, env, hpux_x11_calibrate,
+                                  ARRAY_SIZE(hpux_x11_calibrate));
+            } else if (insn == hpux9_x11_calibrate[0].insn) {
+                gen_hpux_x11_pace(ctx, env, hpux9_x11_calibrate,
+                                  ARRAY_SIZE(hpux9_x11_calibrate));
+            }
         }
 #endif
 
