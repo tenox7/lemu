@@ -209,6 +209,8 @@ struct NCR710State {
     uint8_t current_lun;
     uint8_t reselection_id;
     bool wait_reselect;
+    uint32_t wait_alt;   /* alternate address of the WAIT RESELECT in progress */
+    bool script_halted;  /* stopped by an interrupt, only a DSP write restarts it */
 };
 
 typedef struct SysBusNCR710State {

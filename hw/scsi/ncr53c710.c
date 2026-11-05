@@ -332,6 +332,7 @@ void ncr710_soft_reset(NCR710State *s)
     s->msg_len = 0;
     s->waiting = NCR710_WAIT_NONE;
     s->wait_reselect = false;
+    s->script_halted = false;
     s->reselection_id = 0;
     s->dsa = 0;
     s->dnad = 0;
@@ -623,6 +624,7 @@ static void ncr710_script_scsi_interrupt(NCR710State *s, int stat0)
     mask0 = stat0 & s->sien0;
     if (mask0) {
         ncr710_stop_script(s);
+        s->script_halted = true;
         s->istat |= NCR710_ISTAT_SIP;
         ncr710_update_irq(s);
     }
@@ -639,6 +641,7 @@ static void ncr710_script_dma_interrupt(NCR710State *s, int stat)
     s->istat |= NCR710_ISTAT_DIP;
     ncr710_update_irq(s);
     ncr710_stop_script(s);
+    s->script_halted = true;
 }
 
 inline void ncr710_set_phase(NCR710State *s, int phase)
@@ -810,7 +813,8 @@ void ncr710_command_complete(SCSIRequest *req, size_t resid)
         scsi_req_unref(req);
     }
 
-    if (s->waiting == NCR710_WAIT_RESELECT || s->waiting == NCR710_WAIT_DMA) {
+    if ((s->waiting == NCR710_WAIT_RESELECT ||
+         s->waiting == NCR710_WAIT_DMA) && !s->script_halted) {
         s->waiting = NCR710_WAIT_NONE;
         ncr710_execute_script(s);
     }
@@ -889,7 +893,7 @@ void ncr710_transfer_data(SCSIRequest *req, uint32_t len)
         ncr710_update_irq(s);
         return;
     }
-    if (!s->script_active && !s->waiting) {
+    if (!s->script_active && !s->waiting && !s->script_halted) {
         ncr710_execute_script(s);
     }
 }
@@ -1320,6 +1324,8 @@ void ncr710_execute_script(NCR710State *s)
     uint32_t addr;
     int opcode;
     s->script_active = 1;
+    /* The script runs again, so it is no longer parked in WAIT RESELECT */
+    s->wait_reselect = false;
 
 again:
     insn = ncr710_read_dword(s, s->dsp);
@@ -1481,7 +1487,11 @@ again:
                 }
                 break;
             case 2: /* Wait Reselect */
-                if (!ncr710_irq_on_rsl(s)) {
+                if (s->istat & NCR710_ISTAT_SIGP) {
+                    /* The CPU signalled the SCRIPTS: take the alternate address */
+                    s->dsp = addr;
+                } else if (!ncr710_irq_on_rsl(s)) {
+                    s->wait_alt = addr;
                     ncr710_wait_reselect(s);
                 }
                 break;
@@ -1589,25 +1599,29 @@ again:
 
     case 2: /* Transfer Control.  */
         {
-            int cond;
-            int jmp;
-
+            bool cond = true;
+            bool jmp = (insn & (1 << 19)) != 0;
 
             if (s->sstat0 & NCR710_SSTAT0_STO) {
                 break;
             }
-            cond = jmp = (insn & (1 << 19)) != 0;
-            if (cond == jmp && (insn & (1 << 21))) {
-                cond = s->carry != 0;
+            /*
+             * All selected tests must hold; with no test selected the
+             * condition is true, so a "jump if false" without tests never
+             * jumps (the HP-UX c700 scripts use that as a no-op).
+             */
+            if (insn & (1 << 21)) {
+                cond = cond && s->carry != 0;
             }
-            if (cond == jmp && (insn & (1 << 17))) {
-                cond = (s->sstat2 & PHASE_MASK) == ((insn >> 24) & 7);
+            if (insn & (1 << 17)) {
+                cond = cond &&
+                       (s->sstat2 & PHASE_MASK) == ((insn >> 24) & 7);
             }
-            if (cond == jmp && (insn & (1 << 18))) {
+            if (insn & (1 << 18)) {
                 uint8_t mask;
 
                 mask = (~insn >> 8) & 0xff;
-                cond = (s->sfbr & mask) == (insn & mask);
+                cond = cond && (s->sfbr & mask) == (insn & mask);
             }
             if (cond == jmp) {
                 if (insn & (1 << 23)) {
@@ -1859,6 +1873,11 @@ static uint8_t ncr710_reg_readb(NCR710State *s, int offset)
     case NCR710_CTEST2_REG: /* CTEST2 */
         ret = s->ctest2;
         s->ctest2 |= 0x04;
+        if (s->ctest2 & NCR710_CTEST2_SIGP) {
+            /* Reading CTEST2 acknowledges the signal process bit */
+            s->ctest2 &= ~NCR710_CTEST2_SIGP;
+            s->istat &= ~NCR710_ISTAT_SIGP;
+        }
         break;
     case NCR710_CTEST3_REG: /* CTEST3 */
         ret = s->ctest3;
@@ -2133,21 +2152,27 @@ static void ncr710_reg_writeb(NCR710State *s, int offset, uint8_t val)
         break;
 
     case NCR710_ISTAT_REG: /* ISTAT */
-        old_val = s->istat;
-
-        if ((old_val & NCR710_ISTAT_DIP) && !(val & NCR710_ISTAT_DIP)) {
-            /* Clear script interrupt data after Linux processes it */
-            s->dstat = 0;
-            s->dsps = 0;
-        }
-
-        if ((old_val & NCR710_ISTAT_SIP) && !(val & NCR710_ISTAT_SIP)) {
-            s->sstat0 = 0;
-        }
-
+        /*
+         * DIP and SIP are read-only: the pending DMA and SCSI interrupt
+         * status goes away when the driver reads DSTAT and SSTAT0, not when
+         * it writes ISTAT (HP-UX writes ISTAT before it reads DSTAT).
+         */
         s->istat = (val & ~(NCR710_ISTAT_DIP | NCR710_ISTAT_SIP)) |
                   (s->istat & (NCR710_ISTAT_DIP | NCR710_ISTAT_SIP));
         ncr710_update_irq(s);
+
+        if (val & NCR710_ISTAT_SIGP) {
+            /* SCRIPTS can read the signal in CTEST2, which also clears it */
+            s->ctest2 |= NCR710_CTEST2_SIGP;
+            if (s->waiting == NCR710_WAIT_RESELECT && s->wait_reselect &&
+                !s->script_active) {
+                /* Signal process ends the idle WAIT RESELECT */
+                s->wait_reselect = false;
+                s->waiting = NCR710_WAIT_NONE;
+                s->dsp = s->wait_alt;
+                ncr710_execute_script(s);
+            }
+        }
 
         if (val & NCR710_ISTAT_ABRT) {
             ncr710_script_dma_interrupt(s, NCR710_DSTAT_ABRT);
@@ -2194,6 +2219,7 @@ static void ncr710_reg_writeb(NCR710State *s, int offset, uint8_t val)
         s->dsp &= 0x00ffffff;
         s->dsp |= val << 24;
         s->waiting = NCR710_WAIT_NONE;
+        s->script_halted = false;
         s->script_active = 1;
         s->istat |= NCR710_ISTAT_CON;
         ncr710_clear_selection_timeout(s);
@@ -2297,6 +2323,26 @@ static const VMStateDescription vmstate_ncr710_scsi_fifo = {
     }
 };
 
+static bool ncr710_idle_needed(void *opaque)
+{
+    NCR710State *s = opaque;
+
+    return s->script_halted || s->wait_reselect;
+}
+
+static const VMStateDescription vmstate_ncr710_idle = {
+    .name = "ncr710/idle",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ncr710_idle_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(script_halted, NCR710State),
+        VMSTATE_BOOL(wait_reselect, NCR710State),
+        VMSTATE_UINT32(wait_alt, NCR710State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 const VMStateDescription vmstate_ncr710 = {
     .name = "ncr710",
     .version_id = 1,
@@ -2357,6 +2403,10 @@ const VMStateDescription vmstate_ncr710 = {
         VMSTATE_UINT32(select_tag, NCR710State),
         VMSTATE_UINT8(current_lun, NCR710State),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ncr710_idle,
+        NULL
     }
 };
 
