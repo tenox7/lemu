@@ -1,12 +1,13 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 set -e
-[ $# -eq 4 ] || { echo "usage: $0 aix53|aix61|aix72 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
+[ $# -eq 4 ] || { echo "usage: $0 aix53|aix61|aix71|aix72 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 os=$1 vm=$2 bin=$3 out=$4
 case $os in
 aix53) name=aix53pseries-qemu img=$vm/aix53.qcow2 ;;
 aix61) name=aix61pseries-qemu img=$vm/aix61.qcow2 ;;
+aix71) name=aix71pseries-qemu img=$vm/aix71.qcow2 ;;
 aix72) name=aix72pseries-qemu img=$vm/hdisk0.qcow2 ;;
 *) echo "unknown OS: $os" >&2; exit 1 ;;
 esac
