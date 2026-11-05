@@ -46,9 +46,23 @@ struct HppaMachineState {
 
     DeviceState *lasi_dev;
     uint64_t memsplit_addr;
+    bool legacy_fw;
 };
 
 #define MIN_SEABIOS_HPPA_VERSION 26 /* require at least this fw version */
+
+/*
+ * SeaBIOS-hppa 25 and older want the CPUs at 0xfffb0000 and the fw_cfg port
+ * at 0xfffa0000, as in QEMU 11.1.  Version 26 and later take both addresses
+ * from registers.  The "legacy-fw" machine option selects the old layout.
+ */
+#define LEGACY_CPU_HPA                  0xfffb0000
+#define LEGACY_FW_CFG_IO_BASE           0xfffa0000
+#define LEGACY_MIN_SEABIOS_HPPA_VERSION 22
+
+static hwaddr cpu_hpa = CPU_HPA;
+static hwaddr fw_cfg_io_base = FW_CFG_IO_BASE;
+static unsigned int min_fw_version = MIN_SEABIOS_HPPA_VERSION;
 
 #define HPA_POWER_BUTTON        (FIRMWARE_END - 0x10)
 static hwaddr soft_power_reg;
@@ -217,7 +231,7 @@ static FWCfgState *create_fw_cfg(MachineState *ms, PCIBus *pci_bus,
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, HPPA_MAX_CPUS);
     fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, ms->ram_size);
 
-    val = cpu_to_le64(MIN_SEABIOS_HPPA_VERSION);
+    val = cpu_to_le64(min_fw_version);
     fw_cfg_add_file(fw_cfg, "/etc/firmware-min-version",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
@@ -241,11 +255,11 @@ static FWCfgState *create_fw_cfg(MachineState *ms, PCIBus *pci_bus,
     fw_cfg_add_file(fw_cfg, "/etc/hppa/power-button-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
-    val = cpu_to_le64(CPU_HPA + 16);
+    val = cpu_to_le64(cpu_hpa + 16);
     fw_cfg_add_file(fw_cfg, "/etc/hppa/rtc-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
-    val = cpu_to_le64(CPU_HPA + 24);
+    val = cpu_to_le64(cpu_hpa + 24);
     fw_cfg_add_file(fw_cfg, "/etc/hppa/DebugOutputPort",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
 
@@ -296,6 +310,13 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
     struct HppaMachineState *hpm;
     hwaddr splitaddr;
 
+    hpm = HPPA_COMMON_MACHINE(machine);
+    if (hpm->legacy_fw) {
+        cpu_hpa = LEGACY_CPU_HPA;
+        fw_cfg_io_base = LEGACY_FW_CFG_IO_BASE;
+        min_fw_version = LEGACY_MIN_SEABIOS_HPPA_VERSION;
+    }
+
     /* Create CPUs.  */
     for (unsigned int i = 0; i < smp_cpus; i++) {
         cpu[i] = HPPA_CPU(cpu_create(machine->cpu_type));
@@ -321,7 +342,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
         memory_region_init_io(cpu_region, OBJECT(cpu[i]), &hppa_io_eir_ops,
                               cpu[i], name, 4);
         memory_region_add_subregion(addr_space,
-                                    translate(NULL, CPU_HPA + i * 0x1000),
+                                    translate(NULL, cpu_hpa + i * 0x1000),
                                     cpu_region);
 
         if (!hppa_is_pa20(&cpu[0]->env)) {
@@ -339,7 +360,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
         memory_region_init_io(cflush, NULL, &hppa_pci_ignore_ops,
                               NULL, cflush_name, 4);
         memory_region_add_subregion(addr_space,
-                              translate(NULL, CPU_HPA + i * 0x1000 + 0x500),
+                              translate(NULL, cpu_hpa + i * 0x1000 + 0x500),
                               cflush);
     }
 
@@ -347,7 +368,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
     cpu_region = g_new(MemoryRegion, 1);
     memory_region_init_io(cpu_region, OBJECT(cpu[0]), &hppa_io_helper_ops,
                           cpu[0], "cpu0-io-rtc", 2 * sizeof(uint64_t));
-    memory_region_add_subregion(addr_space, translate(NULL, CPU_HPA + 16),
+    memory_region_add_subregion(addr_space, translate(NULL, cpu_hpa + 16),
                                 cpu_region);
 
     /* Main memory region. */
@@ -455,7 +476,7 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
     qemu_register_powerdown_notifier(&hppa_system_powerdown_notifier);
 
     /* fw_cfg configuration interface */
-    create_fw_cfg(machine, pci_bus, translate(NULL, FW_CFG_IO_BASE));
+    create_fw_cfg(machine, pci_bus, translate(NULL, fw_cfg_io_base));
 
     /* Load firmware.  Given that this is not "real" firmware,
        but one explicitly written for the emulation, we might as
@@ -842,7 +863,7 @@ static void hppa_machine_reset(MachineState *ms, ResetType type)
 
         cpu_set_pc(cs, firmware_entry);
         cpu[i]->env.psw = PSW_Q;
-        cpu[i]->env.gr[5] = CPU_HPA + i * 0x1000;
+        cpu[i]->env.gr[5] = cpu_hpa + i * 0x1000;
     }
 
     cpu[0]->env.gr[26] = ms->ram_size;
@@ -851,7 +872,7 @@ static void hppa_machine_reset(MachineState *ms, ResetType type)
     cpu[0]->env.gr[23] = cpu[0]->env.initrd_base;
     cpu[0]->env.gr[22] = cpu[0]->env.initrd_end;
     cpu[0]->env.gr[21] = smp_cpus;
-    cpu[0]->env.gr[19] = FW_CFG_IO_BASE;
+    cpu[0]->env.gr[19] = fw_cfg_io_base;
 
     /* reset static fields to avoid starting Linux kernel & initrd on reboot */
     cpu[0]->env.kernel_entry = 0;
@@ -869,6 +890,16 @@ static void hppa_nmi(NMIState *ns)
     }
 }
 
+static bool hppa_get_legacy_fw(Object *obj, Error **errp)
+{
+    return HPPA_COMMON_MACHINE(obj)->legacy_fw;
+}
+
+static void hppa_set_legacy_fw(Object *obj, bool value, Error **errp)
+{
+    HPPA_COMMON_MACHINE(obj)->legacy_fw = value;
+}
+
 static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -883,6 +914,11 @@ static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
     mc->default_nic = "tulip";
 
     nc->raise_nmi = hppa_nmi;
+
+    object_class_property_add_bool(oc, "legacy-fw", hppa_get_legacy_fw,
+                                   hppa_set_legacy_fw);
+    object_class_property_set_description(oc, "legacy-fw",
+        "Put the CPUs and fw_cfg where SeaBIOS-hppa 25 and older expect them");
 }
 
 static void HP_B160L_machine_init_class_init(ObjectClass *oc, const void *data)
