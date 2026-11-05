@@ -8,13 +8,12 @@ never appeared). LEMU's firmware (SeaBIOS-hppa 26) is enough; SeaBIOS-hppa 25 wi
 
 ## Run
 
-[run.sh](run.sh) is an example. Put these next to it:
-
-- `hpux.img`: the HP-UX 10.20 disk, qcow2, on SCSI ID 6.
-- `hppa-firmware-v25.img`: SeaBIOS-hppa 25, only if you want it (see Firmware). The
-  script uses it. It is in LEMU's history:
-  `git show 90ce9a4150:pc-bios/hppa-firmware.img > hppa-firmware-v25.img`
-  Without it, drop `-bios` and `legacy-fw=on` and LEMU's own firmware is used.
+[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux1020b160l-qemu` (see
+[README.txt](README.txt)); [../release/mkrelease.sh](../release/mkrelease.sh) packs it.
+They use LEMU's own firmware (SeaBIOS-hppa 26) and the disk `hpux1020.qcow2` on SCSI ID 6.
+To try SeaBIOS-hppa 25 (see Firmware), add `-M legacy-fw=on -bios hppa-firmware-v25.img`.
+It is in LEMU's history:
+`git show 90ce9a4150:pc-bios/hppa-firmware.img > hppa-firmware-v25.img`
 
 Check the guest with `ioscan -fnC processor` (four processors, all CLAIMED) and
 `sar -u -M 2 3` (load per CPU). Run it with a window, or with `-display vnc=...`. With
