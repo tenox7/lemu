@@ -48,6 +48,7 @@ struct ARTISTState {
     AddressSpace as;
 
     struct vram_buffer vram_buffer[16];
+    uint16_t unimp_logged;      /* buffers without a model that were logged */
 
     bool disable;
     uint16_t width;
@@ -235,6 +236,21 @@ static void artist_invalidate_lines(struct vram_buffer *buf,
     if (start + size <= buf->size) {
         memory_region_set_dirty(&buf->mr, start, size);
     }
+}
+
+/*
+ * Mark @len bytes of @buf at @offset dirty. The guest can pick any of the 16
+ * buffers with the bitmap access registers, and this model creates only a few
+ * of them: for another one buf->size is 0 and its MemoryRegion was never
+ * initialised, so there is nothing to mark.
+ */
+static void artist_set_dirty(struct vram_buffer *buf, unsigned int offset,
+                             unsigned int len)
+{
+    if (offset >= buf->size) {
+        return;
+    }
+    memory_region_set_dirty(&buf->mr, offset, MIN(len, buf->size - offset));
 }
 
 static int vram_write_bufidx(ARTISTState *s)
@@ -774,7 +790,7 @@ static void artist_vram_write4(ARTISTState *s, struct vram_buffer *buf,
         data <<= 8;
         mask <<= 1;
     }
-    memory_region_set_dirty(&buf->mr, offset, 4);
+    artist_set_dirty(buf, offset, 4);
 }
 
 static void artist_vram_write32(ARTISTState *s, struct vram_buffer *buf,
@@ -797,7 +813,7 @@ static void artist_vram_write32(ARTISTState *s, struct vram_buffer *buf,
             }
         }
     }
-    memory_region_set_dirty(&buf->mr, offset, pix_count);
+    artist_set_dirty(buf, offset, pix_count);
 }
 
 static int get_vram_offset(ARTISTState *s, struct vram_buffer *buf,
@@ -815,6 +831,14 @@ static int vram_bit_write(ARTISTState *s, uint32_t pos, int posy,
                           uint32_t data, int size)
 {
     struct vram_buffer *buf = vram_write_buffer(s);
+
+    if (!buf->size && !(s->unimp_logged & (1 << vram_write_bufidx(s)))) {
+        /* HP PEX Drive writes to such a buffer, millions of times: say it once */
+        s->unimp_logged |= 1 << vram_write_bufidx(s);
+        qemu_log_mask(LOG_UNIMP, "%s: write to buffer %d that this model "
+                      "does not have, dst bm access %08x\n", __func__,
+                      vram_write_bufidx(s), s->dst_bm_access);
+    }
 
     switch (s->dst_bm_access >> 16) {
     case 0x3ba0:
@@ -889,7 +913,7 @@ static uint64_t artist_vram_read(void *opaque, hwaddr addr, unsigned size)
 
     offset = get_vram_offset(s, buf, addr >> 2, 0);
 
-    if (offset > buf->size) {
+    if (offset > buf->size - 4) {
         return 0;
     }
 
