@@ -209,7 +209,12 @@ static target_ulong h_bulk_remove(PowerPCCPU *cpu, SpaprMachineState *spapr,
 
         switch (ret) {
         case REMOVE_SUCCESS:
-            *tsh |= (r & (HPTE64_R_C | HPTE64_R_R)) << 43;
+            /*
+             * R and C go to H_BULK_REMOVE_RC. AIX reads C here to see
+             * whether a page was changed, for example a page of a file
+             * a process wrote through mmap().
+             */
+            *tsh |= (r & (HPTE64_R_C | HPTE64_R_R)) << 51;
             break;
 
         case REMOVE_PARM:
