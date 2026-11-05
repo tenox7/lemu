@@ -49,6 +49,9 @@ struct ARTISTState {
 
     struct vram_buffer vram_buffer[16];
     uint16_t unimp_logged;      /* buffers without a model that were logged */
+    uint8_t *wid;               /* window id of each pixel, see artist_fill_wid() */
+    uint32_t wid_size;
+    bool wid_used;              /* some pixel had a window id other than 0 */
 
     bool disable;
     uint16_t width;
@@ -463,6 +466,44 @@ static void block_move(ARTISTState *s,
     artist_invalidate_lines(buf, dest_y, height);
 }
 
+/*
+ * The X server of HP-UX 9 gives a window that does not use the default
+ * visual (an 8 bit TrueColor window, for example) its own colour map: it
+ * loads a second bank of 256 entries into the colour map memory (at 0x800;
+ * the default bank is at 0x400) and tags the pixels of the window with a
+ * window id, with a fill of the control plane with bit 24 set. When the
+ * window goes away, or another window covers it, a fill of the control plane
+ * without that bit changes the pixels back. The display looks up a pixel
+ * with a window id in the second bank. Nothing else of the control plane
+ * is emulated.
+ */
+static void artist_fill_wid(ARTISTState *s,
+                            unsigned int startx, unsigned int starty,
+                            unsigned int width, unsigned int height)
+{
+    uint8_t val = 0;
+    unsigned int x, y;
+
+    if (!s->wid) {
+        return;
+    }
+    if (s->control_plane & 0x01000000) {
+        val = artist_get_color(s) & s->plane_mask & 0xff;
+    }
+    for (y = starty; y < starty + height && y < s->height; y++) {
+        for (x = startx; x < startx + width && x < s->width; x++) {
+            s->wid[y * s->width + x] = val;
+        }
+    }
+    if (val) {
+        s->wid_used = true;
+    }
+    if (s->wid_used) {
+        artist_invalidate_lines(&s->vram_buffer[ARTIST_BUFFER_AP], starty,
+                                height);
+    }
+}
+
 static void fill_window(ARTISTState *s,
                         unsigned int startx, unsigned int starty,
                         unsigned int width,  unsigned int height)
@@ -476,9 +517,8 @@ static void fill_window(ARTISTState *s,
                              s->image_bitmap_op, s->control_plane);
 
     if (s->control_plane != 0) {
-        /* We don't support CONTROL_PLANE accesses */
-        qemu_log_mask(LOG_UNIMP, "%s: CONTROL_PLANE: %08x\n", __func__,
-                      s->control_plane);
+        /* Only the window id of the pixels is emulated */
+        artist_fill_wid(s, startx, starty, width, height);
         return;
     }
 
@@ -1337,6 +1377,16 @@ static void artist_draw_line(void *opaque, uint8_t *d, const uint8_t *src,
 
     cmap = (uint32_t *)(s->vram_buffer[ARTIST_BUFFER_CMAP].data + 0x400);
 
+    if (s->wid_used) {
+        const struct vram_buffer *ap = &s->vram_buffer[ARTIST_BUFFER_AP];
+        const uint8_t *wid = s->wid + (src - ap->data);
+
+        for (x = 0; x < s->width; x++) {
+            *data++ = cmap[(wid[x] ? 256 : 0) + src[x]];
+        }
+        return;
+    }
+
     for (x = 0; x < s->width; x++) {
         *data++ = cmap[*src++];
     }
@@ -1437,6 +1487,8 @@ static void artist_realizefn(DeviceState *dev, Error **errp)
     buf = &s->vram_buffer[ARTIST_BUFFER_AP];
     framebuffer_update_memory_section(&s->fbsection, &buf->mr, 0,
                                       buf->width, buf->height);
+    s->wid_size = buf->size;
+    s->wid = g_malloc0(s->wid_size);
     /*
      * Artist cursor max size
      */
@@ -1464,6 +1516,32 @@ static int vmstate_artist_post_load(void *opaque, int version_id)
     artist_invalidate(opaque);
     return 0;
 }
+
+static bool artist_wid_needed(void *opaque)
+{
+    return ARTIST(opaque)->wid_used;
+}
+
+static int artist_wid_post_load(void *opaque, int version_id)
+{
+    ARTISTState *s = ARTIST(opaque);
+
+    s->wid_used = true;
+    artist_invalidate(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_artist_wid = {
+    .name = "artist/wid",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = artist_wid_needed,
+    .post_load = artist_wid_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_VBUFFER_UINT32(wid, ARTISTState, 1, NULL, wid_size),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_artist = {
     .name = "artist",
@@ -1507,6 +1585,10 @@ static const VMStateDescription vmstate_artist = {
         VMSTATE_UINT32(font_write_pos_y, ARTISTState),
         VMSTATE_BOOL(disable, ARTISTState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_artist_wid,
+        NULL
     }
 };
 
