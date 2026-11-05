@@ -767,13 +767,14 @@ static void artist_vram_write4(ARTISTState *s, struct vram_buffer *buf,
     int mask = s->vram_bitmask >> 28;
 
     for (i = 0; i < 4; i++) {
+        /* A masked pixel still uses up its data byte and its mask bit. */
         if (!(s->image_bitmap_op & 0x20000000) || (mask & 8)) {
             artist_rop8(s, buf, offset + i, data >> 24);
-            data <<= 8;
-            mask <<= 1;
         }
+        data <<= 8;
+        mask <<= 1;
     }
-    memory_region_set_dirty(&buf->mr, offset, 3);
+    memory_region_set_dirty(&buf->mr, offset, 4);
 }
 
 static void artist_vram_write32(ARTISTState *s, struct vram_buffer *buf,
