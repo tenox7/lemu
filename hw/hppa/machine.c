@@ -48,6 +48,7 @@ struct HppaMachineState {
     uint64_t memsplit_addr;
     bool legacy_fw;
     bool hpux_idle;
+    bool hpux_x11_pace;
 };
 
 #define MIN_SEABIOS_HPPA_VERSION 26 /* require at least this fw version */
@@ -322,6 +323,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
     for (unsigned int i = 0; i < smp_cpus; i++) {
         cpu[i] = HPPA_CPU(cpu_create(machine->cpu_type));
         cpu[i]->hpux_idle = hpm->hpux_idle;
+        cpu[i]->hpux_x11_pace = hpm->hpux_x11_pace;
     }
 
     /* Initialize memory */
@@ -912,9 +914,20 @@ static void hppa_set_hpux_idle(Object *obj, bool value, Error **errp)
     HPPA_COMMON_MACHINE(obj)->hpux_idle = value;
 }
 
+static bool hppa_get_hpux_x11_pace(Object *obj, Error **errp)
+{
+    return HPPA_COMMON_MACHINE(obj)->hpux_x11_pace;
+}
+
+static void hppa_set_hpux_x11_pace(Object *obj, bool value, Error **errp)
+{
+    HPPA_COMMON_MACHINE(obj)->hpux_x11_pace = value;
+}
+
 static void hppa_machine_instance_init(Object *obj)
 {
     HPPA_COMMON_MACHINE(obj)->hpux_idle = true;
+    HPPA_COMMON_MACHINE(obj)->hpux_x11_pace = true;
 }
 
 static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
@@ -940,6 +953,11 @@ static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
                                    hppa_set_hpux_idle);
     object_class_property_set_description(oc, "hpux-idle",
         "Halt the CPU in the HP-UX 10.20 idle loop instead of spinning");
+    object_class_property_add_bool(oc, "hpux-x11-pace", hppa_get_hpux_x11_pace,
+                                   hppa_set_hpux_x11_pace);
+    object_class_property_set_description(oc, "hpux-x11-pace",
+        "Slow down the timer calibration of the HP-UX 10.20 X server, "
+        "which divides by zero when the CPU is fast");
 }
 
 static void HP_B160L_machine_init_class_init(ObjectClass *oc, const void *data)

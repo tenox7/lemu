@@ -92,6 +92,7 @@ typedef struct DisasContext {
     bool is_pa20;
     bool insn_start_updated;
     bool hpux_idle;
+    bool hpux_x11_pace;
 
     MemOp mo_align;
 } DisasContext;
@@ -4685,6 +4686,9 @@ static void hppa_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->hpux_idle = env_archcpu(cpu_env(cs))->hpux_idle
                      && ctx->privilege == PRIV_KERNEL
                      && !(tb_cflags(ctx->base.tb) & CF_SINGLE_STEP);
+    ctx->hpux_x11_pace = env_archcpu(cpu_env(cs))->hpux_x11_pace
+                         && ctx->privilege == PRIV_USER
+                         && !(tb_cflags(ctx->base.tb) & CF_SINGLE_STEP);
 #endif
 
     /* Bound the number of instructions by those left on the page.  */
@@ -4810,6 +4814,55 @@ static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env)
 }
 
 /*
+ * The X server of HP-UX 10.20 (X11R6, built 12 September 1999) calibrates
+ * the interval timer in calibrate_cr16(). Six times it reads the time of day,
+ * counts a variable in memory up to 200000, reads the time of day again and
+ * adds up the elapsed time in whole milliseconds. In the end it divides the
+ * timer ticks by that sum. A 160 MHz PA-7300LC needs about 6 ms for the
+ * count. Emulated at full speed it needs less than 1 ms, so every round
+ * counts as 0 ms, the division traps, and the server dies with SIGFPE each
+ * time VUE starts it. These are the words from the store that clears the
+ * counter to the end of the counting loop, as offsets from the first one.
+ * Nothing is masked: another build of the server is left alone.
+ */
+static const struct {
+    int16_t off;
+    uint32_t insn;
+} hpux_x11_calibrate[] = {
+    { 0x00, 0x6bc03f99 },       /* stw   r0,-34(sp)           count = 0 */
+    { 0x04, 0x4bd73f99 },       /* ldw   -34(sp),r23 */
+    { 0x08, 0x88f74030 },       /* cmpb,>>= r23,r7,done */
+    { 0x0c, 0x08000240 },       /* nop */
+    { 0x10, 0x4bdf3f99 },       /* ldw   -34(sp),r31 */
+    { 0x14, 0x37f80002 },       /* ldo   1(r31),r24 */
+    { 0x18, 0x6bd83f99 },       /* stw   r24,-34(sp)          count++ */
+    { 0x1c, 0x4bca3f99 },       /* ldw   -34(sp),r10 */
+    { 0x20, 0x80ea5fdf },       /* cmpb,<,n r10,r7,loop */
+};
+
+/*
+ * At the first insn of a TB: if it starts that counting, let
+ * helper_hpux_x11_pace() make the round last long enough to count.
+ */
+static void gen_hpux_x11_pace(DisasContext *ctx, CPUHPPAState *env)
+{
+    vaddr pc = ctx->base.pc_next;
+
+    for (int i = 0; i < ARRAY_SIZE(hpux_x11_calibrate); i++) {
+        vaddr addr = pc + hpux_x11_calibrate[i].off;
+
+        if (!translator_is_same_page(&ctx->base, addr) ||
+            translator_ldl_end(env, &ctx->base, addr, mo_endian(ctx))
+            != hpux_x11_calibrate[i].insn) {
+            return;
+        }
+    }
+
+    trace_hppa_hpux_match("x11 calibration", pc);
+    gen_helper_hpux_x11_pace(tcg_env);
+}
+
+/*
  * The only two places where the HP-UX 10.20 scheduler hands a thread to a
  * processor: it adds one to the length of one of the two run queues of the
  * processor structure at r24 - 0x518. An idle processor gets no interrupt,
@@ -4899,6 +4952,10 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
             && !iaqe_variable(&ctx->iaq_b)
             && ctx->iaq_b.disp == ctx->iaq_f.disp + 4) {
             gen_hpux_idle(ctx, env);
+        }
+        if (ctx->hpux_x11_pace && ctx->base.num_insns == 1
+            && insn == hpux_x11_calibrate[0].insn) {
+            gen_hpux_x11_pace(ctx, env);
         }
 #endif
 

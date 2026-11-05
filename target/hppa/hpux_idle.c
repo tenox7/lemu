@@ -298,3 +298,23 @@ void HELPER(hpux_bell)(CPUHPPAState *env, target_ulong r24)
         }
     }
 }
+
+/*
+ * Called at the start of each round of the counting loop in calibrate_cr16()
+ * of the X server, see hpux_x11_calibrate[] in translate.c. The server wants
+ * to see at least a millisecond go by in the round; a real CPU of that time
+ * needs 6, ours less than 1. Wait a while: the timer of the guest keeps going
+ * and, being whole milliseconds, the round then measures about the time it
+ * took, so the server learns the frequency of the timer to within a few
+ * percent. The 6 rounds add up to 0.12 seconds of waiting, once per start of
+ * the server.
+ */
+#define HPUX_X11_PACE_US 20000
+
+void HELPER(hpux_x11_pace)(CPUHPPAState *env)
+{
+    CPUState *cs = env_cpu(env);
+
+    trace_hppa_hpux_pace(cs->cpu_index);
+    g_usleep(HPUX_X11_PACE_US);
+}

@@ -300,6 +300,8 @@ struct ArchCPU {
 
     /* Halt in the HP-UX 10.20 idle loop, set by the board (hpux_idle.c) */
     bool hpux_idle;
+    /* Pace the timer calibration of the HP-UX X server (hpux_idle.c) */
+    bool hpux_x11_pace;
     /* Rounds of the idle loop with nothing to do, and the interrupts seen */
     unsigned int hpux_idle_rounds;
     uint64_t hpux_idle_ints;
