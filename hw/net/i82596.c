@@ -2107,10 +2107,44 @@ void i82596_poll(NetClientState *nc, bool enable)
     qemu_set_irq(s->irq, 0);
 }
 
+/*
+ * State that the first version of this description left out.  Without SCP
+ * the next channel attention after a load sees the reset default, runs the
+ * chip initialisation on garbage and loses the SCB address.  A subsection
+ * keeps older snapshots loadable.
+ */
+static const VMStateDescription vmstate_i82596_init_state = {
+    .name = "i82596/init_state",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(scp, I82596State),
+        VMSTATE_UINT64(next_rbd, I82596State),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static int i82596_post_load(void *opaque, int version_id)
+{
+    I82596State *s = opaque;
+
+    /* The packets that were queued for a not yet ready RU are not saved */
+    s->queue_head = 0;
+    s->queue_tail = 0;
+    s->queue_count = 0;
+    s->flushing_queue = false;
+
+    if (s->nic) {
+        qemu_flush_queued_packets(qemu_get_queue(s->nic));
+    }
+    return 0;
+}
+
 const VMStateDescription vmstate_i82596 = {
     .name = "i82596",
     .version_id = 1,
     .minimum_version_id = 1,
+    .post_load = i82596_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT8(mode, I82596State),
         VMSTATE_UINT16(t_on, I82596State),
@@ -2159,6 +2193,10 @@ const VMStateDescription vmstate_i82596 = {
         VMSTATE_BOOL(rnr_signaled, I82596State),
         VMSTATE_BOOL(flushing_queue, I82596State),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_i82596_init_state,
+        NULL
     }
 };
 
