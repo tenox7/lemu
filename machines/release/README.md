@@ -1,6 +1,6 @@
 # One build for all kits
 
-These scripts build QEMU once for all the kits: the five binaries the
+These scripts build QEMU once for all the kits: the six binaries the
 kits use, for macOS, Linux and Windows. Each machine's own `release/`
 folder then packs its kits from that one build. Without them, each of
 the five release folders builds its own QEMU, so a full set of kits
@@ -33,6 +33,7 @@ commit.
 - `OUT/rc` must show exit code 0 for all four. The logs are in
   `OUT/*.log`.
 - Each binary has every feature that any of the five machine builds had.
+  qemu-system-hppa gets the same set.
 - `build-mac.sh` prints the oldest macOS the binaries run on
   (`needs macOS ...`). The kit READMEs must say the same.
 
@@ -53,8 +54,8 @@ what each binary has in `OUT/macos-*.features` and
 
     sh stage.sh OUT STAGE
 
-`stage.sh` makes `STAGE` new. `STAGE/ppc`, `STAGE/ppc64` and
-`STAGE/alpha` each hold only their own binary. `STAGE/mips` has the
+`stage.sh` makes `STAGE` new. `STAGE/ppc`, `STAGE/ppc64`, `STAGE/alpha`
+and `STAGE/hppa` each hold only their own binary. `STAGE/mips` has the
 folder names that `rm200/release/pack.sh` wants. Give the pack scripts
 these folders in place of their own build, for example:
 

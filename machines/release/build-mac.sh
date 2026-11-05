@@ -2,7 +2,8 @@
 # One macOS arm64 build of every kit binary: SDL (the default display) and
 # Cocoa, Core Audio, vmnet. Bundles the Homebrew dylibs into
 # OUT/macos-arm64/lib and lists each binary's features.
-# Feature set = everything the 40p, 7006, pseries, jensen and rm200 builds had.
+# Feature set = everything the 40p, 7006, pseries, jensen and rm200 builds had;
+# qemu-system-hppa (HP B160L) gets the same.
 # usage: build-mac.sh SRC OUT
 set -e
 [ $# -eq 2 ] || { echo "usage: $0 SRC OUT" >&2; exit 1; }
@@ -10,10 +11,10 @@ R=$(cd "$(dirname "$0")" && pwd)
 SRC=$(cd "$1" && pwd)
 OUT=$(mkdir -p "$2" && cd "$2" && pwd)
 O=$OUT/macos-arm64 B=$OUT/build-mac
-BINS="qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-system-mips64el qemu-system-mips64"
+BINS="qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-system-mips64el qemu-system-mips64 qemu-system-hppa"
 export MACOSX_DEPLOYMENT_TARGET=15.0
 mkdir -p $B && cd $B
-$SRC/configure --target-list=ppc-softmmu,ppc64-softmmu,alpha-softmmu,mips64el-softmmu,mips64-softmmu \
+$SRC/configure --target-list=ppc-softmmu,ppc64-softmmu,alpha-softmmu,mips64el-softmmu,mips64-softmmu,hppa-softmmu \
   --without-default-features --enable-system --enable-tcg --enable-hmp \
   --enable-sdl --enable-cocoa --enable-coreaudio --enable-vmnet --enable-slirp --enable-pixman \
   --enable-fdt=internal --enable-vnc --enable-vvfat --enable-qcow1 --enable-vdi --enable-vmdk \

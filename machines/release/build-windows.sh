@@ -5,7 +5,7 @@
 # and looks for the git id in each binary.
 # usage: build-windows.sh SRC OUT
 set -e
-BINS="qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-system-mips64el qemu-system-mips64"
+BINS="qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-system-mips64el qemu-system-mips64 qemu-system-hppa"
 if [ "$1" != --container ]; then
     [ $# -eq 2 ] || { echo "usage: $0 SRC OUT" >&2; exit 1; }
     mkdir -p "$2"
@@ -26,7 +26,7 @@ cd /b/build
 # the source is copied without .git, so pass the git id for --version
 ../configure ${PKGVERSION:+--with-pkgversion=$PKGVERSION} \
     --cross-prefix=x86_64-w64-mingw32- \
-    --target-list=ppc-softmmu,ppc64-softmmu,alpha-softmmu,mips64el-softmmu,mips64-softmmu \
+    --target-list=ppc-softmmu,ppc64-softmmu,alpha-softmmu,mips64el-softmmu,mips64-softmmu,hppa-softmmu \
     --without-default-features --enable-system --enable-tcg --enable-hmp --enable-sdl \
     --enable-dsound --enable-pixman --enable-slirp --enable-fdt=internal --enable-vnc \
     --enable-vvfat --enable-qcow1 --enable-vdi --enable-vmdk --enable-vpc --enable-vhdx \
