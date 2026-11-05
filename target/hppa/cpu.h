@@ -27,6 +27,7 @@
 #include "system/memory.h"
 #include "qemu/cpu-float.h"
 #include "qemu/interval-tree.h"
+#include "qemu/thread.h"
 #include "hw/core/registerfields.h"
 
 #define MMU_KERNEL_IDX    0
@@ -271,6 +272,14 @@ typedef struct CPUArchState {
 
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
+
+    /*
+     * Only the owning vCPU changes tlb_root, but a broadcast purge on
+     * another vCPU asks it whether any entry overlaps the purged range, to
+     * avoid stopping every CPU for a purge that cannot affect them. That
+     * lookup, and every change of the tree, holds this lock.
+     */
+    QemuSpin tlb_lock;
 
     target_ulong kernel_entry; /* Linux kernel was loaded here */
     target_ulong cmdline_or_bootorder;

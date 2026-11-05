@@ -79,6 +79,48 @@ hwaddr hppa_abs_to_phys_pa2_w0(uint8_t phys_addr_bits, vaddr addr)
     return addr;
 }
 
+/*
+ * Only the owning vCPU changes the tree of valid entries, so its own lookups
+ * need no lock.  Another vCPU can ask about the tree with
+ * hppa_tlb_range_in_use(), which is why every change takes tlb_lock.
+ */
+static void hppa_tlb_tree_insert(CPUHPPAState *env, HPPATLBEntry *ent)
+{
+    qemu_spin_lock(&env->tlb_lock);
+    interval_tree_insert(&ent->itree, &env->tlb_root);
+    qemu_spin_unlock(&env->tlb_lock);
+}
+
+static void hppa_tlb_tree_remove(CPUHPPAState *env, HPPATLBEntry *ent)
+{
+    qemu_spin_lock(&env->tlb_lock);
+    interval_tree_remove(&ent->itree, &env->tlb_root);
+    qemu_spin_unlock(&env->tlb_lock);
+}
+
+/*
+ * Does this CPU hold a TLB entry that a purge of [start, end] would remove?
+ * Called from the thread of another vCPU.  Block TLB entries do not count:
+ * a purge never removes them.
+ */
+static bool hppa_tlb_range_in_use(CPUHPPAState *env, vaddr start, vaddr end)
+{
+    HPPATLBEntry *btlb_end = &env->tlb[HPPA_BTLB_ENTRIES(env)];
+    IntervalTreeNode *i;
+    bool in_use = false;
+
+    qemu_spin_lock(&env->tlb_lock);
+    for (i = interval_tree_iter_first(&env->tlb_root, start, end); i;
+         i = interval_tree_iter_next(i, start, end)) {
+        if (container_of(i, HPPATLBEntry, itree) >= btlb_end) {
+            in_use = true;
+            break;
+        }
+    }
+    qemu_spin_unlock(&env->tlb_lock);
+    return in_use;
+}
+
 static HPPATLBEntry *hppa_find_tlb(CPUHPPAState *env, vaddr addr)
 {
     IntervalTreeNode *i = interval_tree_iter_first(&env->tlb_root, addr, addr);
@@ -116,7 +158,7 @@ static void hppa_flush_tlb_ent(CPUHPPAState *env, HPPATLBEntry *ent,
         return;
     }
 
-    interval_tree_remove(&ent->itree, &env->tlb_root);
+    hppa_tlb_tree_remove(env, ent);
     memset(ent, 0, sizeof(*ent));
 
     if (!is_btlb) {
@@ -533,7 +575,7 @@ static void set_access_bits_pa11(CPUHPPAState *env, HPPATLBEntry *ent,
     ent->t = extract32(reg, 29, 1);
     ent->entry_valid = 1;
 
-    interval_tree_insert(&ent->itree, &env->tlb_root);
+    hppa_tlb_tree_insert(env, ent);
     trace_hppa_tlb_itlbp(env, ent, ent->access_id, ent->u, ent->ar_pl2,
                          ent->ar_pl1, ent->ar_type, ent->b, ent->d, ent->t);
 }
@@ -591,7 +633,7 @@ static void itlbt_pa20(CPUHPPAState *env, target_ulong r1,
     ent->access_id = extract64(r2, 1, 31);
     ent->entry_valid = 1;
 
-    interval_tree_insert(&ent->itree, &env->tlb_root);
+    hppa_tlb_tree_insert(env, ent);
     trace_hppa_tlb_itlba(env, ent, ent->itree.start, ent->itree.last, ent->pa);
     trace_hppa_tlb_itlbp(env, ent, ent->access_id, ent->u,
                          ent->ar_pl2, ent->ar_pl1, ent->ar_type,
@@ -610,10 +652,9 @@ void HELPER(iitlbt_pa20)(CPUHPPAState *env, target_ulong r1, target_ulong r2)
     itlbt_pa20(env, r1, r2, va_b);
 }
 
-/* Purge (Insn/Data) TLB. */
-static void ptlb_work(CPUState *cpu, run_on_cpu_data data)
+static void ptlb_decode(vaddr addr, vaddr *startp, vaddr *endp)
 {
-    vaddr start = data.target_ptr;
+    vaddr start = addr;
     vaddr end;
 
     /*
@@ -626,6 +667,16 @@ static void ptlb_work(CPUState *cpu, run_on_cpu_data data)
     end = (vaddr)TARGET_PAGE_SIZE << (2 * end);
     end = start + end - 1;
 
+    *startp = start;
+    *endp = end;
+}
+
+/* Purge (Insn/Data) TLB. */
+static void ptlb_work(CPUState *cpu, run_on_cpu_data data)
+{
+    vaddr start, end;
+
+    ptlb_decode(data.target_ptr, &start, &end);
     hppa_flush_tlb_range(cpu_env(cpu), start, end);
 }
 
@@ -642,12 +693,21 @@ void HELPER(ptlb)(CPUHPPAState *env, target_ulong addr)
     CPUState *src = env_cpu(env);
     CPUState *cpu;
     bool wait = false;
+    vaddr start, end;
 
     trace_hppa_tlb_ptlb(env);
     run_on_cpu_data data = RUN_ON_CPU_TARGET_PTR(addr);
+    ptlb_decode(addr, &start, &end);
 
+    /*
+     * Stopping all CPUs is very expensive.  Only a CPU with an entry in the
+     * purged range can be affected, so leave the others alone.  A CPU that
+     * loads an entry from a page table after this check does so as late as
+     * it could on real hardware, where the purge is just as unordered with
+     * a TLB insert on another processor.
+     */
     CPU_FOREACH(cpu) {
-        if (cpu != src) {
+        if (cpu != src && hppa_tlb_range_in_use(cpu_env(cpu), start, end)) {
             async_run_on_cpu(cpu, ptlb_work, data);
             wait = true;
         }
@@ -663,6 +723,9 @@ void hppa_ptlbe(CPUHPPAState *env)
 {
     uint32_t btlb_entries = HPPA_BTLB_ENTRIES(env);
     uint32_t i;
+
+    /* Other vCPUs may walk the tree while it is rebuilt. */
+    qemu_spin_lock(&env->tlb_lock);
 
     /* Zap the (non-btlb) tlb entries themselves. */
     memset(&env->tlb[btlb_entries], 0,
@@ -683,6 +746,7 @@ void hppa_ptlbe(CPUHPPAState *env)
             interval_tree_insert(&env->tlb[i].itree, &env->tlb_root);
         }
     }
+    qemu_spin_unlock(&env->tlb_lock);
 
     tlb_flush_by_mmuidx(env_cpu(env), HPPA_MMU_FLUSH_MASK);
 }

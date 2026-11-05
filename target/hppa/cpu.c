@@ -188,6 +188,8 @@ static void hppa_cpu_realizefn(DeviceState *dev, Error **errp)
         return;
     }
 
+    qemu_spin_init(&HPPA_CPU(cs)->env.tlb_lock);
+
     qemu_init_vcpu(cs);
     acc->parent_realize(dev, errp);
 
