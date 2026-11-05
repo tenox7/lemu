@@ -4278,7 +4278,7 @@ multi_target_deps = []
 multi_target_crates = []
 multi_target_supported_targets = [
   'aarch64-softmmu',
-  'alpha-softmmu',
+  # 'alpha-softmmu', LEMU: target/alpha has globals that arm and m68k also define
   'arm-softmmu',
   'avr-softmmu',
   'hexagon-softmmu',
