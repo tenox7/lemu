@@ -38,6 +38,7 @@ The PC has no kit, so its `run.sh` is an example.
 | IBM RS/6000 7006-41T (PowerPC 601) | [AIX 3.2.5](machines/7006/aix325/run.sh) |
 | IBM pSeries (POWER7, POWER8) | [AIX 5.3](machines/pseries/aix53/run.sh), [AIX 6.1](machines/pseries/aix61/run.sh), [AIX 7.2](machines/pseries/aix72/run.sh) |
 | HP B160L (PA-RISC 1.1, PA-7300LC) | [HP-UX 10.20](machines/hppa/hpux1020/run.sh) (4 CPUs) |
+| HP 9000/715 (PA-RISC 1.1, PA-7100LC) | [HP-UX 9.05](machines/hppa/hpux905/run.sh) |
 
 ## Build
 

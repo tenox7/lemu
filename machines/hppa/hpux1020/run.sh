@@ -8,8 +8,8 @@ Linux-x86_64) q=bin/linux-x86_64/qemu-system-hppa ;;
 Linux-aarch64) q=bin/linux-aarch64/qemu-system-hppa ;;
 *) echo "No QEMU binary for $(uname -sm)" >&2; exit 1 ;;
 esac
-# The firmware is LEMU's SeaBIOS-hppa 26 (bin/share/qemu/hppa-firmware.img).
-# Version 27 panics on four CPUs.
+# The firmware is LEMU's SeaBIOS-hppa 27 (bin/share/qemu/hppa-firmware.img). Version 26,
+# the one in the first kit, boots four CPUs too, and 25 with -M legacy-fw=on.
 # tb-size=512 keeps the code buffer where it is fast on Apple Silicon. Don't add
 # -d nochain (3 times slower). -display none does not start the X server: use the
 # window, or -display vnc=127.0.0.1:1.

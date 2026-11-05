@@ -3,14 +3,15 @@
 **TL;DR** `-M B160L -smp 4 -accel tcg,thread=multi,tb-size=512` runs HP-UX 10.20 on four
 PA-7300LC CPUs, each on its own host core. A vCPU that has nothing to do sleeps instead of
 spinning, and the X server no longer crashes on the fast CPU (it did, and the VUE login
-never appeared). LEMU's firmware (SeaBIOS-hppa 26) is enough; SeaBIOS-hppa 25 with
-`legacy-fw=on` works too, and version 27 panics on four CPUs.
+never appeared). LEMU's firmware (SeaBIOS-hppa 27) is enough; SeaBIOS-hppa 26 and
+SeaBIOS-hppa 25 with `legacy-fw=on` work too.
 
 ## Run
 
 [run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux1020b160l-qemu` (see
 [README.txt](README.txt)); [../release/mkrelease.sh](../release/mkrelease.sh) packs it.
-They use LEMU's own firmware (SeaBIOS-hppa 26) and the disk `hpux1020.qcow2` on SCSI ID 6.
+They use LEMU's firmware (SeaBIOS-hppa 27; the first kit, packed on 2026-11-05, has 26)
+and the disk `hpux1020.qcow2` on SCSI ID 6.
 To try SeaBIOS-hppa 25 (see Firmware), add `-M legacy-fw=on -bios hppa-firmware-v25.img`.
 It is in LEMU's history:
 `git show 90ce9a4150:pc-bios/hppa-firmware.img > hppa-firmware-v25.img`
@@ -107,10 +108,15 @@ Same QEMU, same disk, same four CPUs; only the firmware differs.
 | SeaBIOS-hppa | 1 CPU                  | 4 CPUs                                                       |
 |--------------|------------------------|--------------------------------------------------------------|
 | 25 (`legacy-fw=on`) | works, VUE login | works, VUE login                                        |
-| 26 (LEMU)    | works, VUE login       | works, VUE login                                             |
-| 27 (upstream QEMU, not in LEMU yet) | works, VUE login | panic "Unexpected interrupt while PSW-Q = 0", then "Processor 1 did not start within expected time period" |
+| 26 (LEMU, the first kit) | works, VUE login | works, VUE login                                  |
+| 27 (upstream QEMU)         | works, VUE login | works, VUE login                                      |
 
-The version 27 panic also happens without the changes above. The guest clock is correct
+Version 27 used to panic on four CPUs ("Unexpected interrupt while PSW-Q = 0", then
+"Processor 1 did not start within expected time period"). The firmware was not the cause:
+QEMU's trap for a disabled FPU was. HP-UX 10.20 clears CCR when it starts a CPU and then calls
+`bzero()`, which uses FP stores, in real mode with PSW.Q = 0. An interruption with Q = 0 saves
+neither the instruction address nor IIR, so the handler of HP-UX cannot tell what trapped.
+QEMU takes that trap only while PSW.Q is set now (`target/hppa/cpu.c`). The guest clock is correct
 with 25 and 26 (`sleep 5` takes 5 s). Version 26 once looked broken, because the VUE
 login did not appear and the "Starting HP VUE" message repeated every 25 s. That was the
 X server crash above, not the firmware: with `hpux-x11-pace` (the default) it logs in at
