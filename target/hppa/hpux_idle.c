@@ -1,14 +1,16 @@
 /*
- * HP-UX 10.20 on PA-RISC 1.1: halt the vCPU in the idle loop
+ * HP-UX 10.20 and 9.05 on PA-RISC 1.1: halt the vCPU in the idle loop
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 /*
- * An idle HP-UX 10.20 spins in the scheduler's idle loop with interrupts
- * enabled, so every idle vCPU keeps a host core busy. This halts the vCPU
- * instead, until an interrupt comes or another vCPU gives it work, which
- * HP-UX does without an interrupt.
+ * An idle HP-UX spins in the scheduler's idle loop with interrupts enabled,
+ * so every idle vCPU keeps a host core busy. This halts the vCPU instead,
+ * until an interrupt comes or, with 10.20 on several CPUs, another vCPU
+ * gives it work, which HP-UX does without an interrupt. The kernel of 9.05
+ * has one CPU and its idle loop is simple, see helper_hpux9_idle() at the
+ * end; the rest of this comment is about 10.20.
  *
  * The translator finds the loop by its instructions (gen_hpux_idle() in
  * translate.c; the B2352B kernel of 9 June 1996 is the only one known) and
@@ -229,6 +231,87 @@ void HELPER(hpux_idle)(CPUHPPAState *env)
     qatomic_set(&cpu->hpux_idle_pcpu, (uint32_t)env->gr[3]);
     if (qatomic_xchg(&cpu->hpux_idle_wake, false) ||
         !hpux_idle_nothing_to_do(env)) {
+        qatomic_set(&cpu->hpux_idle_pcpu, 0);
+        return;
+    }
+
+    trace_hppa_hpux_idle(cs->cpu_index, env->iaoq_f);
+    cs->halted = 1;
+    HELPER(excp)(env, EXCP_HALTED);
+}
+
+/*
+ * The idle loop of the HP-UX 9.05 kernel (loop_till_process_found_to_run()):
+ * with interrupts on, it adds up the four run queue counts of mpproc_info
+ * (r4 to r7 point at it, the counts are at 0x10c, 0x110, 0x114 and 0x118),
+ * calls check_watchdog() and starts again until the sum is not 0. The one
+ * thing check_watchdog() does is to look at EIRR bit 28, one of the bits that
+ * the idle loop keeps masked in EIEM (it is 0x8 in the register): it
+ * runs a soft interrupt that is posted there. Nothing else gives the loop work
+ * but an interrupt, as there is one CPU: a handler queues the process.
+ */
+#define HPUX9_RUNQ_COUNTS   0x10c
+#define HPUX9_EIRR_POLLED   0x00000008
+
+static bool hpux9_idle_nothing_to_do(CPUHPPAState *env)
+{
+    CPUState *cs = env_cpu(env);
+    uint32_t count;
+
+    /* An interrupt it could take, or the soft interrupt that it polls for */
+    if (icount_enabled() || !(env->psw & PSW_I) ||
+        (qatomic_read(&env->cr[CR_EIRR]) &
+         (env->cr[CR_EIEM] | HPUX9_EIRR_POLLED)) ||
+        cpu_test_interrupt(cs, CPU_INTERRUPT_NMI)) {
+        return false;
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (!hpux_idle_ld(env, (uint32_t)env->gr[4 + i] + HPUX9_RUNQ_COUNTS +
+                          4 * i, &count) || count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * The idle loop has come to the sum of the run queue counts. Halt the vCPU
+ * until the next interrupt, if there is nothing to do.
+ */
+void HELPER(hpux9_idle)(CPUHPPAState *env)
+{
+    HPPACPU *cpu = env_archcpu(env);
+    CPUState *cs = env_cpu(env);
+
+    if (!cpu->hpux_idle) {
+        return;
+    }
+
+    /* The vCPU runs, it does not wait: see hppa_cpu_has_work() */
+    qatomic_set(&cpu->hpux_idle_pcpu, 0);
+
+    if (cpu->hpux_idle_ints != cpu->hpux_idle_seen) {
+        cpu->hpux_idle_seen = cpu->hpux_idle_ints;
+        cpu->hpux_idle_rounds = 0;
+    }
+    if (!hpux9_idle_nothing_to_do(env)) {
+        cpu->hpux_idle_rounds = 0;
+        return;
+    }
+    if (++cpu->hpux_idle_rounds <= HPUX_IDLE_SPIN_ROUNDS) {
+        return;
+    }
+
+    /*
+     * Say that the vCPU waits (any value but 0, and no processor structure of
+     * 10.20 has the address 1), so that it wakes only for an interrupt it can
+     * take, and look once more: an interrupt that came in between has set
+     * CPU_INTERRUPT_HARD, which counts from now on.
+     */
+    qatomic_set(&cpu->hpux_idle_pcpu, 1);
+    smp_mb();
+    if (!hpux9_idle_nothing_to_do(env)) {
         qatomic_set(&cpu->hpux_idle_pcpu, 0);
         return;
     }

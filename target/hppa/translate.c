@@ -4774,10 +4774,12 @@ static void hppa_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
  * for work, and the tail of the loop with its checks of the flags. Nothing is
  * masked: a kernel built differently keeps spinning.
  */
-static const struct {
+typedef struct {
     int16_t off;
     uint32_t insn;
-} hpux_idle_loop[] = {
+} HpuxInsnWord;
+
+static const HpuxInsnWord hpux_idle_loop[] = {
     /* the run queue counts */
     { 0x000, 0x49750010 },      /* ldw   8(r11),r21           queue length */
     { 0x004, 0x49700018 },      /* ldw   c(r11),r16 */
@@ -4818,23 +4820,48 @@ static const struct {
 };
 
 /*
- * At the first insn of a TB: if it starts the idle loop's check of the run
- * queue, let helper_hpux_idle() halt the vCPU before the loop runs it. When
- * the vCPU wakes up, the insn queue says to run it again.
+ * The idle loop of the HP-UX 9.05 kernel (A.09.05, B2352A) is the second half
+ * of loop_till_process_found_to_run(): with interrupts on it adds up the
+ * four run queue counts of the one struct in r4 to r7 (mpproc_info), calls
+ * check_watchdog() (which looks at EIRR bit 28) and starts again. These are
+ * its words from the sum to the branch back, with the call and its delay
+ * slot before them. Nothing is masked: a kernel built differently keeps
+ * spinning.
  */
-static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env)
+static const HpuxInsnWord hpux9_idle_loop[] = {
+    { -0x08, 0xe8400108 },      /* b,l   check_watchdog,rp */
+    { -0x04, 0x08000240 },      /* nop */
+    { 0x00, 0x489f0218 },       /* ldw   10c(r4),r31          im_numproc */
+    { 0x04, 0x48b80220 },       /* ldw   110(r5),r24          tr_numproc */
+    { 0x08, 0x0b1f061a },       /* add   r31,r24,r26 */
+    { 0x0c, 0x48d30228 },       /* ldw   114(r6),r19          pe_numproc */
+    { 0x10, 0x0a7a0615 },       /* add   r26,r19,r21 */
+    { 0x14, 0x48fc0230 },       /* ldw   118(r7),ret0         id_numproc */
+    { 0x18, 0x0b950602 },       /* add   r21,ret0,rp */
+    { 0x1c, 0x84403fad },       /* cmpib,= 0,rp,again */
+    { 0x20, 0x08000240 },       /* nop */
+};
+
+/*
+ * At the first insn of a TB: if it starts the idle loop's check of the run
+ * queue, let helper_hpux_idle() (10.20) or helper_hpux9_idle() (9.05) halt
+ * the vCPU before the loop runs it. When the vCPU wakes up, the insn queue
+ * says to run it again.
+ */
+static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env,
+                          const HpuxInsnWord *words, int n, bool hpux9)
 {
     vaddr pc = ctx->base.pc_next;
 
     if (tb_page_addr0(ctx->base.tb) == -1) {
         return;
     }
-    for (int i = 0; i < ARRAY_SIZE(hpux_idle_loop); i++) {
-        vaddr addr = pc + hpux_idle_loop[i].off;
+    for (int i = 0; i < n; i++) {
+        vaddr addr = pc + words[i].off;
 
         if (!translator_is_same_page(&ctx->base, addr) ||
             translator_ldl_end(env, &ctx->base, addr, mo_endian(ctx))
-            != hpux_idle_loop[i].insn) {
+            != words[i].insn) {
             return;
         }
     }
@@ -4842,7 +4869,11 @@ static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env)
     trace_hppa_hpux_match("idle loop", pc);
     install_iaq_entries(ctx, &ctx->iaq_f, &ctx->iaq_b);
     nullify_save(ctx);
-    gen_helper_hpux_idle(tcg_env);
+    if (hpux9) {
+        gen_helper_hpux9_idle(tcg_env);
+    } else {
+        gen_helper_hpux_idle(tcg_env);
+    }
 }
 
 /*
@@ -4857,11 +4888,6 @@ static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env)
  * counter to the end of the counting loop, as offsets from the first one.
  * Nothing is masked: another build of the server is left alone.
  */
-typedef struct {
-    int16_t off;
-    uint32_t insn;
-} HpuxInsnWord;
-
 static const HpuxInsnWord hpux_x11_calibrate[] = {
     { 0x00, 0x6bc03f99 },       /* stw   r0,-34(sp)           count = 0 */
     { 0x04, 0x4bd73f99 },       /* ldw   -34(sp),r23 */
@@ -5019,11 +5045,16 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 
 #ifndef CONFIG_USER_ONLY
         if (ctx->hpux_idle && ctx->base.num_insns == 1
-            && insn == hpux_idle_loop[0].insn
             && ctx->null_cond.c == TCG_COND_NEVER
             && !iaqe_variable(&ctx->iaq_b)
             && ctx->iaq_b.disp == ctx->iaq_f.disp + 4) {
-            gen_hpux_idle(ctx, env);
+            if (insn == hpux_idle_loop[0].insn) {
+                gen_hpux_idle(ctx, env, hpux_idle_loop,
+                              ARRAY_SIZE(hpux_idle_loop), false);
+            } else if (insn == hpux9_idle_loop[2].insn) {
+                gen_hpux_idle(ctx, env, hpux9_idle_loop,
+                              ARRAY_SIZE(hpux9_idle_loop), true);
+            }
         }
         if (ctx->hpux_x11_pace && ctx->base.num_insns == 1) {
             if (insn == hpux_x11_calibrate[0].insn) {
