@@ -2,6 +2,7 @@ Windows NT 3.1 (build 511, SP3) for DEC Alpha on QEMU's DECpc AXP 150 (Jensen)
 
 Run ./run.sh (macOS 26+ arm64, Linux x86_64/aarch64 with glibc 2.34+ and X11/XWayland) or run.cmd (Windows 10+ x64).
 NT logs on automatically as Administrator (no password). Extra QEMU options are passed through, e.g. ./run.sh -display vnc=:1.
+Mouse: the vmmouse driver (LEMU machines/vmmouse) is installed, so the pointer moves in and out of the window without a grab.
 Press a key during the firmware's 5 s countdown for the ARC menus. Its "NVRAM inconsistent" warning is harmless.
 NT's boot screen stays blank until the desktop appears.
 QEMU halts the CPU while NT is idle, so an idle VM uses about 2% of a host core.
