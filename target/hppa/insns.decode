@@ -450,9 +450,12 @@ bl              111010 ..... ..... 100 ........... .   .        @bl
 bl              111010 ..... ..... 101 ........... n:1 .        &BL l=2 \
                 disp=%assemble_22
 b_gate          111010 ..... ..... 001 ........... .   .        @bl
-blr             111010 l:5   x:5   010 00000000000 n:1 0
-nopbts          111010 00000 00000 010 0---------1   0 1    # clrbts/popbts
-nopbts          111010 00000 ----- 010 00000000000   0 1    # pushbts/pushnom
+{
+  nopbts        111010 00000 00000 010 0---------1   0 1    # clrbts/popbts
+  nopbts        111010 00000 ----- 010 00000000000   0 1    # pushbts/pushnom
+  # Real CPUs ignore the reserved bits of BLR; HP-UX 9 programs set some.
+  blr           111010 l:5   x:5   010 ----------- n:1 -
+}
 bv              111010 b:5   x:5   110 00000000000 n:1 0
 bve             111010 b:5   00000 110 10000000000 n:1 -        l=0
 bve             111010 b:5   00000 111 10000000000 n:1 -        l=2
