@@ -47,6 +47,7 @@ struct HppaMachineState {
     DeviceState *lasi_dev;
     uint64_t memsplit_addr;
     bool legacy_fw;
+    bool hpux_idle;
 };
 
 #define MIN_SEABIOS_HPPA_VERSION 26 /* require at least this fw version */
@@ -320,6 +321,7 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine)
     /* Create CPUs.  */
     for (unsigned int i = 0; i < smp_cpus; i++) {
         cpu[i] = HPPA_CPU(cpu_create(machine->cpu_type));
+        cpu[i]->hpux_idle = hpm->hpux_idle;
     }
 
     /* Initialize memory */
@@ -900,6 +902,21 @@ static void hppa_set_legacy_fw(Object *obj, bool value, Error **errp)
     HPPA_COMMON_MACHINE(obj)->legacy_fw = value;
 }
 
+static bool hppa_get_hpux_idle(Object *obj, Error **errp)
+{
+    return HPPA_COMMON_MACHINE(obj)->hpux_idle;
+}
+
+static void hppa_set_hpux_idle(Object *obj, bool value, Error **errp)
+{
+    HPPA_COMMON_MACHINE(obj)->hpux_idle = value;
+}
+
+static void hppa_machine_instance_init(Object *obj)
+{
+    HPPA_COMMON_MACHINE(obj)->hpux_idle = true;
+}
+
 static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -919,6 +936,10 @@ static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
                                    hppa_set_legacy_fw);
     object_class_property_set_description(oc, "legacy-fw",
         "Put the CPUs and fw_cfg where SeaBIOS-hppa 25 and older expect them");
+    object_class_property_add_bool(oc, "hpux-idle", hppa_get_hpux_idle,
+                                   hppa_set_hpux_idle);
+    object_class_property_set_description(oc, "hpux-idle",
+        "Halt the CPU in the HP-UX 10.20 idle loop instead of spinning");
 }
 
 static void HP_B160L_machine_init_class_init(ObjectClass *oc, const void *data)
@@ -998,6 +1019,7 @@ static const TypeInfo hppa_machine_types[] = {
         .name           = TYPE_HPPA_COMMON_MACHINE,
         .parent         = TYPE_MACHINE,
         .instance_size  = sizeof(HppaMachineState),
+        .instance_init  = hppa_machine_instance_init,
         .class_init     = hppa_machine_common_class_init,
         .abstract       = true,
         .interfaces = (const InterfaceInfo[]) {

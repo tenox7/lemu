@@ -13,6 +13,7 @@ hppa_ss.add(files(
 
 hppa_system_ss = ss.source_set()
 hppa_system_ss.add(files(
+  'hpux_idle.c',
   'int_helper.c',
   'machine.c',
   'mem_helper.c',

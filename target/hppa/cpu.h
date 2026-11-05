@@ -297,6 +297,22 @@ struct ArchCPU {
 
     CPUHPPAState env;
     QEMUTimer *alarm_timer;
+
+    /* Halt in the HP-UX 10.20 idle loop, set by the board (hpux_idle.c) */
+    bool hpux_idle;
+    /* Rounds of the idle loop with nothing to do, and the interrupts seen */
+    unsigned int hpux_idle_rounds;
+    uint64_t hpux_idle_ints;
+    uint64_t hpux_idle_seen;
+    /*
+     * Set when the vCPU is about to halt, and while it is halted: the
+     * per-processor structure and the number of the processor whose work it
+     * waits for. Other vCPUs read them to find whom to wake.
+     */
+    uint32_t hpux_idle_pcpu;
+    uint32_t hpux_idle_id;
+    /* Another vCPU gave this one work: see hppa_cpu_has_work() */
+    bool hpux_idle_wake;
 };
 
 /**

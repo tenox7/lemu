@@ -17,3 +17,8 @@ disable hppa_tlb_lpa_failed(void *env, uint64_t addr) "env=%p addr=0x%lx"
 
 # op_helper.c
 disable hppa_tlb_probe(uint64_t addr, int level, int want) "addr=0x%lx level=%d want=%d"
+
+# hpux_idle.c, translate.c
+hppa_hpux_match(const char *what, uint64_t pc) "%s found at pc=0x%" PRIx64
+hppa_hpux_idle(int cpu, uint64_t pc) "cpu=%d halts in the idle loop at pc=0x%" PRIx64
+hppa_hpux_bell(int src, int dst, uint32_t pcpu) "cpu=%d wakes cpu=%d, which waits for pcpu=0x%" PRIx32

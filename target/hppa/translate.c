@@ -29,6 +29,7 @@
 #include "exec/translation-block.h"
 #include "exec/target_page.h"
 #include "exec/log.h"
+#include "trace.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -90,6 +91,7 @@ typedef struct DisasContext {
     bool psw_b_next;
     bool is_pa20;
     bool insn_start_updated;
+    bool hpux_idle;
 
     MemOp mo_align;
 } DisasContext;
@@ -4679,6 +4681,12 @@ static void hppa_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 
     ctx->zero = tcg_constant_i64(0);
 
+#ifndef CONFIG_USER_ONLY
+    ctx->hpux_idle = env_archcpu(cpu_env(cs))->hpux_idle
+                     && ctx->privilege == PRIV_KERNEL
+                     && !(tb_cflags(ctx->base.tb) & CF_SINGLE_STEP);
+#endif
+
     /* Bound the number of instructions by those left on the page.  */
     bound = -(ctx->base.pc_first | TARGET_PAGE_MASK) / 4;
     ctx->base.max_insns = MIN(ctx->base.max_insns, bound);
@@ -4721,6 +4729,149 @@ static void hppa_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
     ctx->insn_start_updated = false;
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * The idle loop of the HP-UX 10.20 kernel (B2352B, built 9 June 1996) spins
+ * on a handful of flags and queue lengths, see hpux_idle.c. These are its
+ * words, as offsets from the first one, which is where the loop checks the
+ * run queue of this processor: that check, the exits to the code that looks
+ * for work, and the tail of the loop with its checks of the flags. Nothing is
+ * masked: a kernel built differently keeps spinning.
+ */
+static const struct {
+    int16_t off;
+    uint32_t insn;
+} hpux_idle_loop[] = {
+    /* the run queue counts */
+    { 0x000, 0x49750010 },      /* ldw   8(r11),r21           queue length */
+    { 0x004, 0x49700018 },      /* ldw   c(r11),r16 */
+    { 0x008, 0x0a150618 },      /* add   r21,r16,r24 */
+    { 0x00c, 0x6bd83f39 },      /* stw   r24,-64(sp) */
+    { 0x010, 0x49770a30 },      /* ldw   518(r11),r23         other count */
+    { 0x014, 0x49790a38 },      /* ldw   51c(r11),r25 */
+    { 0x018, 0x0b370614 },      /* add   r23,r25,r20 */
+    { 0x01c, 0x6bd43e99 },      /* stw   r20,-b4(sp) */
+    { 0x020, 0x8b148120 },      /* cmpb,>>= r20,r24,done */
+    { 0x024, 0x6bd43f41 },      /* stw   r20,-60(sp) */
+    { 0x0b8, 0x4bd33e99 },      /* ldw   -b4(sp),r19 */
+    { 0x0bc, 0x8e60815a },      /* cmpib,>>=,n 0,r19,tail */
+    /* the tail: tick count, stop flag, work flag, back to the top */
+    { 0x170, 0x2b6cbfff },      /* addil L%-66800,dp,r1 */
+    { 0x174, 0x48330f60 },      /* ldw   7b0(r1),r19          lbolt */
+    { 0x178, 0x68730270 },      /* stw   r19,138(r3) */
+    { 0x17c, 0x2b7fdfff },      /* addil L%-1800,dp,r1 */
+    { 0x180, 0x483600d0 },      /* ldw   68(r1),r22           stop flag */
+    { 0x184, 0x86c021c2 },      /* cmpib,=,n 0,r22,... */
+    { 0x26c, 0x48610138 },      /* ldw   9c(r3),r1            work flag */
+    { 0x270, 0x84202012 },      /* cmpib,=,n 0,r1,... */
+    { 0x274, 0x487a0138 },      /* ldw   9c(r3),r26 */
+    { 0x278, 0xe84009a0 },      /* b,l   ...,rp */
+    { 0x27c, 0x37d93ef9 },      /* ldo   -84(sp),r25 */
+    { 0x280, 0x2b7fdfff },      /* addil L%-1800,dp,r1 */
+    { 0x284, 0x483c0b30 },      /* ldw   598(r1),ret0         owner */
+    { 0x288, 0x938037ff },      /* cmpiclr,<> -1,ret0,r0 */
+    { 0x28c, 0x68240b30 },      /* stw   r4,598(r1) */
+    { 0x290, 0x2b7fdfff },      /* addil L%-1800,dp,r1 */
+    { 0x294, 0x483c0b28 },      /* ldw   594(r1),ret0         run again */
+    { 0x298, 0x8f8038e7 },      /* cmpib,<>,n 0,ret0,top */
+    { 0x29c, 0x6bc93ee1 },      /* stw   r9,-90(sp) */
+    { 0x2a0, 0x2b7fdfff },      /* addil L%-1800,dp,r1 */
+    { 0x2a4, 0x48350b30 },      /* ldw   598(r1),r21 */
+    { 0x2a8, 0x8aa438c7 },      /* cmpb,<>,n r4,r21,top */
+    { 0x2ac, 0x6bc93ee1 },      /* stw   r9,-90(sp) */
+};
+
+/*
+ * At the first insn of a TB: if it starts the idle loop's check of the run
+ * queue, let helper_hpux_idle() halt the vCPU before the loop runs it. When
+ * the vCPU wakes up, the insn queue says to run it again.
+ */
+static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env)
+{
+    vaddr pc = ctx->base.pc_next;
+
+    if (tb_page_addr0(ctx->base.tb) == -1) {
+        return;
+    }
+    for (int i = 0; i < ARRAY_SIZE(hpux_idle_loop); i++) {
+        vaddr addr = pc + hpux_idle_loop[i].off;
+
+        if (!translator_is_same_page(&ctx->base, addr) ||
+            translator_ldl_end(env, &ctx->base, addr, mo_endian(ctx))
+            != hpux_idle_loop[i].insn) {
+            return;
+        }
+    }
+
+    trace_hppa_hpux_match("idle loop", pc);
+    install_iaq_entries(ctx, &ctx->iaq_f, &ctx->iaq_b);
+    nullify_save(ctx);
+    gen_helper_hpux_idle(tcg_env);
+}
+
+/*
+ * The only two places where the HP-UX 10.20 scheduler hands a thread to a
+ * processor: it adds one to the length of one of the two run queues of the
+ * processor structure at r24 - 0x518. An idle processor gets no interrupt,
+ * so helper_hpux_bell() wakes its vCPU after each of these stores. Each word
+ * is given as the offset from the store, which is the third one.
+ */
+static const struct {
+    int16_t off;
+    uint32_t insn;
+} hpux_bell_stores[2][9] = {
+    {
+        { -8, 0x4b1a0010 },     /* ldw   8(r24),r26 */
+        { -4, 0x375d0002 },     /* ldo   1(r26),ret1 */
+        { 0, 0x0f1d1290 },      /* stw   ret1,8(r24) */
+        { 4, 0x489301d0 },      /* ldw   e8(r4),r19 */
+        { 8, 0x86603caf },      /* cmpib,=,n 0,r19,... */
+        { 12, 0x2b61cfff },     /* addil L%-3e000,dp,r1 */
+        { 16, 0x4b140a30 },     /* ldw   518(r24),r20 */
+        { 20, 0x36950002 },     /* ldo   1(r20),r21 */
+        { 24, 0x6b150a30 },     /* stw   r21,518(r24) */
+    }, {
+        { -8, 0x4b150018 },     /* ldw   c(r24),r21 */
+        { -4, 0x36b60002 },     /* ldo   1(r21),r22 */
+        { 0, 0x0f161298 },      /* stw   r22,c(r24) */
+        { 4, 0x489401d0 },      /* ldw   e8(r4),r20 */
+        { 8, 0x86803c57 },      /* cmpib,=,n 0,r20,... */
+        { 12, 0x2b61cfff },     /* addil L%-3e000,dp,r1 */
+        { 16, 0x4b1c0a38 },     /* ldw   51c(r24),ret0 */
+        { 20, 0x37810002 },     /* ldo   1(ret0),r1 */
+        { 24, 0x6b010a38 },     /* stw   r1,51c(r24) */
+    },
+};
+
+/* Is the insn just translated one of the stores above? */
+static bool hpux_bell_store(DisasContext *ctx, CPUHPPAState *env, uint32_t insn)
+{
+    vaddr pc = ctx->base.pc_next;
+
+    if (tb_page_addr0(ctx->base.tb) == -1) {
+        return false;
+    }
+    for (int k = 0; k < ARRAY_SIZE(hpux_bell_stores); k++) {
+        bool match = insn == hpux_bell_stores[k][2].insn;
+
+        for (int i = 0; match && i < ARRAY_SIZE(hpux_bell_stores[k]); i++) {
+            vaddr addr = pc + hpux_bell_stores[k][i].off;
+
+            match = i == 2
+                || (translator_is_same_page(&ctx->base, addr)
+                    && translator_ldl_end(env, &ctx->base, addr,
+                                          mo_endian(ctx))
+                       == hpux_bell_stores[k][i].insn);
+        }
+        if (match) {
+            trace_hppa_hpux_match("queue store", pc);
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
@@ -4741,6 +4892,16 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         uint32_t insn = translator_ldl_end(env, &ctx->base, ctx->base.pc_next,
                                            mo_endian(ctx));
 
+#ifndef CONFIG_USER_ONLY
+        if (ctx->hpux_idle && ctx->base.num_insns == 1
+            && insn == hpux_idle_loop[0].insn
+            && ctx->null_cond.c == TCG_COND_NEVER
+            && !iaqe_variable(&ctx->iaq_b)
+            && ctx->iaq_b.disp == ctx->iaq_f.disp + 4) {
+            gen_hpux_idle(ctx, env);
+        }
+#endif
+
         /*
          * Set up the IA queue for the next insn.
          * This will be overwritten by a branch.
@@ -4759,6 +4920,12 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
             }
             ret = ctx->base.is_jmp;
             assert(ctx->null_lab == NULL);
+#ifndef CONFIG_USER_ONLY
+            if (ctx->hpux_idle && ret == DISAS_NEXT
+                && hpux_bell_store(ctx, env, insn)) {
+                gen_helper_hpux_bell(tcg_env, cpu_gr[24]);
+            }
+#endif
         }
 
         if (ret != DISAS_NORETURN) {

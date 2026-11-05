@@ -137,7 +137,21 @@ static void hppa_restore_state_to_opc(CPUState *cs,
 #ifndef CONFIG_USER_ONLY
 static bool hppa_cpu_has_work(CPUState *cs)
 {
-    return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI);
+    HPPACPU *cpu = HPPA_CPU(cs);
+    CPUHPPAState *env = &cpu->env;
+    int irq = CPU_INTERRUPT_NMI;
+
+    /*
+     * A vCPU that hpux_idle.c has halted (it publishes hpux_idle_pcpu) wakes
+     * only for an interrupt it can take: HP-UX leaves masked bits in EIRR,
+     * and CPU_INTERRUPT_HARD stays set for them.
+     */
+    if (!qatomic_read(&cpu->hpux_idle_pcpu) ||
+        (qatomic_read(&env->cr[CR_EIRR]) & env->cr[CR_EIEM])) {
+        irq |= CPU_INTERRUPT_HARD;
+    }
+    /* hpux_idle_wake: another vCPU gave this one work */
+    return cpu_test_interrupt(cs, irq) || qatomic_read(&cpu->hpux_idle_wake);
 }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -219,6 +233,10 @@ static void hppa_cpu_reset_hold(Object *obj, ResetType type)
     }
     cs->exception_index = -1;
     cs->halted = 0;
+    cpu->hpux_idle_rounds = 0;
+    cpu->hpux_idle_pcpu = 0;
+    cpu->hpux_idle_id = 0;
+    cpu->hpux_idle_wake = false;
     cpu_set_pc(cs, 0xf0000004);
 
     memset(env, 0, offsetof(CPUHPPAState, end_reset_fields));

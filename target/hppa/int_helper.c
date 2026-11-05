@@ -106,6 +106,9 @@ void hppa_cpu_do_interrupt(CPUState *cs)
     uint64_t old_psw, old_gva_offset_mask;
     uint64_t last_pc = cs->cc->get_pc(cs);
 
+    /* hpux_idle.c notices that the idle loop was left */
+    cpu->hpux_idle_ints++;
+
     /* As documented in pa2.0 -- interruption handling.  */
     /* step 1 */
     env->cr[CR_IPSW] = old_psw = cpu_hppa_get_psw(env);
