@@ -4528,12 +4528,30 @@ static bool do_fmpyadd_s(DisasContext *ctx, arg_mpyadd *a, bool is_sub)
     int ta = fmpyadd_s_reg(a->ta);
     int rm2 = fmpyadd_s_reg(a->rm2);
     int rm1 = fmpyadd_s_reg(a->rm1);
+    TCGv_i32 x, y, u, v;
 
     nullify_over(ctx);
 
-    do_fop_weww(ctx, tm, rm1, rm2, gen_helper_fmpy_s);
-    do_fop_weww(ctx, ta, ta, ra,
-                is_sub ? gen_helper_fsub_s : gen_helper_fadd_s);
+    /*
+     * The multiply and the add or subtract run in parallel: both read their
+     * operands before either one writes its result. The target of the
+     * multiply can be the operand RA of the add, which then sees the old
+     * value (a software pipelined loop does that).
+     */
+    x = load_frw0_i32(rm1);
+    y = load_frw0_i32(rm2);
+    u = load_frw0_i32(ta);
+    v = load_frw0_i32(ra);
+
+    gen_helper_fmpy_s(x, tcg_env, x, y);
+    if (is_sub) {
+        gen_helper_fsub_s(u, tcg_env, u, v);
+    } else {
+        gen_helper_fadd_s(u, tcg_env, u, v);
+    }
+
+    save_frw_i32(tm, x);
+    save_frw_i32(ta, u);
 
     return nullify_end(ctx);
 }
@@ -4550,11 +4568,25 @@ static bool trans_fmpysub_f(DisasContext *ctx, arg_mpyadd *a)
 
 static bool do_fmpyadd_d(DisasContext *ctx, arg_mpyadd *a, bool is_sub)
 {
+    TCGv_i64 x, y, u, v;
+
     nullify_over(ctx);
 
-    do_fop_dedd(ctx, a->tm, a->rm1, a->rm2, gen_helper_fmpy_d);
-    do_fop_dedd(ctx, a->ta, a->ta, a->ra,
-                is_sub ? gen_helper_fsub_d : gen_helper_fadd_d);
+    /* Both operations read their operands before either one writes. */
+    x = load_frd0(a->rm1);
+    y = load_frd0(a->rm2);
+    u = load_frd0(a->ta);
+    v = load_frd0(a->ra);
+
+    gen_helper_fmpy_d(x, tcg_env, x, y);
+    if (is_sub) {
+        gen_helper_fsub_d(u, tcg_env, u, v);
+    } else {
+        gen_helper_fadd_d(u, tcg_env, u, v);
+    }
+
+    save_frd(a->tm, x);
+    save_frd(a->ta, u);
 
     return nullify_end(ctx);
 }
