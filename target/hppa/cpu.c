@@ -100,6 +100,11 @@ static TCGTBCPUState hppa_get_tb_cpu_state(CPUState *cs)
      */
     flags |= TB_FLAG_FPU_DISABLED *
              (!(env->cr[CR_SCRCCR] & 0xc0) && (env->psw & PSW_Q));
+    /* A pending delayed FP trap, taken by the next FP insn: same rules. */
+    flags |= TB_FLAG_FP_TRAP *
+             (FIELD_EX32(env->fr0_shadow, FPSR, T)
+              && (env->cr[CR_SCRCCR] & 0xc0) && (env->psw & PSW_Q));
+    flags |= TB_FLAG_FP_ENA * (FIELD_EX32(env->fr0_shadow, FPSR, ENABLES) != 0);
     if ((env->sr[4] == env->sr[5])
         & (env->sr[4] == env->sr[6])
         & (env->sr[4] == env->sr[7])) {

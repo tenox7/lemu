@@ -98,6 +98,33 @@ void HELPER(write_eirr)(CPUHPPAState *env, target_ulong val)
     bql_unlock();
 }
 
+/*
+ * The insn word at IAOQ_F, as the CPU with this PSW sees it, or 0 if it
+ * can't be read.  Read it from physical memory, lest we raise another
+ * exception from some sort of TLB issue.
+ * ??? An alternate fool-proof method would be to store the instruction
+ * data into the unwind info.  That's probably a bit too much in the way
+ * of extra storage required.
+ */
+uint32_t hppa_insn_at_iaoq_f(CPUHPPAState *env, uint64_t psw,
+                             uint64_t gva_offset_mask)
+{
+    vaddr vaddr = env->iaoq_f & -4;
+    hwaddr paddr = vaddr;
+
+    if (psw & PSW_C) {
+        int prot, t;
+
+        vaddr = hppa_form_gva_mask(gva_offset_mask, env->iasq_f, vaddr);
+        t = hppa_get_physical_address(env, vaddr, MMU_KERNEL_IDX,
+                                      0, 0, &paddr, &prot);
+        if (t >= 0) {
+            return 0;
+        }
+    }
+    return ldl_be_phys(env_cpu(env)->as, paddr);
+}
+
 void hppa_cpu_do_interrupt(CPUState *cs)
 {
     HPPACPU *cpu = HPPA_CPU(cs);
@@ -167,34 +194,13 @@ void hppa_cpu_do_interrupt(CPUState *cs)
         case EXCP_TLB_DIRTY:
         case EXCP_PAGE_REF:
         case EXCP_ASSIST_EMU:
-            {
-                /* Avoid reading directly from the virtual address, lest we
-                   raise another exception from some sort of TLB issue.  */
-                /* ??? An alternate fool-proof method would be to store the
-                   instruction data into the unwind info.  That's probably
-                   a bit too much in the way of extra storage required.  */
-                vaddr vaddr = env->iaoq_f & -4;
-                hwaddr paddr = vaddr;
-
-                if (old_psw & PSW_C) {
-                    int prot, t;
-
-                    vaddr = hppa_form_gva_mask(old_gva_offset_mask,
-					       env->iasq_f, vaddr);
-                    t = hppa_get_physical_address(env, vaddr, MMU_KERNEL_IDX,
-                                                  0, 0, &paddr, &prot);
-                    if (t >= 0) {
-                        /* We can't re-load the instruction.  */
-                        env->cr[CR_IIR] = 0;
-                        break;
-                    }
-                }
-                env->cr[CR_IIR] = ldl_be_phys(cs->as, paddr);
-                if (i == EXCP_ASSIST) {
-                    /* stuff insn code into bits of FP exception register #1 */
-                    env->fr[0] |= (env->cr[CR_IIR] & 0x03ffffff);
-                }
-            }
+            /*
+             * For EXCP_ASSIST this is the next FP insn, which takes a
+             * delayed trap: fp_delayed_trap() already put the insn that
+             * failed into FP exception register 1.
+             */
+            env->cr[CR_IIR] = hppa_insn_at_iaoq_f(env, old_psw,
+                                                  old_gva_offset_mask);
             break;
 
         default:

@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
+#include "accel/tcg/cpu-loop.h"
 #include "fpu/softfloat.h"
 
 void HELPER(loaded_fr0)(CPUHPPAState *env)
@@ -90,6 +91,60 @@ void cpu_hppa_loaded_fr0(CPUHPPAState *env)
      ? (X) / ((SRC) / (DST)) & (DST)    \
      : ((X) & (SRC)) * ((DST) / (SRC)))
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * An exception whose trap is enabled causes a delayed trap: the insn
+ * does not write its result, FP exception register 1 gets its exception
+ * code and insn bits, FPSR.T is set, and the next FP insn takes the
+ * assist exception trap (TB_FLAG_FP_TRAP).  So the trap handler returns
+ * to that next insn.  A trap on the failing insn itself made HP-UX run
+ * it again after the SIGFPE handler, forever (Netscape 4 on HP-UX 9).
+ */
+static G_NORETURN void fp_delayed_trap(CPUHPPAState *env, uintptr_t ra,
+                                       bool unimplemented)
+{
+    CPUState *cs = env_cpu(env);
+    uint32_t insn;
+
+    cpu_restore_state(cs, ra);
+    insn = hppa_insn_at_iaoq_f(env, env->psw, env->gva_offset_mask);
+    env->fr[0] |= insn & 0x03ffffff;
+    if (unimplemented) {
+        /* The code names the major opcode: 0x0c gives 0x09, 0x0e 0x0b. */
+        env->fr[0] |= (uint32_t)((extract32(insn, 26, 6) & 0x3a) | 1) << 26;
+    }
+
+    /* The insn is done: go on with the next one. */
+    env->iaoq_f = env->iaoq_b;
+    env->iasq_f = env->iasq_b;
+    env->iaoq_b = env->iaoq_f + 4;
+    env->psw_xb = 0;
+    cpu_loop_exit(cs);
+}
+
+/*
+ * A double-word store of fr0 saved the status register and exception
+ * register 1: it clears FPSR.T, so the trap handler can save the other
+ * FP registers.
+ */
+void HELPER(stored_fr0)(CPUHPPAState *env)
+{
+    env->fr0_shadow = FIELD_DP32(env->fr0_shadow, FPSR, T, 0);
+    env->fr[0] = deposit64(env->fr[0], 32 + R_FPSR_T_SHIFT, 1, 0);
+}
+
+/*
+ * Empty: called before an FP insn while an FP trap is enabled.  The FP op
+ * helpers are TCG_CALL_NO_RWG, so TCG may keep guest registers in host
+ * registers across them, but fp_delayed_trap() leaves the TB and env must
+ * then hold every guest register.  This TCG_CALL_NO_WG call makes TCG
+ * write them back.  Without traps enabled, no FP op helper leaves the TB.
+ */
+void HELPER(fp_sync)(void)
+{
+}
+#endif
+
 static void update_fr0_op(CPUHPPAState *env, uintptr_t ra)
 {
     uint32_t soft_exp = get_float_exception_flags(&env->fp_status);
@@ -131,8 +186,35 @@ static void update_fr0_op(CPUHPPAState *env, uintptr_t ra)
     env->fr[0] = (uint64_t)shadow << 32 | fr1;
 
     if (hard_exp & shadow) {
+#ifdef CONFIG_USER_ONLY
         hppa_dynamic_excp(env, EXCP_ASSIST, ra);
+#else
+        fp_delayed_trap(env, ra, false);
+#endif
     }
+}
+
+/*
+ * A conversion to fixed point that is invalid (NaN, infinity or out of
+ * range) while the invalid trap is enabled takes an unimplemented
+ * exception instead: no flags, no result, and the OS emulates the insn,
+ * as on HP's FPUs.  HP-UX 9's emulator then signals SIGFPE with the
+ * unimplemented code for a NaN and saturates other values quietly, and
+ * Netscape 4's SIGFPE handler expects exactly that.  With the trap
+ * disabled, the conversion saturates here as before.
+ */
+static void update_fr0_cnv(CPUHPPAState *env, uintptr_t ra)
+{
+#ifndef CONFIG_USER_ONLY
+    if ((get_float_exception_flags(&env->fp_status) & float_flag_invalid)
+        && FIELD_EX32(env->fr0_shadow, FPSR, ENA_V)) {
+        set_float_exception_flags(0, &env->fp_status);
+        env->fr0_shadow = FIELD_DP32(env->fr0_shadow, FPSR, T, 1);
+        env->fr[0] = (uint64_t)env->fr0_shadow << 32;
+        fp_delayed_trap(env, ra, true);
+    }
+#endif
+    update_fr0_op(env, ra);
 }
 
 float32 HELPER(fsqrt_s)(CPUHPPAState *env, float32 arg)
@@ -264,56 +346,56 @@ float64 HELPER(fcnv_dw_d)(CPUHPPAState *env, int64_t arg)
 int32_t HELPER(fcnv_s_w)(CPUHPPAState *env, float32 arg)
 {
     int32_t ret = float32_to_int32(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 int32_t HELPER(fcnv_d_w)(CPUHPPAState *env, float64 arg)
 {
     int32_t ret = float64_to_int32(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 int64_t HELPER(fcnv_s_dw)(CPUHPPAState *env, float32 arg)
 {
     int64_t ret = float32_to_int64(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 int64_t HELPER(fcnv_d_dw)(CPUHPPAState *env, float64 arg)
 {
     int64_t ret = float64_to_int64(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 int32_t HELPER(fcnv_t_s_w)(CPUHPPAState *env, float32 arg)
 {
     int32_t ret = float32_to_int32_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 int32_t HELPER(fcnv_t_d_w)(CPUHPPAState *env, float64 arg)
 {
     int32_t ret = float64_to_int32_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 int64_t HELPER(fcnv_t_s_dw)(CPUHPPAState *env, float32 arg)
 {
     int64_t ret = float32_to_int64_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 int64_t HELPER(fcnv_t_d_dw)(CPUHPPAState *env, float64 arg)
 {
     int64_t ret = float64_to_int64_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
@@ -348,56 +430,56 @@ float64 HELPER(fcnv_udw_d)(CPUHPPAState *env, uint64_t arg)
 uint32_t HELPER(fcnv_s_uw)(CPUHPPAState *env, float32 arg)
 {
     uint32_t ret = float32_to_uint32(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 uint32_t HELPER(fcnv_d_uw)(CPUHPPAState *env, float64 arg)
 {
     uint32_t ret = float64_to_uint32(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 uint64_t HELPER(fcnv_s_udw)(CPUHPPAState *env, float32 arg)
 {
     uint64_t ret = float32_to_uint64(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 uint64_t HELPER(fcnv_d_udw)(CPUHPPAState *env, float64 arg)
 {
     uint64_t ret = float64_to_uint64(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 uint32_t HELPER(fcnv_t_s_uw)(CPUHPPAState *env, float32 arg)
 {
     uint32_t ret = float32_to_uint32_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 uint32_t HELPER(fcnv_t_d_uw)(CPUHPPAState *env, float64 arg)
 {
     uint32_t ret = float64_to_uint32_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 uint64_t HELPER(fcnv_t_s_udw)(CPUHPPAState *env, float32 arg)
 {
     uint64_t ret = float32_to_uint64_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
 uint64_t HELPER(fcnv_t_d_udw)(CPUHPPAState *env, float64 arg)
 {
     uint64_t ret = float64_to_uint64_round_to_zero(arg, &env->fp_status);
-    update_fr0_op(env, GETPC());
+    update_fr0_cnv(env, GETPC());
     return ret;
 }
 
@@ -450,8 +532,13 @@ void HELPER(fcmp_s)(CPUHPPAState *env, float32 a, float32 b,
     } else {
         r = float32_compare_quiet(a, b, &env->fp_status);
     }
-    update_fr0_op(env, GETPC());
+    /*
+     * The compare sets C even when it takes the invalid trap, as HP's FP
+     * emulation in HP-UX and Linux does: a SIGFPE handler that returns
+     * then sees the right result.
+     */
     update_fr0_cmp(env, y, c, r);
+    update_fr0_op(env, GETPC());
 }
 
 void HELPER(fcmp_d)(CPUHPPAState *env, float64 a, float64 b,
@@ -463,8 +550,9 @@ void HELPER(fcmp_d)(CPUHPPAState *env, float64 a, float64 b,
     } else {
         r = float64_compare_quiet(a, b, &env->fp_status);
     }
-    update_fr0_op(env, GETPC());
+    /* C is set even on a trap: see HELPER(fcmp_s). */
     update_fr0_cmp(env, y, c, r);
+    update_fr0_op(env, GETPC());
 }
 
 float32 HELPER(fmpyfadd_s)(CPUHPPAState *env, float32 a, float32 b, float32 c)

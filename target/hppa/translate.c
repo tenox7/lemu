@@ -1709,6 +1709,10 @@ static bool do_floadw(DisasContext *ctx, unsigned rt, unsigned rb,
 
     if (rt == 0) {
         gen_helper_loaded_fr0(tcg_env);
+#ifndef CONFIG_USER_ONLY
+        /* FPSR.T may have changed: TB_FLAG_FP_TRAP. */
+        ctx->base.is_jmp = DISAS_IAQ_N_STALE_EXIT;
+#endif
     }
 
     return nullify_end(ctx);
@@ -1738,6 +1742,9 @@ static bool trans_fldw(DisasContext *ctx, arg_ldst *a)
     if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
         return gen_fmem_excp(ctx, a, MO_UL, PAGE_READ);
     }
+    if (ctx->tb_flags & TB_FLAG_FP_TRAP) {
+        return gen_excp_iir(ctx, EXCP_ASSIST);
+    }
     return do_floadw(ctx, a->t, a->b, a->x, a->scale ? 2 : 0,
                      a->disp, a->sp, a->m);
 }
@@ -1756,6 +1763,10 @@ static bool do_floadd(DisasContext *ctx, unsigned rt, unsigned rb,
 
     if (rt == 0) {
         gen_helper_loaded_fr0(tcg_env);
+#ifndef CONFIG_USER_ONLY
+        /* FPSR.T may have changed: TB_FLAG_FP_TRAP. */
+        ctx->base.is_jmp = DISAS_IAQ_N_STALE_EXIT;
+#endif
     }
 
     return nullify_end(ctx);
@@ -1765,6 +1776,9 @@ static bool trans_fldd(DisasContext *ctx, arg_ldst *a)
 {
     if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
         return gen_fmem_excp(ctx, a, MO_UQ, PAGE_READ);
+    }
+    if (ctx->tb_flags & TB_FLAG_FP_TRAP) {
+        return gen_excp_iir(ctx, EXCP_ASSIST);
     }
     return do_floadd(ctx, a->t, a->b, a->x, a->scale ? 3 : 0,
                      a->disp, a->sp, a->m);
@@ -1798,6 +1812,9 @@ static bool trans_fstw(DisasContext *ctx, arg_ldst *a)
     if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
         return gen_fmem_excp(ctx, a, MO_UL, PAGE_WRITE);
     }
+    if (ctx->tb_flags & TB_FLAG_FP_TRAP) {
+        return gen_excp_iir(ctx, EXCP_ASSIST);
+    }
     return do_fstorew(ctx, a->t, a->b, a->x, a->scale ? 2 : 0,
                       a->disp, a->sp, a->m);
 }
@@ -1813,6 +1830,16 @@ static bool do_fstored(DisasContext *ctx, unsigned rt, unsigned rb,
     tmp = load_frd(rt);
     do_store_64(ctx, tmp, rb, rx, scale, disp, sp, modify, MO_UQ);
 
+#ifndef CONFIG_USER_ONLY
+    if (rt == 0) {
+        /* Storing the status register clears FPSR.T. */
+        gen_helper_stored_fr0(tcg_env);
+        if (ctx->tb_flags & TB_FLAG_FP_TRAP) {
+            ctx->base.is_jmp = DISAS_IAQ_N_STALE_EXIT;
+        }
+    }
+#endif
+
     return nullify_end(ctx);
 }
 
@@ -1820,6 +1847,10 @@ static bool trans_fstd(DisasContext *ctx, arg_ldst *a)
 {
     if (ctx->tb_flags & TB_FLAG_FPU_DISABLED) {
         return gen_fmem_excp(ctx, a, MO_UQ, PAGE_WRITE);
+    }
+    /* With a delayed trap pending, only a store of fr0 runs. */
+    if ((ctx->tb_flags & TB_FLAG_FP_TRAP) && a->t != 0) {
+        return gen_excp_iir(ctx, EXCP_ASSIST);
     }
     return do_fstored(ctx, a->t, a->b, a->x, a->scale ? 3 : 0,
                       a->disp, a->sp, a->m);
@@ -5131,6 +5162,30 @@ static bool decode_insn(DisasContext *ctx, uint32_t insn)
         case 0x26:
         case 0x2e:
             return gen_excp_iir(ctx, EXCP_ASSIST_EMU);
+        }
+    }
+    if (ctx->tb_flags & (TB_FLAG_FP_TRAP | TB_FLAG_FP_ENA)) {
+        switch (insn >> 26) {
+        case 0x0c:
+            if (extract32(insn, 7, 2)) {
+                break;
+            }
+            /* fall through */
+        case 0x06:
+        case 0x0e:
+        case 0x26:
+        case 0x2e:
+            if (ctx->tb_flags & TB_FLAG_FP_TRAP) {
+                /*
+                 * A delayed FP trap is pending: the next FP insn takes it.
+                 * The FP loads and stores check this in their trans
+                 * functions.
+                 */
+                return gen_excp_iir(ctx, EXCP_ASSIST);
+            }
+            /* This FP op may cause a delayed trap. */
+            gen_helper_fp_sync();
+            break;
         }
     }
 #endif

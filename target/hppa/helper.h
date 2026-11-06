@@ -83,6 +83,8 @@ DEF_HELPER_FLAGS_0(read_interval_timer, TCG_CALL_NO_RWG, tl)
 
 #ifndef CONFIG_USER_ONLY
 DEF_HELPER_5(fpu_mem, noreturn, env, tl, i32, i32, i32)
+DEF_HELPER_FLAGS_1(stored_fr0, TCG_CALL_NO_RWG, void, env)
+DEF_HELPER_FLAGS_0(fp_sync, TCG_CALL_NO_WG, void)
 DEF_HELPER_1(halt, noreturn, env)
 DEF_HELPER_1(hpux_idle, void, env)
 DEF_HELPER_2(hpux9_idle, void, env, i32)

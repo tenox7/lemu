@@ -401,6 +401,13 @@ hwaddr hppa_abs_to_phys_pa2_w1(uint8_t phys_addr_bits, vaddr addr);
 #define TB_FLAG_UNALIGN     0x400
 #define TB_FLAG_SPHASH      0x800
 #define TB_FLAG_FPU_DISABLED 0x1000
+/*
+ * A delayed floating-point trap is pending (FPSR.T): the next FP
+ * instruction takes the assist exception trap, see fp_delayed_trap().
+ */
+#define TB_FLAG_FP_TRAP     0x2000
+/* An FP trap is enabled (FPSR enable bits): see HELPER(fp_sync). */
+#define TB_FLAG_FP_ENA      0x4000
 #define CS_BASE_DIFFPAGE    (1 << 12)
 #define CS_BASE_DIFFSPACE   (1 << 13)
 
@@ -430,6 +437,8 @@ void hppa_cpu_do_interrupt(CPUState *cpu);
 bool hppa_cpu_exec_interrupt(CPUState *cpu, int int_req);
 int hppa_get_physical_address(CPUHPPAState *env, vaddr addr, int mmu_idx,
                               int type, MemOp mop, hwaddr *pphys, int *pprot);
+uint32_t hppa_insn_at_iaoq_f(CPUHPPAState *env, uint64_t psw,
+                             uint64_t gva_offset_mask);
 void hppa_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
                                      vaddr addr, unsigned size,
                                      MMUAccessType access_type,
