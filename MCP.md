@@ -127,6 +127,7 @@ Use these:
 | Stop when the guest gets to an address (a breakpoint) | `debug-run` |
 | Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
 | See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
+| See how the CPU got to where it stopped | `debug-run` with `history` |
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |
@@ -197,6 +198,13 @@ Use these:
   `address` too, whichever comes first stops it. Only CPUs are
   watched, not devices that write memory themselves (DMA). On hppa,
   give the whole address, space and offset, as for other memory.
+- **How did it get here?** `debug-run` with `history: 16` notes the
+  last 16 blocks of code each CPU runs, and shows them when it stops,
+  oldest first, as start-end ranges. A block runs from where a jump
+  lands to the next jump, so each block ends in the jump to the next
+  one; a loop of one block shows once, with `xN`. It works the same on
+  every CPU, with no stack to unwind. The guest runs slower while the
+  blocks are noted.
 - **Every hit, with the guest running on:** `debug-trace` logs each
   arrival at `address`, or each access to `watch`, with the
   `registers` and `memory` you ask for, until `count` hits or

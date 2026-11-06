@@ -32,7 +32,9 @@
 #ifdef CONFIG_TCG
 #include "exec/cpu-interrupt.h"
 #include "exec/tb-flush.h"
+#include "exec/tb-history.h"
 #include "exec/watchpoint.h"
+#include "qemu/host-utils.h"
 #endif
 
 #define WRITE_MAX_BYTES         1024
@@ -1201,6 +1203,7 @@ struct McpRun {
     QemuInputCtx *ctx;
     int64_t limit;              /* the hits to wait for */
     int64_t end;                /* QEMU_CLOCK_REALTIME, ms */
+    int history;                /* blocks to note, 0 for none */
     /* debug-trace: each hit, with the VM stopped there */
     void (*log)(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
                 bool retry);
@@ -1246,6 +1249,78 @@ static void mcp_run_arrivals(McpRun *r)
     }
 }
 
+#define HISTORY_MAX     1024
+
+/*
+ * Note the last @n blocks of code that the CPUs of @b run.  The VM is
+ * stopped.  Their blocks no longer chain, so the guest runs slower.
+ */
+static void mcp_history_on(McpBreak *b, int n)
+{
+    uint32_t size = pow2ceil(n);
+    CPUState *cpu;
+
+    CPU_FOREACH(cpu) {
+        CPUTBHistory *h;
+
+        if (b->only && cpu != b->only) {
+            continue;
+        }
+        h = g_malloc0(sizeof(*h) + size * sizeof(h->e[0]));
+        h->size = size;
+        g_free(cpu->tb_history);
+        cpu->tb_history = h;
+        tcg_update_cflags(cpu);
+    }
+}
+
+/* Stop noting them; the vCPUs pause for it if the VM runs */
+static void mcp_history_off(void *opaque)
+{
+    bool running = runstate_is_running();
+    CPUState *cpu;
+
+    if (running) {
+        pause_all_vcpus();
+    }
+    CPU_FOREACH(cpu) {
+        CPUTBHistory *h = cpu->tb_history;
+
+        cpu->tb_history = NULL;
+        tcg_update_cflags(cpu);
+        g_free(h);
+    }
+    if (running) {
+        resume_all_vcpus();
+    }
+}
+
+/* The last @n blocks @cpu ran, oldest first: "0x1000-0x1013 x5" */
+static strList *mcp_history_lines(CPUState *cpu, int n)
+{
+    CPUTBHistory *h = cpu->tb_history;
+    strList *list = NULL, **tail = &list;
+    uint64_t i;
+
+    if (!h) {
+        return NULL;
+    }
+    for (i = MIN(h->count, (uint64_t)n); i > 0; i--) {
+        CPUTBHistoryEntry *e = &h->e[(h->next - i) & (h->size - 1)];
+        g_autofree char *end = e->size ?
+            g_strdup_printf("-0x%" PRIx64, (uint64_t)e->pc + e->size - 1) :
+            NULL;
+        g_autofree char *rep = e->repeat > 1 ?
+            g_strdup_printf(" x%" PRIu32, e->repeat) : NULL;
+
+        QAPI_LIST_APPEND(tail, g_strdup_printf("0x%" PRIx64 "%s%s",
+                                               (uint64_t)e->pc,
+                                               end ? end : "",
+                                               rep ? rep : ""));
+    }
+    return list;
+}
+
 static void mcp_run_access(McpRun *r, CPUState *cpu)
 {
     McpWatchSeen seen;
@@ -1277,6 +1352,9 @@ static void coroutine_fn mcp_run(McpRun *r)
         if (!runstate_is_running()) {
             mcp_run_arrivals(r);
         }
+    }
+    if (r->history && !runstate_is_running()) {
+        mcp_history_on(b, r->history);
     }
     while (r->n_hits < r->limit) {
         if (runstate_is_running()) {
@@ -1380,6 +1458,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
                                          bool has_cpu, int64_t cpu_index,
                                          bool has_memory,
                                          McpDebugMemoryList *memory,
+                                         bool has_history, int64_t history,
                                          bool has_timeout_ms,
                                          int64_t timeout_ms, Error **errp)
 {
@@ -1391,7 +1470,8 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     McpWatchSeen *seen = &r.seen;
     McpDebugStop *res;
     CPUState *at, *cpu;
-    int n_mem = 0;
+    strList *hist = NULL, *l;
+    int n_mem = 0, n;
     const char *hit_word;
 
     if (!r.ctx) {
@@ -1410,6 +1490,11 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     }
     timeout_ms = has_timeout_ms ? timeout_ms : RUN_DEFAULT_MS;
     timeout_ms = MIN(MAX(timeout_ms, 0), mcp_wait_max_ms());
+    if (has_history && (history < 0 || history > HISTORY_MAX)) {
+        error_setg(errp, "history must be 0 to %d", HISTORY_MAX);
+        return NULL;
+    }
+    r.history = has_history ? history : 0;
     if (!mcp_run_parse(&r, address, has_cpu, cpu_index, errp)) {
         return NULL;
     }
@@ -1430,6 +1515,14 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
 
     mcp_run(&r);
     at = r.at;
+    cpu = at ? at : b->only ? b->only : first_cpu;
+    if (r.history) {
+        /* how the CPU shown got there, read while it is stopped */
+        if (!runstate_is_running()) {
+            hist = mcp_history_lines(cpu, r.history);
+        }
+        mcp_debug_outside(mcp_history_off, NULL);
+    }
     /* the time ran out or the call was cancelled: the guest goes on */
     if ((r.result == RUN_TIMEOUT || r.result == RUN_CANCELLED) &&
         !runstate_is_running()) {
@@ -1437,6 +1530,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     }
     mcp_debug_end();
     if (r.result == RUN_CANCELLED) {
+        qapi_free_strList(hist);
         error_setg(errp, "cancelled");
         return NULL;
     }
@@ -1528,13 +1622,27 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         g_assert_not_reached();
     }
     if (!res->running) {
-        cpu = at ? at : b->only ? b->only : first_cpu;
         if (!at) {
             g_string_append_printf(s, "; CPU %d:", cpu->cpu_index);
+        }
+        if (hist) {
+            for (l = hist, n = 0; l; l = l->next) {
+                n++;
+            }
+            g_string_append_printf(s, "\n\nHow it got here, the last %d"
+                                   " block%s of code CPU %d ran, oldest"
+                                   " first:", n, n == 1 ? "" : "s",
+                                   cpu->cpu_index);
+            for (l = hist; l; l = l->next) {
+                g_string_append_printf(s, "\n  %s", l->value);
+            }
+            res->has_history = true;
+            res->history = g_steal_pointer(&hist);
         }
         /* and the watched memory, after the memory asked for */
         mcp_debug_show(s, cpu, mem, n_mem + b->has_watch);
     }
+    qapi_free_strList(hist);
     res->summary = g_strdup(s->str);
     return res;
 }

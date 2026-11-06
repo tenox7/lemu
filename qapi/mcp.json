@@ -1466,13 +1466,18 @@
 # @watch: what the CPU did to the watched memory, when that stopped
 #     the VM (debug-run)
 #
+# @history: how the CPU got there (debug-run with @history): the last
+#     blocks of code it ran, oldest first, each as start-end in hex,
+#     with " xN" when it ran N times in a row
+#
 # Since: 11.2
 ##
 { 'struct': 'McpDebugStop',
   'base': 'McpResult',
   'data': { 'reached': 'bool', '*cpu': 'int', '*pc': 'str',
             '*hits': 'int', '*steps': 'int', 'running': 'bool',
-            '*retry': 'bool', '*watch': 'McpWatchHit' },
+            '*retry': 'bool', '*watch': 'McpWatchHit',
+            '*history': [ 'str' ] },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1551,6 +1556,11 @@
 #
 # @memory: guest memory to show when it stops
 #
+# @history: note the last this many blocks of code each CPU runs, up
+#     to 1024, and show them when it stops: how the CPU got there.  A
+#     block is the code from where a jump lands to the next jump.  The
+#     guest runs slower while they are noted (default: 0, none)
+#
 # @timeout-ms: give up after this long, at most 1500000, 25 minutes
 #     (default: 30000); the VM then keeps running
 #
@@ -1563,7 +1573,7 @@
 { 'command': 'debug-run',
   'data': { '*address': 'str', '*watch': 'McpWatch', '*hits': 'int',
             '*cpu': 'int', '*memory': [ 'McpDebugMemory' ],
-            '*timeout-ms': 'int' },
+            '*history': 'int', '*timeout-ms': 'int' },
   'returns': 'McpDebugStop',
   'features': [ 'mcp' ],
   'coroutine': true,

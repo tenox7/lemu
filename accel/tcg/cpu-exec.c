@@ -30,6 +30,7 @@
 #include "exec/cpu-interrupt.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
+#include "exec/tb-history.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
 #include "qemu/atomic.h"
@@ -403,6 +404,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
         log_cpu_exec(s.pc, cpu, tb);
     }
+    if (unlikely(cpu->tb_history)) {
+        cpu_tb_history_add(cpu->tb_history, s.pc, tb->size);
+    }
 
     return tb->tc.ptr;
 }
@@ -436,6 +440,13 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 
     if (qemu_loglevel_mask(CPU_LOG_TB_CPU | CPU_LOG_EXEC)) {
         log_cpu_exec(log_pc(cpu, itb), cpu, itb);
+    }
+    /*
+     * A block with interrupts kept away runs part of one that stopped
+     * partway, for a watchpoint or I/O: that is not a new place.
+     */
+    if (unlikely(cpu->tb_history) && !(tb_cflags(itb) & CF_NOIRQ)) {
+        cpu_tb_history_add(cpu->tb_history, log_pc(cpu, itb), itb->size);
     }
 
     qemu_thread_jit_execute();

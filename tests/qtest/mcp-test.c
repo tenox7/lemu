@@ -1626,6 +1626,27 @@ static void test_debug_run(void)
 #define FAULT_DIV       0xf001a
 #define FAULT_HANDLER   0xf001e
 
+/*
+ * A 64 KiB BIOS file: @code at f000:0000, a far jump to it at the
+ * reset vector, and hlt everywhere else
+ */
+static char *debug_bios_code(const uint8_t *code, size_t len)
+{
+    static const uint8_t reset[] = { 0xea, 0x00, 0x00, 0x00, 0xf0 };
+    g_autofree uint8_t *rom = g_malloc(64 * KiB);
+    char *path = NULL;
+    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    g_assert(len <= 0xfff0);
+    memset(rom, 0xf4, 64 * KiB);
+    memcpy(rom, code, len);
+    memcpy(rom + 0xfff0, reset, sizeof(reset));
+    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
+    close(fd);
+    return path;
+}
+
 static char *debug_bios_fault(void)
 {
     static const uint8_t code[] = {
@@ -1639,18 +1660,8 @@ static char *debug_bios_fault(void)
         0xeb, 0xf7,
         0x43, 0xcf,
     };
-    static const uint8_t reset[] = { 0xea, 0x00, 0x00, 0x00, 0xf0 };
-    g_autofree uint8_t *rom = g_malloc(64 * KiB);
-    char *path = NULL;
-    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
 
-    g_assert(fd >= 0);
-    memset(rom, 0xf4, 64 * KiB);
-    memcpy(rom, code, sizeof(code));
-    memcpy(rom + 0xfff0, reset, sizeof(reset));
-    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
-    close(fd);
-    return path;
+    return debug_bios_code(code, sizeof(code));
 }
 
 /*
@@ -1739,19 +1750,12 @@ static char *debug_bios_regs(void)
         0xeb, 0xfe,
     };
     static const char str[] = "Hi, \"MCP\"\n\x01";
-    static const uint8_t reset[] = { 0xea, 0x00, 0x00, 0x00, 0xf0 };
-    g_autofree uint8_t *rom = g_malloc(64 * KiB);
-    char *path = NULL;
-    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+    uint8_t buf[0x40 + sizeof(str)];
 
-    g_assert(fd >= 0);
-    memset(rom, 0xf4, 64 * KiB);
-    memcpy(rom, code, sizeof(code));
-    memcpy(rom + 0x40, str, sizeof(str));
-    memcpy(rom + 0xfff0, reset, sizeof(reset));
-    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
-    close(fd);
-    return path;
+    memset(buf, 0xf4, sizeof(buf));
+    memcpy(buf, code, sizeof(code));
+    memcpy(buf + 0x40, str, sizeof(str));
+    return debug_bios_code(buf, sizeof(buf));
 }
 
 static void debug_summary_has(QDict *ret, const char *want)
@@ -1842,18 +1846,8 @@ static char *debug_bios_watch(void)
         0x8b, 0x0f,
         0xeb, 0xf9,
     };
-    static const uint8_t reset[] = { 0xea, 0x00, 0x00, 0x00, 0xf0 };
-    g_autofree uint8_t *rom = g_malloc(64 * KiB);
-    char *path = NULL;
-    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
 
-    g_assert(fd >= 0);
-    memset(rom, 0xf4, 64 * KiB);
-    memcpy(rom, code, sizeof(code));
-    memcpy(rom + 0xfff0, reset, sizeof(reset));
-    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
-    close(fd);
-    return path;
+    return debug_bios_code(code, sizeof(code));
 }
 
 static void debug_check_watch(QDict *ret, const char *access, uint64_t pc,
@@ -1963,6 +1957,118 @@ static void test_debug_watch(void)
     debug_check_error(qts, "debug-run",
                       "{'watch': {'address': '0x1000', 'length': 0}}",
                       "watch length must be 1 to 4096");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
+ * A BIOS that counts down in a loop of one instruction, writes 0x1000,
+ * then stays in a jump to itself.  At f000:0000, after a far jump:
+ *
+ *  0000  mov cx,1000
+ *  0003  loop 0003
+ *  0005  mov [1000],ax
+ *  0008  jmp 0008
+ */
+static char *debug_bios_history(void)
+{
+    static const uint8_t code[] = {
+        0xb9, 0xe8, 0x03,
+        0xe2, 0xfe,
+        0xa3, 0x00, 0x10,
+        0xeb, 0xfe,
+    };
+
+    return debug_bios_code(code, sizeof(code));
+}
+
+/* The history entry @i of @ret */
+static const char *debug_history(QDict *ret, int i)
+{
+    QList *hist = qdict_get_qlist(ret, "history");
+    QListEntry *e;
+
+    g_assert(hist);
+    QLIST_FOREACH_ENTRY(hist, e) {
+        if (!i--) {
+            return qstring_get_str(qobject_to(QString, qlist_entry_obj(e)));
+        }
+    }
+    g_assert_not_reached();
+}
+
+/* The loop at 0xf0003 ran @lo to @hi times in a row */
+static void debug_check_loop(const char *entry, unsigned long lo,
+                             unsigned long hi)
+{
+    unsigned long n;
+
+    g_assert(g_str_has_prefix(entry, "0xf0003-0xf0004 x"));
+    n = g_ascii_strtoull(entry + strlen("0xf0003-0xf0004 x"), NULL, 10);
+    g_assert_cmpuint(n, >=, lo);
+    g_assert_cmpuint(n, <=, hi);
+}
+
+/* debug-run with history shows the blocks of code that led there */
+static void test_debug_history(void)
+{
+    g_autofree char *bios = debug_bios_history();
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* the loop is one block, run 999 times in a row: one entry */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x1000'},"
+                   " 'history': 3}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "history")), ==, 3);
+    g_assert_cmpstr(debug_history(ret, 0), ==, "0xf0000-0xf0004");
+    debug_check_loop(debug_history(ret, 1), 999, 1001);
+    g_assert_cmpstr(debug_history(ret, 2), ==, "0xf0005-0xf0009");
+    debug_summary_has(ret, "\n\nHow it got here, the last 3 blocks of code"
+                      " CPU 0 ran, oldest first:\n  0xf0000-0xf0004\n"
+                      "  0xf0003-0xf0004 x");
+    qobject_unref(ret);
+
+    /* fewer blocks than asked: only the step past the jump */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf0008',"
+                   " 'history': 4}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "history")), ==, 1);
+    g_assert_cmpstr(debug_history(ret, 0), ==, "0xf0008-0xf0009");
+    debug_summary_has(ret, "the last 1 block of code CPU 0 ran");
+    qobject_unref(ret);
+
+    /* the time runs out with the VM running: no history, it goes on */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x2000'},"
+                   " 'history': 4, 'timeout-ms': 200}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    g_assert(!qdict_haskey(ret, "history"));
+    qobject_unref(ret);
+    ret = debug_ok(qts, "query-status", "{}");
+    g_assert(qdict_get_bool(ret, "running"));
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-run", "{'address': '0xf0008',"
+                      " 'history': 1025}", "history must be 0 to 1024");
+    qtest_quit(qts);
+
+    /*
+     * A breakpoint on the page makes each instruction there a block:
+     * the loop is the same block 1000 times
+     */
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf0008',"
+                   " 'history': 3}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(debug_history(ret, 0), ==, "0xf0000-0xf0002");
+    debug_check_loop(debug_history(ret, 1), 1000, 1002);
+    g_assert_cmpstr(debug_history(ret, 2), ==, "0xf0005-0xf0007");
+    qobject_unref(ret);
     qtest_quit(qts);
     unlink(bios);
 }
@@ -2728,6 +2834,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/registers", test_debug_registers);
         qtest_add_func("/mcp/debug/watch", test_debug_watch);
         qtest_add_func("/mcp/debug/trace", test_debug_trace);
+        qtest_add_func("/mcp/debug/history", test_debug_history);
     }
     return g_test_run();
 }
