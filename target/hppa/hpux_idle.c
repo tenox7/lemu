@@ -243,17 +243,18 @@ void HELPER(hpux_idle)(CPUHPPAState *env)
 /*
  * The idle loop of the HP-UX 9.05 kernel (loop_till_process_found_to_run()):
  * with interrupts on, it adds up the four run queue counts of mpproc_info
- * (r4 to r7 point at it, the counts are at 0x10c, 0x110, 0x114 and 0x118),
- * calls check_watchdog() and starts again until the sum is not 0. The one
+ * (r4 to r7 point at it, the counts are at @runq, @runq + 4, + 8 and + 12:
+ * 0x10c in the kernel of the CD, 0x194 in a kernel built with the patches of
+ * July 1997), calls check_watchdog() and starts again until the sum is not
+ * 0. The one
  * thing check_watchdog() does is to look at EIRR bit 28, one of the bits that
  * the idle loop keeps masked in EIEM (it is 0x8 in the register): it
  * runs a soft interrupt that is posted there. Nothing else gives the loop work
  * but an interrupt, as there is one CPU: a handler queues the process.
  */
-#define HPUX9_RUNQ_COUNTS   0x10c
 #define HPUX9_EIRR_POLLED   0x00000008
 
-static bool hpux9_idle_nothing_to_do(CPUHPPAState *env)
+static bool hpux9_idle_nothing_to_do(CPUHPPAState *env, uint32_t runq)
 {
     CPUState *cs = env_cpu(env);
     uint32_t count;
@@ -267,8 +268,8 @@ static bool hpux9_idle_nothing_to_do(CPUHPPAState *env)
     }
 
     for (int i = 0; i < 4; i++) {
-        if (!hpux_idle_ld(env, (uint32_t)env->gr[4 + i] + HPUX9_RUNQ_COUNTS +
-                          4 * i, &count) || count) {
+        if (!hpux_idle_ld(env, (uint32_t)env->gr[4 + i] + runq + 4 * i,
+                          &count) || count) {
             return false;
         }
     }
@@ -279,7 +280,7 @@ static bool hpux9_idle_nothing_to_do(CPUHPPAState *env)
  * The idle loop has come to the sum of the run queue counts. Halt the vCPU
  * until the next interrupt, if there is nothing to do.
  */
-void HELPER(hpux9_idle)(CPUHPPAState *env)
+void HELPER(hpux9_idle)(CPUHPPAState *env, uint32_t runq)
 {
     HPPACPU *cpu = env_archcpu(env);
     CPUState *cs = env_cpu(env);
@@ -295,7 +296,7 @@ void HELPER(hpux9_idle)(CPUHPPAState *env)
         cpu->hpux_idle_seen = cpu->hpux_idle_ints;
         cpu->hpux_idle_rounds = 0;
     }
-    if (!hpux9_idle_nothing_to_do(env)) {
+    if (!hpux9_idle_nothing_to_do(env, runq)) {
         cpu->hpux_idle_rounds = 0;
         return;
     }
@@ -311,7 +312,7 @@ void HELPER(hpux9_idle)(CPUHPPAState *env)
      */
     qatomic_set(&cpu->hpux_idle_pcpu, 1);
     smp_mb();
-    if (!hpux9_idle_nothing_to_do(env)) {
+    if (!hpux9_idle_nothing_to_do(env, runq)) {
         qatomic_set(&cpu->hpux_idle_pcpu, 0);
         return;
     }

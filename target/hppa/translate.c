@@ -4873,15 +4873,38 @@ static const HpuxInsnWord hpux9_idle_loop[] = {
     { 0x1c, 0x84403fad },       /* cmpib,= 0,rp,again */
     { 0x20, 0x08000240 },       /* nop */
 };
+#define HPUX9_RUNQ_COUNTS           0x10c
+
+/*
+ * The same loop in the 9.05 kernel that is built with the patches of the
+ * July 1997 bundle (XSW700GR0905): mpproc_info has grown, so the run queue
+ * counts are at 0x194 to 0x1a0. The rest of the loop and check_watchdog()
+ * are the same.
+ */
+static const HpuxInsnWord hpux9_idle_loop_patched[] = {
+    { -0x08, 0xe8400108 },      /* b,l   check_watchdog,rp */
+    { -0x04, 0x08000240 },      /* nop */
+    { 0x00, 0x489f0328 },       /* ldw   194(r4),r31          im_numproc */
+    { 0x04, 0x48b80330 },       /* ldw   198(r5),r24          tr_numproc */
+    { 0x08, 0x0b1f061a },       /* add   r31,r24,r26 */
+    { 0x0c, 0x48d30338 },       /* ldw   19c(r6),r19          pe_numproc */
+    { 0x10, 0x0a7a0615 },       /* add   r26,r19,r21 */
+    { 0x14, 0x48fc0340 },       /* ldw   1a0(r7),ret0         id_numproc */
+    { 0x18, 0x0b950602 },       /* add   r21,ret0,rp */
+    { 0x1c, 0x84403fad },       /* cmpib,= 0,rp,again */
+    { 0x20, 0x08000240 },       /* nop */
+};
+#define HPUX9_RUNQ_COUNTS_PATCHED   0x194
 
 /*
  * At the first insn of a TB: if it starts the idle loop's check of the run
  * queue, let helper_hpux_idle() (10.20) or helper_hpux9_idle() (9.05) halt
  * the vCPU before the loop runs it. When the vCPU wakes up, the insn queue
- * says to run it again.
+ * says to run it again. For 9.05, @runq is where the four run queue counts
+ * start in mpproc_info; for 10.20 it is 0.
  */
 static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env,
-                          const HpuxInsnWord *words, int n, bool hpux9)
+                          const HpuxInsnWord *words, int n, uint32_t runq)
 {
     vaddr pc = ctx->base.pc_next;
 
@@ -4901,8 +4924,8 @@ static void gen_hpux_idle(DisasContext *ctx, CPUHPPAState *env,
     trace_hppa_hpux_match("idle loop", pc);
     install_iaq_entries(ctx, &ctx->iaq_f, &ctx->iaq_b);
     nullify_save(ctx);
-    if (hpux9) {
-        gen_helper_hpux9_idle(tcg_env);
+    if (runq) {
+        gen_helper_hpux9_idle(tcg_env, tcg_constant_i32(runq));
     } else {
         gen_helper_hpux_idle(tcg_env);
     }
@@ -5082,10 +5105,14 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
             && ctx->iaq_b.disp == ctx->iaq_f.disp + 4) {
             if (insn == hpux_idle_loop[0].insn) {
                 gen_hpux_idle(ctx, env, hpux_idle_loop,
-                              ARRAY_SIZE(hpux_idle_loop), false);
+                              ARRAY_SIZE(hpux_idle_loop), 0);
             } else if (insn == hpux9_idle_loop[2].insn) {
                 gen_hpux_idle(ctx, env, hpux9_idle_loop,
-                              ARRAY_SIZE(hpux9_idle_loop), true);
+                              ARRAY_SIZE(hpux9_idle_loop), HPUX9_RUNQ_COUNTS);
+            } else if (insn == hpux9_idle_loop_patched[2].insn) {
+                gen_hpux_idle(ctx, env, hpux9_idle_loop_patched,
+                              ARRAY_SIZE(hpux9_idle_loop_patched),
+                              HPUX9_RUNQ_COUNTS_PATCHED);
             }
         }
         if (ctx->hpux_x11_pace && ctx->base.num_insns == 1) {
