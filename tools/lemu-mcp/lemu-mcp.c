@@ -35,7 +35,6 @@
 #define TOOLS_TIMEOUT_MS    3000
 #define WAIT_TICK_MS        200
 #define WAIT_DEFAULT_MS     30000
-#define WAIT_MAX_MS         110000
 #define WAIT_PROGRESS_MS    5000
 #define PORT_RETRY_MS       500     /* between tries */
 #define PORT_SILENT_MS      5000    /* a try that hears nothing ends */
@@ -86,7 +85,7 @@ static const char vm_wait_tool[] =
     " regular expression that the answer must match (default: any"
     " answer)\"},"
     "\"timeout-ms\":{\"type\":\"integer\",\"description\":\"give up after"
-    " this long, at most 110000 (default: 30000)\"}}},"
+    " this long, at most 1500000, 25 minutes (default: 30000)\"}}},"
     "\"annotations\":{\"destructiveHint\":false,\"openWorldHint\":true}}";
 
 static const char vm_arg_schema[] =
@@ -1566,7 +1565,7 @@ static void client_vm_wait(QObject *id, QDict *params)
         wait_error(w, "timeout-ms and port must be integers");
         return;
     }
-    w->deadline_ms = w->start_ms + MIN(MAX(timeout, 0), WAIT_MAX_MS);
+    w->deadline_ms = w->start_ms + MIN(MAX(timeout, 0), MCP_WAIT_MAX_MS);
     if (!until || !strcmp(until, "up")) {
         w->until = WAIT_UP;
     } else if (!strcmp(until, "gone")) {

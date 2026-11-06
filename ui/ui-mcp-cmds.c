@@ -10,6 +10,7 @@
 
 #include "qemu/osdep.h"
 #include "keymaps.h"
+#include "monitor/mcp-common.h"
 #include "monitor/mcp.h"
 #include "qapi/clone-visitor.h"
 #include "qapi/error.h"
@@ -28,7 +29,6 @@
 #include "ui/pointer.h"
 #include "vnc_keysym.h"
 
-#define MCP_WAIT_MAX_MS     110000
 #define MCP_MAX_KEYS        100000
 
 /* Calls */

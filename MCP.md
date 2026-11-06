@@ -70,7 +70,8 @@ The server sends these rules to every agent that connects:
   mouse tools take `then`, so they can wait and look again in the same
   call.
 - **Don't sleep.** Use `wait-screen`, or `serial-expect` for serial
-  text. For long installs, call it in a loop.
+  text. One call can wait up to 25 minutes; for a longer install, call
+  it again.
 - **Starting and stopping:** after you start a VM from a shell, call
   `vm-wait`. After a guest shutdown, `vm-wait` until `gone` before you
   copy its disk.
@@ -149,3 +150,8 @@ files.
 - **Your own socket.** `-mcp unix:vm.mcp,server=on,wait=off` gives a VM its
   own socket instead of the default one. `lemu-mcp` still finds it. On
   macOS, Unix socket paths must stay under about 104 bytes.
+- **Long waits in Claude Code.** A tool call that runs longer than 2
+  minutes moves to the background, and Claude Code tells the agent when
+  it ends. Stopping it (TaskStop) cancels the wait in the VM. One call
+  waits at most 25 minutes, under Claude Code's 30-minute limit for a
+  call that sends nothing.

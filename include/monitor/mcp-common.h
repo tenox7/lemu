@@ -12,6 +12,14 @@
 
 #define MCP_PROTOCOL_LATEST     "2025-11-25"
 
+/*
+ * The longest a tool waits in one call.  MCP clients give up on a call
+ * that sends nothing for a while (Claude Code: 30 minutes for a stdio
+ * server).  Calls send progress every 5 s, but only to a client that
+ * asks for it, so stay under that.
+ */
+#define MCP_WAIT_MAX_MS         (25 * 60 * 1000)
+
 /* JSON-RPC error codes */
 #define MCP_PARSE_ERROR         -32700
 #define MCP_INVALID_REQUEST     -32600

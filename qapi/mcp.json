@@ -114,8 +114,8 @@
 # @delay-ms: sleep this long after the input, before waiting
 #     (default: 0)
 #
-# @timeout-ms: give up waiting after this long, at most 110000
-#     (default: 10000)
+# @timeout-ms: give up waiting after this long, at most 1500000, 25
+#     minutes (default: 10000)
 #
 # @stable-ms: how long the screen must not change to be stable
 #     (default: 1000)
@@ -448,9 +448,10 @@
 #     Wait until the screen changes, becomes stable, or a pixel has a
 #     colour.  Use it instead of sleeping.  change-then-stable waits
 #     for something to happen, then for it to settle.  Changes smaller
-#     than @min-pixels and blinking text cursors are not counted.  For
-#     long installs, call it in a loop.  If a clock or a graph keeps
-#     the screen from settling, use @ignore-animation.
+#     than @min-pixels and blinking text cursors are not counted.  One
+#     call can wait up to 25 minutes; for a longer install, call it
+#     again.  If a clock or a graph keeps the screen from settling,
+#     use @ignore-animation.
 #
 # @until: what to wait for
 #
@@ -467,7 +468,7 @@
 # @stable-ms: how long the screen must not change to be stable
 #     (default: 2000)
 #
-# @timeout-ms: give up after this long, at most 110000
+# @timeout-ms: give up after this long, at most 1500000, 25 minutes
 #     (default: 60000)
 #
 # @pixel: the pixel to watch, for "pixel"
@@ -984,8 +985,8 @@
 # @cursor: offset to search from (default: where the last
 #     serial-read or serial-expect stopped)
 #
-# @timeout-ms: give up after this long, at most 110000 (default:
-#     30000)
+# @timeout-ms: give up after this long, at most 1500000, 25 minutes
+#     (default: 30000)
 #
 # Features:
 #
@@ -1068,8 +1069,8 @@
 # @prompt: for shell "none" only: a regular expression for the prompt
 #     that follows the output
 #
-# @timeout-ms: give up waiting after this long, at most 110000
-#     (default: 30000)
+# @timeout-ms: give up waiting after this long, at most 1500000, 25
+#     minutes (default: 30000)
 #
 # @max-lines: show at most this many lines of output (default: 200)
 #

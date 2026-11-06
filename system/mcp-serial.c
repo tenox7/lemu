@@ -28,7 +28,6 @@
 
 #define SERIAL_TAP_SIZE     (1024 * 1024)
 #define SERIAL_READ_MAX     16384
-#define SERIAL_WAIT_MAX_MS  110000
 #define SERIAL_STALL_MS     10000
 #define SERIAL_SCAN_MS      20      /* let output gather between scans */
 #define SERIAL_RUN_LINES    200
@@ -545,7 +544,7 @@ McpSerialResult *coroutine_fn qmp_serial_expect(const char *port_name,
     }
     e.re = re;
     timeout_ms = MIN(has_timeout_ms ? MAX(timeout_ms, 0) : 30000,
-                     SERIAL_WAIT_MAX_MS);
+                     MCP_WAIT_MAX_MS);
     from = has_cursor ? MAX(cursor, 0) : port->mark;
 
     mcp_serial_scan_init(&s);
@@ -929,7 +928,7 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
         return NULL;
     }
     timeout_ms = MIN(has_timeout_ms ? MAX(timeout_ms, 0) : 30000,
-                     SERIAL_WAIT_MAX_MS);
+                     MCP_WAIT_MAX_MS);
     start_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     if (!mcp_serial_run_turn(port, ctx, start_ms + timeout_ms, errp)) {
         return NULL;
