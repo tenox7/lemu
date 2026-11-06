@@ -30,6 +30,13 @@ QemuInputCtx *mcp_current_input_ctx(void);
 void mcp_quiet_runstate_events(void);
 
 /*
+ * The longest a tool may wait: MCP_WAIT_MAX_MS less what the MCP call
+ * running in this coroutine has used, so that the steps of a steps
+ * call stay under it in all.  MCP_WAIT_MAX_MS outside MCP.
+ */
+int64_t mcp_wait_max_ms(void);
+
+/*
  * Text as HMP prints it, for the debug tools: the integer registers of
  * @cpu (info registers without the FPU), and @count instructions at
  * the virtual address @pc.  NULL when QEMU was built without HMP.

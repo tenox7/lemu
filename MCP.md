@@ -68,6 +68,7 @@ only when exactly one VM is running and you started it.
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
 | `hmp`, `qmp` | Run any QEMU monitor command: registers, memory, disassembly, pause and go on |
+| `steps` | Run several of these tools in one call, in order; stop at the first wait that is not met |
 
 ## How to drive a VM
 
@@ -76,6 +77,9 @@ The server sends these rules to every agent that connects:
 - **Look before you act.** Take a screenshot first. The keyboard and
   mouse tools take `then`, so they can wait and look again in the same
   call.
+- **Known sequences in one call:** for a login or the next pages of an
+  installer, `steps` runs several tool calls in order. It stops at the
+  first wait that is not met, so put a wait after each action.
 - **A black screen** in a graphical guest is often its screen saver,
   not a hang. Move the mouse, then look again.
 - **Don't sleep.** Use `wait-screen`, or `serial-expect` for serial
@@ -131,6 +135,7 @@ Use these:
 | Read what a serial port printed | `serial-read` |
 | Log in over the network, when the console is the screen | `serial-connect`, then the serial tools on the port it names |
 | Wait for the screen | `wait-screen` |
+| Press keys, type, wait and look, several times, in one call | `steps` |
 | Wait for a VM to start, or to end | `vm-wait` until `up` or `gone` |
 | Wait until a guest service answers on a forwarded port | `vm-wait` until `port` |
 | See how much host CPU a VM uses, and whether the guest idles | `vm-stats` |
@@ -151,6 +156,18 @@ Use these:
   itself (terminal type VT100), so the guest's telnetd needs no setup.
   When the guest ends the session, the serial tools say so at once;
   `serial-connect` again opens a new one on the same port name.
+- **A login in one call:** `steps` with this list types the user name,
+  waits for the prompt and runs a command. If the prompt does not come,
+  it stops there and says so. A command that fails does not stop it:
+  to stop on a failure, join the commands with `&&` in one `serial-run`.
+  All steps run on the VM the call names, and together they get the
+  25 minutes of one call.
+
+  ```json
+  [{"tool": "serial-write", "args": {"text": "root\r"}},
+   {"tool": "serial-expect", "args": {"pattern": "# $"}},
+   {"tool": "serial-run", "args": {"command": "uname -a"}}]
+  ```
 - **Waiting outside the VM:** `vm-wait` covers a QEMU process that
   starts or ends, and a port that should answer. For anything else, use
   your agent's own way to wait in the background (in Claude Code, a
@@ -204,4 +221,5 @@ Use these:
   minutes moves to the background, and Claude Code tells the agent when
   it ends. Stopping it (TaskStop) cancels the wait in the VM. One call
   waits at most 25 minutes, under Claude Code's 30-minute limit for a
-  call that sends nothing.
+  call that sends nothing. That holds for a `steps` call too: its steps
+  share the 25 minutes.

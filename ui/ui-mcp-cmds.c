@@ -10,7 +10,6 @@
 
 #include "qemu/osdep.h"
 #include "keymaps.h"
-#include "monitor/mcp-common.h"
 #include "monitor/mcp.h"
 #include "qapi/clone-visitor.h"
 #include "qapi/error.h"
@@ -476,7 +475,7 @@ McpWaitResult *coroutine_fn qmp_wait_screen(McpWaitUntil until,
     c.ignore = ign;
     c.min_pixels = has_min_pixels ? min_pixels : 64;
     c.stable_ms = has_stable_ms ? stable_ms : 2000;
-    c.timeout_ms = MIN(has_timeout_ms ? timeout_ms : 60000, MCP_WAIT_MAX_MS);
+    c.timeout_ms = MIN(has_timeout_ms ? timeout_ms : 60000, mcp_wait_max_ms());
     c.ignore_blink = has_ignore_blink ? ignore_blink : true;
     c.ignore_animation = has_ignore_animation && ignore_animation;
     c.sleep = &ctx->sleep;
@@ -564,7 +563,7 @@ static bool mcp_input_begin(McpInput *in, QemuConsole *con, McpThen *then,
         in->cond.stable_ms = then->has_stable_ms ? then->stable_ms : 1000;
         in->cond.timeout_ms = MIN(then->has_timeout_ms ? then->timeout_ms
                                                        : 10000,
-                                  MCP_WAIT_MAX_MS);
+                                  mcp_wait_max_ms());
         in->cond.ignore_blink = true;
         in->cond.ignore_animation = then->has_ignore_animation &&
                                     then->ignore_animation;

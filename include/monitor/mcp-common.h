@@ -31,11 +31,13 @@
 extern const char mcp_instructions[];
 
 /*
- * The hand-written 'hmp' and 'qmp' tools.  The bridge lists them too,
- * so that an agent has them even when no VM was up when it started.
+ * The hand-written 'hmp', 'qmp' and 'steps' tools.  The bridge lists
+ * them too, so that an agent has them even when no VM was up when it
+ * started.
  */
 extern const char mcp_tool_hmp[];
 extern const char mcp_tool_qmp[];
+extern const char mcp_tool_steps[];
 
 bool mcp_protocol_supported(const char *v);
 QList *mcp_protocol_list(void);

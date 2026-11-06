@@ -637,7 +637,7 @@ McpSerialResult *coroutine_fn qmp_serial_expect(const char *port_name,
     }
     e.re = re;
     timeout_ms = MIN(has_timeout_ms ? MAX(timeout_ms, 0) : 30000,
-                     MCP_WAIT_MAX_MS);
+                     mcp_wait_max_ms());
     from = has_cursor ? MAX(cursor, 0) : port->mark;
 
     mcp_serial_scan_init(&s);
@@ -1035,7 +1035,7 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
         return NULL;
     }
     timeout_ms = MIN(has_timeout_ms ? MAX(timeout_ms, 0) : 30000,
-                     MCP_WAIT_MAX_MS);
+                     mcp_wait_max_ms());
     start_ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     if (!mcp_serial_run_turn(port, ctx, start_ms + timeout_ms, errp)) {
         return NULL;

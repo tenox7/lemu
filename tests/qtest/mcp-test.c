@@ -20,6 +20,10 @@
  * its options and take the telnet commands out of what it sends, and
  * what is typed must have IAC doubled and a lone CR followed by NUL.
  *
+ * The steps test runs several tools in one call over MCP: it must stop
+ * at the first wait that is not met or the first error, and run nothing
+ * when a tool name is wrong.
+ *
  * The debug tests run a BIOS of two instructions under TCG, step it,
  * stop it at an address and patch it while it runs.
  *
@@ -1257,6 +1261,218 @@ static void test_serial_telnet(void)
     qtest_quit(qts);
 }
 
+/* A VM with an MCP socket of its own, and a client that said hello */
+typedef struct StepsVm {
+    QTestState *qts;
+    char *dir;
+    char *path;
+    int fd;
+} StepsVm;
+
+static void steps_vm_start(StepsVm *v, const char *args)
+{
+    v->dir = g_dir_make_tmp("mcp-test-XXXXXX", NULL);
+    v->path = g_build_filename(v->dir, "mcp.sock", NULL);
+    v->qts = qtest_initf("%s -display none -serial null "
+                         "-mcp unix:%s,server=on,wait=off", args, v->path);
+    v->fd = mcp_connect(v->path);
+    mcp_send(v->fd, "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": "
+             "\"initialize\", \"params\": {\"protocolVersion\": "
+             "\"2025-11-25\", \"capabilities\": {}, \"clientInfo\": "
+             "{\"name\": \"mcp-test\", \"version\": \"1\"}}}");
+    g_free(mcp_recv(v->fd));
+}
+
+static void steps_vm_stop(StepsVm *v)
+{
+    close(v->fd);
+    qtest_quit(v->qts);
+    unlink(v->path);
+    rmdir(v->dir);
+    g_free(v->path);
+    g_free(v->dir);
+}
+
+/* Call "steps" with @steps (JSON) over MCP; the text and *@json blocks */
+static char *steps_call(int fd, int id, const char *steps, bool *is_error,
+                        bool *image, QDict **json)
+{
+    g_autofree char *req = g_strdup_printf(
+        "{\"jsonrpc\": \"2.0\", \"id\": %d, \"method\": \"tools/call\", "
+        "\"params\": {\"name\": \"steps\", \"arguments\": {\"steps\": %s}}}",
+        id, steps);
+    g_autofree char *line = NULL;
+    QDict *rsp, *result;
+    QList *content;
+    QListEntry *e;
+    char *text = NULL;
+
+    mcp_send(fd, req);
+    line = mcp_recv(fd);
+    rsp = qobject_to(QDict, qobject_from_json(line, &error_abort));
+    g_assert_cmpint(qdict_get_int(rsp, "id"), ==, id);
+    result = qdict_get_qdict(rsp, "result");
+    *is_error = qdict_get_bool(result, "isError");
+    *image = false;
+    *json = NULL;
+    content = qdict_get_qlist(result, "content");
+    QLIST_FOREACH_ENTRY(content, e) {
+        QDict *b = qobject_to(QDict, qlist_entry_obj(e));
+        const char *type = qdict_get_str(b, "type");
+
+        if (!strcmp(type, "image")) {
+            *image = true;
+        } else if (!text) {
+            text = g_strdup(qdict_get_str(b, "text"));
+        } else if (!*json) {
+            *json = qobject_to(QDict,
+                               qobject_from_json(qdict_get_str(b, "text"),
+                                                 &error_abort));
+        }
+    }
+    g_test_message("steps: %s", text);
+    qobject_unref(rsp);
+    return text;
+}
+
+static void steps_has(const char *text, const char *want, bool has)
+{
+    if (!strstr(text, want) != !has) {
+        g_test_message("'%s' %s '%s'", text, has ? "lacks" : "has", want);
+        g_assert_not_reached();
+    }
+}
+
+static bool uart_ready(QTestState *qts)
+{
+    return qtest_inb(qts, COM1 + UART_LSR) & UART_LSR_DR;
+}
+
+/*
+ * "steps" runs tools in order in one call and stops at the first that
+ * fails or whose wait is not met.  A bad tool name, or a step for
+ * another VM, stops it before anything runs.
+ */
+static void test_steps(void)
+{
+    g_autofree char *mine = NULL;
+    StepsVm v;
+    QDict *json;
+    bool is_error, image;
+    char *text;
+
+    steps_vm_start(&v, "-machine pc -name mine");
+
+    /* the wait that is not met stops it: the hmp step does not run */
+    text = steps_call(v.fd, 2, "[{\"tool\": \"vm-info\"}, "
+                      "{\"tool\": \"serial-write\", \"args\": "
+                      "{\"text\": \"x\", \"vm\": \"mine\"}}, "
+                      "{\"tool\": \"serial-expect\", \"args\": "
+                      "{\"pattern\": \"never\", \"timeout-ms\": 100}}, "
+                      "{\"tool\": \"hmp\", \"args\": "
+                      "{\"command\": \"info status\"}}]",
+                      &is_error, &image, &json);
+    g_assert(!is_error);
+    g_assert(g_str_has_prefix(text, "stopped after step 3 of 4: no match, "
+                              "so the rest did not run\n1. vm-info: "));
+    steps_has(text, "\n2. serial-write: sent 1 bytes", true);
+    steps_has(text, "\n3. serial-expect: serial0: no match", true);
+    steps_has(text, "4. hmp", false);
+    g_assert_cmpint(qdict_get_int(json, "steps-done"), ==, 3);
+    g_assert_cmpint(qdict_get_int(json, "steps"), ==, 4);
+    g_assert(!qdict_get_bool(qdict_get_qdict(json, "last"), "matched"));
+    g_assert(uart_ready(v.qts));
+    g_assert_cmpint(qtest_inb(v.qts, COM1), ==, 'x');
+    qobject_unref(json);
+    g_free(text);
+
+    /* all of them: hmp text, and the screenshot's image */
+    text = steps_call(v.fd, 3, "[{\"tool\": \"hmp\", \"args\": "
+                      "{\"command\": \"info status\"}}, "
+                      "{\"tool\": \"screenshot\"}]",
+                      &is_error, &image, &json);
+    g_assert(!is_error);
+    g_assert(image);
+    g_assert(g_str_has_prefix(text, "ran all 2 steps\n1. hmp: VM status: "
+                              "running\n2. screenshot: "));
+    g_assert_cmpint(qdict_get_int(json, "steps-done"), ==, 2);
+    qobject_unref(json);
+    g_free(text);
+
+    /* the last step's wait is not met: it says so */
+    text = steps_call(v.fd, 4, "[{\"tool\": \"serial-expect\", \"args\": "
+                      "{\"pattern\": \"never\", \"timeout-ms\": 100}}]",
+                      &is_error, &image, &json);
+    g_assert(!is_error);
+    g_assert(g_str_has_prefix(text, "step 1 of 1: no match\n"));
+    qobject_unref(json);
+    g_free(text);
+
+    /* a typo: nothing runs */
+    text = steps_call(v.fd, 5, "[{\"tool\": \"serial-write\", \"args\": "
+                      "{\"text\": \"y\"}}, {\"tool\": \"kye\"}]",
+                      &is_error, &image, &json);
+    g_assert(is_error);
+    g_assert_cmpstr(text, ==, "step 2: unknown tool 'kye'");
+    g_assert(!uart_ready(v.qts));
+    g_free(text);
+
+    /* a step that fails stops the rest */
+    text = steps_call(v.fd, 6, "[{\"tool\": \"serial-write\", \"args\": "
+                      "{\"text\": \"z\"}}, {\"tool\": \"serial-write\"}, "
+                      "{\"tool\": \"serial-write\", \"args\": "
+                      "{\"text\": \"w\"}}]",
+                      &is_error, &image, &json);
+    g_assert(is_error);
+    g_assert(g_str_has_prefix(text, "step 2 of 3 failed, so the rest did "
+                              "not run\n1. serial-write: sent 1 bytes"));
+    steps_has(text, "\n2. serial-write failed: Parameter 'text' is missing",
+              true);
+    g_assert_cmpint(qdict_get_int(json, "steps-done"), ==, 1);
+    g_assert(!qdict_haskey(json, "last"));
+    g_assert(uart_ready(v.qts));
+    g_assert_cmpint(qtest_inb(v.qts, COM1), ==, 'z');
+    g_assert(!uart_ready(v.qts));
+    qobject_unref(json);
+    g_free(text);
+
+    /* a step for another VM: nothing runs; this VM's PID is fine */
+    text = steps_call(v.fd, 7, "[{\"tool\": \"serial-write\", \"args\": "
+                      "{\"text\": \"p\"}}, {\"tool\": \"serial-write\", "
+                      "\"args\": {\"text\": \"q\", \"vm\": \"other\"}}]",
+                      &is_error, &image, &json);
+    g_assert(is_error);
+    steps_has(text, "step 2: its vm is not this VM; all steps run on mine "
+              "(pid ", true);
+    g_assert(!uart_ready(v.qts));
+    g_free(text);
+    mine = g_strdup_printf("[{\"tool\": \"serial-write\", \"args\": "
+                           "{\"text\": \"p\", \"vm\": %d}}]",
+                           (int)qtest_pid(v.qts));
+    text = steps_call(v.fd, 8, mine, &is_error, &image, &json);
+    g_assert(!is_error);
+    g_assert(uart_ready(v.qts));
+    g_assert_cmpint(qtest_inb(v.qts, COM1), ==, 'p');
+    qobject_unref(json);
+    g_free(text);
+
+    text = steps_call(v.fd, 9, "[{\"tool\": \"steps\"}]", &is_error, &image,
+                      &json);
+    g_assert(is_error);
+    steps_has(text, "steps cannot hold steps", true);
+    g_free(text);
+    text = steps_call(v.fd, 10, "[{\"tool\": \"vm-wait\"}]", &is_error,
+                      &image, &json);
+    steps_has(text, "the bridge's own tools cannot be steps", true);
+    g_free(text);
+    text = steps_call(v.fd, 11, "[]", &is_error, &image, &json);
+    g_assert(is_error);
+    steps_has(text, "at least one step", true);
+    g_free(text);
+
+    steps_vm_stop(&v);
+}
+
 /*
  * A BIOS of three bytes at the reset vector: inc ax at 0xfffffff0,
  * then jmp short back to it at 0xfffffff1.  Halts everywhere else.
@@ -1396,6 +1612,49 @@ static void test_debug_run(void)
  * memory-write changes RAM and ROM but no device, and code made from
  * the old bytes goes away; debug-profile finds the loop
  */
+/*
+ * A debug-run step that does not get to its address stops the steps,
+ * and a debug-step that does all its steps lets them go on
+ */
+static void test_steps_debug(void)
+{
+    g_autofree char *bios = debug_bios();
+    g_autofree char *args = g_strdup_printf("-accel tcg -machine pc -bios %s",
+                                            bios);
+    StepsVm v;
+    QDict *json;
+    bool is_error, image;
+    char *text;
+
+    steps_vm_start(&v, args);
+    text = steps_call(v.fd, 2, "[{\"tool\": \"debug-run\", \"args\": "
+                      "{\"address\": \"0x12345678\", \"timeout-ms\": 200}}, "
+                      "{\"tool\": \"serial-write\", \"args\": "
+                      "{\"text\": \"q\"}}]", &is_error, &image, &json);
+    g_assert(!is_error);
+    g_assert(g_str_has_prefix(text, "stopped after step 1 of 2: the CPU did "
+                              "not get there, so the rest did not run\n"));
+    g_assert(!qdict_get_bool(qdict_get_qdict(json, "last"), "reached"));
+    g_assert(!uart_ready(v.qts));
+    qobject_unref(json);
+    g_free(text);
+
+    text = steps_call(v.fd, 3, "[{\"tool\": \"debug-step\"}, "
+                      "{\"tool\": \"vm-power\", \"args\": "
+                      "{\"action\": \"resume\"}}, "
+                      "{\"tool\": \"serial-write\", \"args\": "
+                      "{\"text\": \"r\"}}]", &is_error, &image, &json);
+    g_assert(!is_error);
+    g_assert(g_str_has_prefix(text, "ran all 3 steps\n1. debug-step: "));
+    g_assert(uart_ready(v.qts));
+    g_assert_cmpint(qtest_inb(v.qts, COM1), ==, 'r');
+    qobject_unref(json);
+    g_free(text);
+
+    steps_vm_stop(&v);
+    unlink(bios);
+}
+
 static void test_debug_memory(void)
 {
     g_autofree char *bios = debug_bios();
@@ -2020,11 +2279,13 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/serial/run", test_serial_run);
     qtest_add_func("/mcp/serial/run-cancel", test_serial_run_cancel);
     qtest_add_func("/mcp/serial/telnet", test_serial_telnet);
+    qtest_add_func("/mcp/steps", test_steps);
     qtest_add_func("/mcp/media/disc", test_media_disc);
     qtest_add_func("/mcp/media/floppy", test_media_floppy);
     if (qtest_has_accel("tcg")) {
         qtest_add_func("/mcp/debug/run", test_debug_run);
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
+        qtest_add_func("/mcp/steps/debug", test_steps_debug);
     }
     return g_test_run();
 }

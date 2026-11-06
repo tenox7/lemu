@@ -25,6 +25,7 @@
 #include "qobject/qjson.h"
 #include "qobject/qlist.h"
 #include "qobject/qnull.h"
+#include "qobject/qnum.h"
 #include "qobject/qstring.h"
 #include "system/registry.h"
 #include "system/system.h"
@@ -46,6 +47,38 @@ void lemu_registry_add_endpoint(const char *spec)
         registry_endpoints = g_ptr_array_new_with_free_func(g_free);
     }
     g_ptr_array_add(registry_endpoints, g_strdup(spec));
+}
+
+const char *lemu_registry_name(void)
+{
+    static char *name;
+
+    /* once, as -daemonize moves to / after the entry is written */
+    if (!name) {
+        g_autofree char *cwd = g_get_current_dir();
+
+        name = qemu_name ? g_strdup(qemu_name) : g_path_get_basename(cwd);
+    }
+    return name;
+}
+
+bool lemu_registry_names_me(QObject *vm)
+{
+    QString *qs = qobject_to(QString, vm);
+    QNum *qn = qobject_to(QNum, vm);
+    const char *name = qs ? qstring_get_str(qs) : NULL;
+    int64_t pid;
+
+    if (qn) {
+        return qnum_get_try_int(qn, &pid) && pid == getpid();
+    }
+    if (!name || !*name) {
+        return false;
+    }
+    if (strspn(name, "0123456789") == strlen(name)) {
+        return g_ascii_strtoll(name, NULL, 10) == getpid();
+    }
+    return !strcmp(name, lemu_registry_name());
 }
 
 #ifdef CONFIG_POSIX
@@ -181,13 +214,7 @@ static void registry_write(Notifier *n, void *data)
     int i;
 
     qdict_put_int(d, "pid", getpid());
-    if (qemu_name) {
-        qdict_put_str(d, "name", qemu_name);
-    } else {
-        g_autofree char *base = g_path_get_basename(cwd);
-
-        qdict_put_str(d, "name", base);
-    }
+    qdict_put_str(d, "name", lemu_registry_name());
     if (registry_socket) {
         qdict_put_str(d, "socket", registry_socket);
     } else {

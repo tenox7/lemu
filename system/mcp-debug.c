@@ -10,7 +10,6 @@
 #include "exec/replay-core.h"
 #include "hw/core/cpu.h"
 #include "monitor/mcp.h"
-#include "monitor/mcp-common.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-mcp.h"
 #include "qemu/coroutine.h"
@@ -664,7 +663,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         return NULL;
     }
     timeout_ms = has_timeout_ms ? timeout_ms : RUN_DEFAULT_MS;
-    timeout_ms = MIN(MAX(timeout_ms, 0), MCP_WAIT_MAX_MS);
+    timeout_ms = MIN(MAX(timeout_ms, 0), mcp_wait_max_ms());
     if (!mcp_parse_address(address, "address", &b.addr, errp)) {
         return NULL;
     }
@@ -1039,7 +1038,7 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
         ctx = &local;
     }
     interval_ms = has_interval_ms ? interval_ms : PROFILE_DEFAULT_MS;
-    interval_ms = MIN(MAX(interval_ms, PROFILE_MIN_MS), MCP_WAIT_MAX_MS);
+    interval_ms = MAX(MIN(interval_ms, mcp_wait_max_ms()), PROFILE_MIN_MS);
     top = has_top ? top : PROFILE_TOP;
     top = MIN(MAX(top, 1), PROFILE_TOP_MAX);
     CPU_FOREACH(cpu) {

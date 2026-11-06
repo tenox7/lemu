@@ -41,15 +41,19 @@
 #include "qobject/qnum.h"
 #include "qobject/qstring.h"
 #include "qom/object_interfaces.h"
+#include "system/registry.h"
 #include "trace.h"
 
 #define MCP_EVENTS_MAX          32
 #define MCP_PROGRESS_MS         5000
+#define MCP_STEPS_MAX           50
+#define MCP_STEP_SUMMARY_MAX    2000    /* of a step that is not the last */
 
 typedef struct McpCall {
     MonitorMCP *mon;
     QObject *id;
     char *tool;
+    char *step;                 /* steps: "(2 of 5: key)" while it runs */
     QDict *args;
     QObject *progress_token;
     QEMUTimer *progress_timer;
@@ -86,27 +90,43 @@ static GHashTable *mcp_calls_by_co;
 
 static void mcp_handle_message(void *opaque, QObject *msg, Error *err);
 
-QemuInputCtx *mcp_current_input_ctx(void)
+static McpCall *mcp_current_call(void)
 {
-    McpCall *call;
-
     if (!mcp_calls_by_co || !qemu_in_coroutine()) {
         return NULL;
     }
-    call = g_hash_table_lookup(mcp_calls_by_co, qemu_coroutine_self());
+    return g_hash_table_lookup(mcp_calls_by_co, qemu_coroutine_self());
+}
+
+QemuInputCtx *mcp_current_input_ctx(void)
+{
+    McpCall *call = mcp_current_call();
+
     return call ? &call->ctx : NULL;
 }
 
 void mcp_quiet_runstate_events(void)
 {
-    McpCall *call;
+    McpCall *call = mcp_current_call();
 
-    if (mcp_calls_by_co && qemu_in_coroutine()) {
-        call = g_hash_table_lookup(mcp_calls_by_co, qemu_coroutine_self());
-        if (call) {
-            call->quiet_runstate = true;
-        }
+    if (call) {
+        call->quiet_runstate = true;
     }
+}
+
+/* What is left of the MCP_WAIT_MAX_MS that one call may take in all */
+static int64_t mcp_call_time_left(McpCall *call)
+{
+    int64_t used = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - call->start_ms;
+
+    return MAX(MCP_WAIT_MAX_MS - used, 0);
+}
+
+int64_t mcp_wait_max_ms(void)
+{
+    McpCall *call = mcp_current_call();
+
+    return call ? mcp_call_time_left(call) : MCP_WAIT_MAX_MS;
 }
 
 #ifdef CONFIG_HMP
@@ -344,6 +364,31 @@ static QDict *mcp_tool_error(const char *text)
 }
 
 /*
+ * Add an image block to @content for each of @images; the images
+ * without their data, for the JSON block
+ */
+static QList *mcp_image_blocks(QList *content, QList *images)
+{
+    QList *meta = qlist_new();
+    QListEntry *le;
+
+    QLIST_FOREACH_ENTRY(images, le) {
+        QDict *img = qobject_to(QDict, qlist_entry_obj(le));
+        QDict *block = qdict_new();
+        QDict *m = qdict_clone_shallow(img);
+
+        qdict_put_str(block, "type", "image");
+        qdict_put_str(block, "data", qdict_get_str(img, "data"));
+        qdict_put_str(block, "mimeType", qdict_get_str(img, "mime-type"));
+        qlist_append(content, block);
+        qdict_del(m, "data");
+        qdict_del(m, "mime-type");
+        qlist_append(meta, m);
+    }
+    return meta;
+}
+
+/*
  * Turn an McpResult-based return value into MCP content: the summary
  * as text, each image as an image block, all else as one JSON block.
  */
@@ -375,8 +420,6 @@ static QDict *mcp_content_from_result(MonitorMCP *mcp, QObject *ret)
     }
     for (e = qdict_first(dict); e; e = qdict_next(dict, e)) {
         const char *key = qdict_entry_key(e);
-        QList *images, *meta;
-        QListEntry *le;
 
         if (!strcmp(key, "summary")) {
             continue;
@@ -385,23 +428,9 @@ static QDict *mcp_content_from_result(MonitorMCP *mcp, QObject *ret)
             qdict_put_obj(rest, key, qobject_ref(qdict_entry_value(e)));
             continue;
         }
-        images = qobject_to(QList, qdict_entry_value(e));
-        meta = qlist_new();
-        QLIST_FOREACH_ENTRY(images, le) {
-            QDict *img = qobject_to(QDict, qlist_entry_obj(le));
-            QDict *block = qdict_new();
-            QDict *m = qdict_clone_shallow(img);
-
-            qdict_put_str(block, "type", "image");
-            qdict_put_str(block, "data", qdict_get_str(img, "data"));
-            qdict_put_str(block, "mimeType",
-                          qdict_get_str(img, "mime-type"));
-            qlist_append(content, block);
-            qdict_del(m, "data");
-            qdict_del(m, "mime-type");
-            qlist_append(meta, m);
-        }
-        qdict_put(rest, "images", meta);
+        qdict_put(rest, "images",
+                  mcp_image_blocks(content, qobject_to(QList,
+                                                       qdict_entry_value(e))));
     }
     if (events) {
         qdict_put(rest, "events", events);
@@ -445,8 +474,10 @@ static void mcp_progress_tick(void *opaque)
     QDict *params = qdict_new();
     int64_t s = (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - call->start_ms)
                 / 1000;
-    g_autofree char *text = g_strdup_printf("%s running for %" PRId64 " s",
-                                            call->tool, s);
+    g_autofree char *text = g_strdup_printf("%s%s%s running for %" PRId64
+                                            " s", call->tool,
+                                            call->step ? " " : "",
+                                            call->step ? call->step : "", s);
 
     if (call->discard) {
         qobject_unref(msg);
@@ -476,8 +507,340 @@ static void mcp_call_free(McpCall *call)
     qobject_unref(call->args);
     qobject_unref(call->progress_token);
     g_free(call->tool);
+    g_free(call->step);
     object_unref(OBJECT(call->mon));
     g_free(call);
+}
+
+/*
+ * Run tool @tool with @args: a QMP command, or the qmp or hmp tool.
+ * The QMP response, or NULL and *@error if the call cannot run.
+ */
+static QDict *coroutine_fn mcp_run_tool(McpCall *call, const char *tool,
+                                        QDict *args, char **error)
+{
+    if (!strcmp(tool, "qmp")) {
+        const char *execute = qdict_get_try_str(args, "execute");
+        QDict *qargs = qdict_get_qdict(args, "arguments");
+        g_autoptr(QDict) empty = qdict_new();
+
+        if (!execute) {
+            *error = g_strdup("'execute' is missing");
+            return NULL;
+        }
+        if (!strcmp(execute, "qmp_capabilities")) {
+            *error = g_strdup("qmp_capabilities is not needed here");
+            return NULL;
+        }
+        return mcp_dispatch(call, execute, qargs ? qargs : empty);
+    }
+#ifdef CONFIG_HMP
+    if (!strcmp(tool, "hmp")) {
+        const char *cmd = qdict_get_try_str(args, "command");
+        g_autoptr(QDict) hargs = qdict_new();
+
+        if (!cmd) {
+            *error = g_strdup("'command' is missing");
+            return NULL;
+        }
+        qdict_put_str(hargs, "command-line", cmd);
+        return mcp_dispatch(call, "human-monitor-command", hargs);
+    }
+#endif
+    return mcp_dispatch(call, tool, args);
+}
+
+/* hmp output; the monitor writes \r\n line ends */
+static GString *mcp_hmp_text(QString *text)
+{
+    GString *s = g_string_new(NULL);
+    const char *p;
+
+    for (p = qstring_get_str(text); *p; p++) {
+        if (p[0] != '\r' || p[1] != '\n') {
+            g_string_append_c(s, *p);
+        }
+    }
+    return s;
+}
+
+static void mcp_add_json_block(QList *content, QDict *rest)
+{
+    GString *json = qobject_to_json(QOBJECT(rest));
+
+    qlist_append(content, mcp_text_block(json->str));
+    g_string_free(json, true);
+}
+
+/* The tool result for a QMP response */
+static QDict *mcp_result_from_rsp(MonitorMCP *mcp, QDict *rsp)
+{
+    QObject *ret = qdict_get(rsp, "return");
+    QString *text = qobject_to(QString, ret);
+    g_autoptr(GString) s = NULL;
+    QList *content, *events;
+
+    if (qdict_haskey(rsp, "error")) {
+        return mcp_error_from_rsp(rsp);
+    }
+    if (!text) {
+        return mcp_content_from_result(mcp, ret);
+    }
+    /* hmp: plain text */
+    content = qlist_new();
+    events = mcp_take_events(mcp);
+    s = mcp_hmp_text(text);
+    qlist_append(content, mcp_text_block(s->len ? s->str : "(no output)"));
+    if (events) {
+        g_autoptr(QDict) rest = qdict_new();
+
+        qdict_put(rest, "events", events);
+        mcp_add_json_block(content, rest);
+    }
+    return mcp_tool_result(content, false);
+}
+
+/* steps */
+
+static bool mcp_tool_exists(const char *name);
+
+static bool mcp_steps_check(QList *steps, char **error)
+{
+    QListEntry *e;
+    int i = 0;
+
+    if (!steps || qlist_empty(steps)) {
+        *error = g_strdup("'steps' needs a list of at least one step");
+        return false;
+    }
+    if (qlist_size(steps) > MCP_STEPS_MAX) {
+        *error = g_strdup_printf("at most %d steps in one call",
+                                 MCP_STEPS_MAX);
+        return false;
+    }
+    QLIST_FOREACH_ENTRY(steps, e) {
+        QDict *step = qobject_to(QDict, qlist_entry_obj(e));
+        const char *tool = step ? qdict_get_try_str(step, "tool") : NULL;
+        QObject *args = step ? qdict_get(step, "args") : NULL;
+        QObject *vm = qobject_to(QDict, args)
+                      ? qdict_get(qobject_to(QDict, args), "vm") : NULL;
+
+        i++;
+        if (!tool) {
+            *error = g_strdup_printf("step %d has no 'tool'", i);
+            return false;
+        }
+        if (args && !qobject_to(QDict, args)) {
+            *error = g_strdup_printf("step %d: 'args' must be an object", i);
+            return false;
+        }
+        if (vm && !lemu_registry_names_me(vm)) {
+            *error = g_strdup_printf("step %d: its vm is not this VM; all"
+                                     " steps run on %s (pid %d), so make one"
+                                     " steps call per VM", i,
+                                     lemu_registry_name(), getpid());
+            return false;
+        }
+        if (!strcmp(tool, "steps")) {
+            *error = g_strdup_printf("step %d: steps cannot hold steps", i);
+            return false;
+        }
+        if (!mcp_tool_exists(tool)) {
+            *error = g_strdup_printf("step %d: unknown tool '%s'%s", i, tool,
+                                     !strcmp(tool, "vm-list") ||
+                                     !strcmp(tool, "vm-wait")
+                                     ? " here (the bridge's own tools "
+                                       "cannot be steps)" : "");
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Why a step that ran did not get what it waited for, or NULL */
+static const char *mcp_step_unmet(QDict *ret)
+{
+    QDict *wait = qdict_get_qdict(ret, "wait");
+
+    if (!qdict_get_try_bool(ret, "matched", true)) {
+        return "no match";
+    }
+    if (wait && !qdict_get_try_bool(wait, "matched", true)) {
+        return "the wait timed out";
+    }
+    if (!qdict_get_try_bool(ret, "done", true)) {
+        return "the command did not end";
+    }
+    if (!qdict_get_try_bool(ret, "reached", true)) {
+        return "the CPU did not get there";
+    }
+    return NULL;
+}
+
+/* Append @text, cut to about @max bytes at a character boundary */
+static void mcp_append_cut(GString *s, const char *text, size_t max)
+{
+    if (strlen(text) <= max) {
+        g_string_append(s, text);
+        return;
+    }
+    while (max && (text[max] & 0xc0) == 0x80) {
+        max--;
+    }
+    g_string_append_len(s, text, max);
+    g_string_append(s, " [...]");
+}
+
+/* One line for a step that ran; its images go to *@images */
+static char *mcp_step_line(int i, const char *tool, QObject *ret,
+                           QList **images)
+{
+    QString *str = qobject_to(QString, ret);
+    QDict *dict = qobject_to(QDict, ret);
+    g_autoptr(GString) s = NULL;
+
+    if (str) {
+        s = mcp_hmp_text(str);
+        return g_strdup_printf("%d. %s: %s", i, tool,
+                               s->len ? s->str : "(no output)");
+    }
+    if (!dict) {
+        s = qobject_to_json(ret);
+        return g_strdup_printf("%d. %s: %s", i, tool, s->str);
+    }
+    if (qdict_get_qlist(dict, "images")) {
+        qobject_unref(*images);
+        *images = qobject_ref(qdict_get_qlist(dict, "images"));
+    }
+    return g_strdup_printf("%d. %s: %s", i, tool,
+                           qdict_haskey(dict, "summary")
+                           ? qdict_get_str(dict, "summary") : "done");
+}
+
+/*
+ * Run the steps in order, until one fails or does not get what it
+ * waits for.  One call: they share its cancel, its events and its
+ * MCP_WAIT_MAX_MS.
+ */
+static QDict *coroutine_fn mcp_steps(McpCall *call, QDict *args)
+{
+    QList *steps = qdict_get_qlist(args, "steps");
+    g_autoptr(GPtrArray) lines = g_ptr_array_new_with_free_func(g_free);
+    g_autoptr(QList) images = NULL;     /* the last ones taken */
+    g_autoptr(QDict) last = NULL;       /* the last step's result */
+    g_autoptr(GString) text = g_string_new(NULL);
+    g_autoptr(QDict) rest = qdict_new();
+    g_autofree char *error = NULL;
+    const char *unmet = NULL;
+    bool failed = false;
+    bool late = false;  /* the last wait was cut short by the time limit */
+    QList *content, *events;
+    QListEntry *e;
+    int n, i = 0;
+    int again = 0;      /* the time limit came before this step */
+    guint j;
+
+    if (!mcp_steps_check(steps, &error)) {
+        return mcp_tool_error(error);
+    }
+    n = qlist_size(steps);
+    QLIST_FOREACH_ENTRY(steps, e) {
+        QDict *step = qobject_to(QDict, qlist_entry_obj(e));
+        const char *tool = qdict_get_str(step, "tool");
+        QDict *sargs = qdict_get_qdict(step, "args");
+        g_autoptr(QDict) a = sargs ? qdict_clone_shallow(sargs) : qdict_new();
+        g_autofree char *err = NULL;
+        QDict *rsp, *qerr;
+        char *line;
+
+        if (call->discard) {
+            unmet = "cancelled";
+            break;
+        }
+        if (i && !mcp_call_time_left(call)) {
+            unmet = "25 minutes is the most one call may take";
+            again = i + 1;
+            break;
+        }
+        i++;
+        qdict_del(a, "vm");     /* the bridge's, checked to be this VM */
+        g_free(call->step);
+        call->step = g_strdup_printf("(%d of %d: %s)", i, n, tool);
+        call->quiet_runstate = false;
+        rsp = mcp_run_tool(call, tool, a, &err);
+        qerr = rsp ? qdict_get_qdict(rsp, "error") : NULL;
+        if (!rsp || qerr) {
+            g_ptr_array_add(lines, g_strdup_printf(
+                "%d. %s failed: %s", i, tool,
+                err ? err : qdict_get_try_str(qerr, "desc")));
+            qobject_unref(rsp);
+            failed = true;
+            break;
+        }
+        line = mcp_step_line(i, tool, qdict_get(rsp, "return"), &images);
+        g_ptr_array_add(lines, g_strchomp(line));
+        qobject_unref(last);
+        last = qobject_to(QDict, qdict_get(rsp, "return"));
+        if (last) {
+            qobject_ref(last);
+            unmet = mcp_step_unmet(last);
+        }
+        qobject_unref(rsp);
+        if (unmet) {
+            late = !mcp_call_time_left(call);
+            break;
+        }
+    }
+    g_clear_pointer(&call->step, g_free);
+
+    if (failed) {
+        g_string_printf(text, "step %d of %d failed", i, n);
+    } else if (unmet && i < n) {
+        g_string_printf(text, "stopped after step %d of %d: %s", i, n, unmet);
+    } else if (unmet) {
+        g_string_printf(text, "step %d of %d: %s", i, n, unmet);
+    } else if (n == 1) {
+        g_string_printf(text, "ran the 1 step");
+    } else {
+        g_string_printf(text, "ran all %d steps", n);
+    }
+    if (late) {
+        /* its own summary says how to go on */
+        g_string_append(text, ", at the 25-minute limit of one call");
+    }
+    if (i < n) {
+        g_string_append(text, ", so the rest did not run");
+    }
+    if (again) {
+        g_string_append_printf(text, "; call steps again from step %d",
+                               again);
+    }
+    for (j = 0; j < lines->len; j++) {
+        g_string_append_c(text, '\n');
+        mcp_append_cut(text, g_ptr_array_index(lines, j),
+                       j + 1 < lines->len ? MCP_STEP_SUMMARY_MAX : SIZE_MAX);
+    }
+    content = qlist_new();
+    qlist_append(content, mcp_text_block(text->str));
+    if (images) {
+        qdict_put(rest, "images", mcp_image_blocks(content, images));
+    }
+    qdict_put_int(rest, "steps-done", failed ? i - 1 : i);
+    qdict_put_int(rest, "steps", n);
+    if (last && !failed) {
+        /* what the last step said, but its summary and images */
+        QDict *l = qdict_clone_shallow(last);
+
+        qdict_del(l, "summary");
+        qdict_del(l, "images");
+        qdict_put(rest, "last", l);
+    }
+    events = mcp_take_events(call->mon);
+    if (events) {
+        qdict_put(rest, "events", events);
+    }
+    mcp_add_json_block(content, rest);
+    return mcp_tool_result(content, failed);
 }
 
 static void coroutine_fn mcp_call_co(void *opaque)
@@ -490,69 +853,13 @@ static void coroutine_fn mcp_call_co(void *opaque)
     g_hash_table_insert(mcp_calls_by_co, qemu_coroutine_self(), call);
     trace_mcp_tool_start(mcp, call->tool);
 
-    if (!strcmp(call->tool, "qmp")) {
-        const char *execute = qdict_get_try_str(call->args, "execute");
-        QDict *args = qdict_get_qdict(call->args, "arguments");
-
-        if (!execute) {
-            result = mcp_tool_error("'execute' is missing");
-        } else if (!strcmp(execute, "qmp_capabilities")) {
-            result = mcp_tool_error("qmp_capabilities is not needed here");
-        } else {
-            g_autoptr(QDict) empty = qdict_new();
-
-            rsp = mcp_dispatch(call, execute, args ? args : empty);
-        }
-#ifdef CONFIG_HMP
-    } else if (!strcmp(call->tool, "hmp")) {
-        const char *cmd = qdict_get_try_str(call->args, "command");
-        g_autoptr(QDict) args = qdict_new();
-
-        if (!cmd) {
-            result = mcp_tool_error("'command' is missing");
-        } else {
-            qdict_put_str(args, "command-line", cmd);
-            rsp = mcp_dispatch(call, "human-monitor-command", args);
-        }
-#endif
+    if (!strcmp(call->tool, "steps")) {
+        result = mcp_steps(call, call->args);
     } else {
-        rsp = mcp_dispatch(call, call->tool, call->args);
-    }
+        g_autofree char *error = NULL;
 
-    if (rsp && qdict_haskey(rsp, "error")) {
-        result = mcp_error_from_rsp(rsp);
-    } else if (rsp) {
-        QObject *ret = qdict_get(rsp, "return");
-        QString *text = qobject_to(QString, ret);
-
-        if (text) {
-            /* hmp: plain text */
-            QList *content = qlist_new();
-            QList *events = mcp_take_events(mcp);
-            g_autoptr(GString) s = g_string_new(NULL);
-            const char *p;
-
-            /* the monitor writes \r\n line ends */
-            for (p = qstring_get_str(text); *p; p++) {
-                if (p[0] != '\r' || p[1] != '\n') {
-                    g_string_append_c(s, *p);
-                }
-            }
-            qlist_append(content,
-                         mcp_text_block(s->len ? s->str : "(no output)"));
-            if (events) {
-                g_autoptr(QDict) rest = qdict_new();
-                GString *json;
-
-                qdict_put(rest, "events", events);
-                json = qobject_to_json(QOBJECT(rest));
-                qlist_append(content, mcp_text_block(json->str));
-                g_string_free(json, true);
-            }
-            result = mcp_tool_result(content, false);
-        } else {
-            result = mcp_content_from_result(mcp, ret);
-        }
+        rsp = mcp_run_tool(call, call->tool, call->args, &error);
+        result = rsp ? mcp_result_from_rsp(mcp, rsp) : mcp_tool_error(error);
     }
     qobject_unref(rsp);
 
@@ -574,7 +881,7 @@ static bool mcp_tool_exists(const char *name)
     const McpToolDef *t;
     const QmpCommand *cmd;
 
-    if (!strcmp(name, "qmp")) {
+    if (!strcmp(name, "qmp") || !strcmp(name, "steps")) {
         return true;
     }
 #ifdef CONFIG_HMP
@@ -605,6 +912,7 @@ static QList *mcp_tools_list(void)
     qlist_append_obj(list, qobject_from_json(mcp_tool_hmp, &error_abort));
 #endif
     qlist_append_obj(list, qobject_from_json(mcp_tool_qmp, &error_abort));
+    qlist_append_obj(list, qobject_from_json(mcp_tool_steps, &error_abort));
     return list;
 }
 
