@@ -140,6 +140,10 @@ Use these:
   Addresses are virtual, as the CPU sees them (on x86: the CS base plus
   EIP). These tools need TCG, the default for the old CPUs, and no GDB
   stub.
+- **When you need GDB after all,** for example to trace many addresses
+  at once: `hmp` `gdbserver tcp:127.0.0.1:1234` turns the GDB stub on in
+  a running VM, with no restart. Don't use `debug-run` or `debug-step`
+  while a GDB client is attached.
 
 Not covered yet: copying files. For guests that run `rshd`, an rsh MCP
 server such as [rsh-mcp](https://github.com/tenox7/rsh-mcp) runs
