@@ -24,6 +24,19 @@ the serial console.
 `AIX_v7.2_Install_7200-05-03-2147_DVD_1_of_2.iso`, TL5 SP10 hangs right after
 the kernel banner.
 
+## Tips for agents
+
+- **Graphical install:** press F1 at "define the System Console" on the
+  screen you want as the console.
+- **Slow start:** AIX is busy for about 7 minutes after boot, and
+  `oslevel -s` takes over 2 minutes. Use long timeouts.
+- **Java Configuration Assistant:** on its license pages, Enter means
+  Decline. Use Tab and Shift+Tab, then Space.
+- **Text installs over telnet** need `TERM=vt100` and `DISPLAY` unset.
+- **grep** has no `-A` or `-B`. Use `awk`.
+- **Panel:** with `panel=on`, `/usr/lib/methods/showled` shows 4
+  characters, and AIX changes hex letters: 0xCAFE shows "ac0e".
+
 ## Release
 
 `release/` builds the tarballs: `build-linux.sh amd64|arm64 OUT` and

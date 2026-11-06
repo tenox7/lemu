@@ -73,6 +73,8 @@ The server sends these rules to every agent that connects:
 - **Look before you act.** Take a screenshot first. The keyboard and
   mouse tools take `then`, so they can wait and look again in the same
   call.
+- **A black screen** in a graphical guest is often its screen saver,
+  not a hang. Move the mouse, then look again.
 - **Don't sleep.** Use `wait-screen`, or `serial-expect` for serial
   text. One call can wait up to 25 minutes; for a longer install, call
   it again.
@@ -84,8 +86,12 @@ The server sends these rules to every agent that connects:
 - **Commands in a Unix guest:** log in on a serial port and use
   `serial-run`. It returns the output and the exit status. If the
   console is a graphics screen, start a getty on a serial port first.
+  Old Unix tools lack GNU options such as `grep -A` and `sed -i`: use
+  `awk`.
 - **Check the focus before typing.** Keys go to the focused window.
-- **Old dialogs:** use Tab and Shift+Tab, then Space or Enter.
+- **Old dialogs:** use Tab and Shift+Tab to reach a control, then
+  Space. Radio buttons and check boxes need Space. Enter presses the
+  default button, which may be Cancel or Decline.
 - **Mouse:** most old guests have a relative mouse. If a click misses,
   take a screenshot with `pointer=true`, or use the keyboard.
 - **Old menus** may need press-and-hold: `mouse-button` down,
