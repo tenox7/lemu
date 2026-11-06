@@ -1977,3 +1977,52 @@
             '*cpu': 'int' },
   'returns': 'McpMemoryWriteResult',
   'features': [ 'mcp', 'mcp-destructive' ] }
+
+##
+# @McpRegisterWriteResult:
+#     What @register-write returns.
+#
+# @before: the value before, in hex
+#
+# @after: the value now, in hex
+#
+# Since: 11.2
+##
+{ 'struct': 'McpRegisterWriteResult',
+  'base': 'McpResult',
+  'data': { 'before': 'str', 'after': 'str' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @register-write:
+#     Set a register of a CPU while the VM is stopped (by debug-run,
+#     debug-step or vm-power pause), for example to change what a
+#     function returns, or to go on at another instruction.  It
+#     returns the old value, so you can put it back, and it says what
+#     else changed with it.
+#
+# @register: pc, or a register named as in a @McpDebugMemory
+#     address.  pc is where the CPU is, as the debug tools show it:
+#     setting it changes the registers that hold it, such as a code
+#     segment's offset or a next-instruction register, but never the
+#     CPU's mode.  When it can't, nothing changes, and the error says
+#     why.
+#
+# @value: the new value: hex with 0x, decimal, or a negative decimal
+#     for a register of up to 8 bytes
+#
+# @cpu: the CPU (default: the one that stopped last, else the first)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# @mcp-destructive: changes the CPU's registers
+#
+# Since: 11.2
+##
+{ 'command': 'register-write',
+  'data': { 'register': 'str', 'value': 'str', '*cpu': 'int' },
+  'returns': 'McpRegisterWriteResult',
+  'features': [ 'mcp', 'mcp-destructive' ],
+  'if': 'CONFIG_TCG' }

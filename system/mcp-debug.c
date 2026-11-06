@@ -30,6 +30,7 @@
 #include "system/tcg.h"
 #include "ui/input.h"
 #ifdef CONFIG_TCG
+#include "accel/tcg/cpu-ops.h"
 #include "exec/cpu-common.h"
 #include "exec/cpu-interrupt.h"
 #include "exec/excp-watch.h"
@@ -871,14 +872,32 @@ static int mcp_reg_number(CPUState *cpu, const char *name)
 }
 
 /*
+ * GDB's bytes of a register as a number, when it has 1 to 8 bytes: in
+ * the byte order the CPU runs in now, as GDB wants it
+ */
+static bool mcp_reg_decode(CPUState *cpu, const GByteArray *b, uint64_t *val)
+{
+    bool be = cpu_internal_is_big_endian(cpu);
+    unsigned int i;
+
+    if (b->len != 1 && b->len != 2 && b->len != 4 && b->len != 8) {
+        return false;
+    }
+    *val = 0;
+    for (i = 0; i < b->len; i++) {
+        *val = *val << 8 | b->data[be ? i : b->len - 1 - i];
+    }
+    return true;
+}
+
+/*
  * The value of register @name of @cpu, when it is an integer: pc is
  * where the debug tools say the CPU is, the others are GDB's
  */
 static bool mcp_reg_value(CPUState *cpu, const char *name, uint64_t *val)
 {
     g_autoptr(GByteArray) buf = NULL;
-    int reg, len, i;
-    bool be;
+    int reg;
 
     if (!g_ascii_strcasecmp(name, "pc")) {
         *val = cpu->cc->get_pc(cpu);
@@ -889,17 +908,8 @@ static bool mcp_reg_value(CPUState *cpu, const char *name, uint64_t *val)
         return false;
     }
     buf = g_byte_array_new();
-    len = gdb_read_register(cpu, buf, reg);
-    if (len != 1 && len != 2 && len != 4 && len != 8) {
-        return false;
-    }
-    /* in the byte order the CPU runs in now, as GDB wants it */
-    be = cpu_internal_is_big_endian(cpu);
-    *val = 0;
-    for (i = 0; i < len; i++) {
-        *val = *val << 8 | buf->data[be ? i : len - 1 - i];
-    }
-    return true;
+    gdb_read_register(cpu, buf, reg);
+    return mcp_reg_decode(cpu, buf, val);
 }
 
 /* The registers an address may name, for an error */
@@ -2982,6 +2992,419 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
     }
     res->summary = g_strdup(s->str);
     mcp_profile_unref(p);
+    return res;
+}
+
+/*
+ * register-write.  GDB's stub sets a register by name.  The pc goes
+ * through the CPU's own set_pc hook, as the GDB stub's "continue at"
+ * does, and may change nothing else the debug tools can see: not the
+ * CPU's mode (its MMU modes and the flags code is translated with),
+ * and no register that does not move as far as the pc.
+ */
+
+#define PC_MODE_BITS            4       /* low bits set_pc may take a mode in */
+
+/* What a write may change in a CPU */
+typedef struct McpCpuSeen {
+    uint64_t pc;
+    int mmu_idx[2];                     /* for data, for code */
+    uint32_t tb_flags;
+    int n_regs;                         /* GDB's registers */
+    GByteArray **regs;
+} McpCpuSeen;
+
+typedef enum McpRegChange {
+    REG_SAME,
+    REG_MOVED,                          /* by as much as asked */
+    REG_OTHER,
+} McpRegChange;
+
+static void mcp_cpu_see(CPUState *cpu, McpCpuSeen *s)
+{
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+    int i;
+
+    s->pc = cpu->cc->get_pc(cpu);
+    s->mmu_idx[0] = ops->mmu_index(cpu, false);
+    s->mmu_idx[1] = ops->mmu_index(cpu, true);
+    s->tb_flags = ops->get_tb_cpu_state(cpu).flags;
+    /* all of GDB's: the pc may be outside the core ones, as on SPARC */
+    s->n_regs = cpu->gdb_num_regs;
+    s->regs = g_new(GByteArray *, s->n_regs);
+    for (i = 0; i < s->n_regs; i++) {
+        s->regs[i] = g_byte_array_new();
+        gdb_read_register(cpu, s->regs[i], i);
+    }
+}
+
+static void mcp_cpu_seen_free(McpCpuSeen *s)
+{
+    int i;
+
+    for (i = 0; i < s->n_regs; i++) {
+        g_byte_array_unref(s->regs[i]);
+    }
+    g_free(s->regs);
+}
+
+static uint64_t mcp_reg_mask(unsigned int len)
+{
+    return len >= 8 ? UINT64_MAX : (1ULL << (len * 8)) - 1;
+}
+
+/* How register @n changed since @was, read into @now */
+static McpRegChange mcp_reg_change(CPUState *cpu, const McpCpuSeen *was,
+                                   int n, uint64_t delta, GByteArray *now)
+{
+    const GByteArray *old = was->regs[n];
+    uint64_t a, b;
+
+    g_byte_array_set_size(now, 0);
+    gdb_read_register(cpu, now, n);
+    if (now->len == old->len && !memcmp(now->data, old->data, old->len)) {
+        return REG_SAME;
+    }
+    if (now->len == old->len && mcp_reg_decode(cpu, old, &a) &&
+        mcp_reg_decode(cpu, now, &b) &&
+        !((b - a - delta) & mcp_reg_mask(now->len))) {
+        return REG_MOVED;
+    }
+    return REG_OTHER;
+}
+
+/* GDB's name of register @n, else rN */
+static char *mcp_reg_name(GArray *names, int n)
+{
+    unsigned int i;
+
+    for (i = 0; i < names->len; i++) {
+        GDBRegDesc *r = &g_array_index(names, GDBRegDesc, i);
+
+        if (r->gdb_reg == n && r->name) {
+            return g_strdup(r->name);
+        }
+    }
+    return g_strdup_printf("r%d", n);
+}
+
+/* A register's value: a number, else GDB's bytes in hex */
+static char *mcp_reg_show(CPUState *cpu, const GByteArray *b)
+{
+    uint64_t v;
+
+    if (mcp_reg_decode(cpu, b, &v)) {
+        return g_strdup_printf("0x%" PRIx64, v);
+    }
+    return mcp_hex(b->data, b->len);
+}
+
+/*
+ * Append the registers but @skip that changed since @was: all of
+ * them, or those that did not move by @delta: "npc (0x2000 to 0x123c)".
+ * Returns how many.
+ */
+static int mcp_reg_append_changes(GString *s, CPUState *cpu,
+                                  const McpCpuSeen *was, bool all,
+                                  uint64_t delta, int skip)
+{
+    g_autoptr(GArray) names = gdb_get_register_list(cpu);
+    g_autoptr(GByteArray) now = g_byte_array_new();
+    GPtrArray *items = g_ptr_array_new_with_free_func(g_free);
+    int i, n;
+
+    for (i = 0; i < was->n_regs; i++) {
+        McpRegChange c = mcp_reg_change(cpu, was, i, delta, now);
+        g_autofree char *name = NULL;
+        g_autofree char *a = NULL;
+        g_autofree char *b = NULL;
+
+        if (i == skip || c == REG_SAME || (c == REG_MOVED && !all)) {
+            continue;
+        }
+        name = mcp_reg_name(names, i);
+        a = mcp_reg_show(cpu, was->regs[i]);
+        b = mcp_reg_show(cpu, now);
+        g_ptr_array_add(items, g_strdup_printf("%s (%s to %s)", name, a, b));
+    }
+    n = items->len;
+    mcp_append_list(s, items, "and");
+    return n;
+}
+
+/*
+ * Whether @cpu is at @want with nothing changed since @was but the
+ * registers that moved as far as the pc.  The translation flags come
+ * last: some CPUs check them against the rest as they make them.
+ */
+static bool mcp_pc_alone(CPUState *cpu, const McpCpuSeen *was, uint64_t want)
+{
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+    g_autoptr(GByteArray) now = g_byte_array_new();
+    int i;
+
+    if (cpu->cc->get_pc(cpu) != want ||
+        ops->mmu_index(cpu, false) != was->mmu_idx[0] ||
+        ops->mmu_index(cpu, true) != was->mmu_idx[1]) {
+        return false;
+    }
+    for (i = 0; i < was->n_regs; i++) {
+        if (mcp_reg_change(cpu, was, i, want - was->pc, now) == REG_OTHER) {
+            return false;
+        }
+    }
+    return ops->get_tb_cpu_state(cpu).flags == was->tb_flags;
+}
+
+/*
+ * Put @cpu at @want through set_pc, with @mode in the low bits: some
+ * CPUs take a mode with the pc there (Thumb, MIPS16, PALcode, privilege
+ * levels).  When the pc the tools show adds a base, such as the code
+ * segment's on x86, set_pc takes the offset.
+ */
+static void mcp_pc_set(CPUState *cpu, uint64_t want, int mode)
+{
+    vaddr v = want | mode;
+    vaddr got;
+
+    cpu_set_pc(cpu, v);
+    got = cpu->cc->get_pc(cpu);
+    if (got != want) {
+        cpu_set_pc(cpu, v - (got - want));
+    }
+}
+
+/* Put @cpu back as @was saw it: the pc and the mode, then the registers */
+static bool mcp_pc_restore(CPUState *cpu, const McpCpuSeen *was)
+{
+    const TCGCPUOps *ops = cpu->cc->tcg_ops;
+    g_autoptr(GByteArray) now = g_byte_array_new();
+    int mode, i;
+
+    for (mode = 0; mode < PC_MODE_BITS; mode++) {
+        mcp_pc_set(cpu, was->pc, mode);
+        if (cpu->cc->get_pc(cpu) == was->pc &&
+            ops->mmu_index(cpu, false) == was->mmu_idx[0] &&
+            ops->mmu_index(cpu, true) == was->mmu_idx[1]) {
+            break;
+        }
+    }
+    for (i = 0; i < was->n_regs; i++) {
+        if (was->regs[i]->len &&
+            mcp_reg_change(cpu, was, i, 0, now) != REG_SAME) {
+            gdb_write_register(cpu, was->regs[i]->data, i);
+        }
+    }
+    return mcp_pc_alone(cpu, was, was->pc);
+}
+
+/*
+ * @s as the value of a register of @len bytes: hex with 0x, decimal, or
+ * a negative decimal
+ */
+static bool mcp_parse_reg_value(const char *s, unsigned int len,
+                                uint64_t *val, Error **errp)
+{
+    uint64_t mask = mcp_reg_mask(len);
+    int64_t neg;
+
+    if (s[0] == '-') {
+        if (qemu_strtoi64(s, NULL, 10, &neg) < 0) {
+            error_setg(errp, "value '%s' is not a number: write hex with 0x,"
+                       " decimal, or a negative decimal", s);
+            return false;
+        }
+        if (len < 8 && neg < -(int64_t)(mask >> 1) - 1) {
+            error_setg(errp, "value %s does not fit in %u byte%s", s, len,
+                       len == 1 ? "" : "s");
+            return false;
+        }
+        *val = (uint64_t)neg & mask;
+        return true;
+    }
+    if (!mcp_parse_address(s, "value", val, errp)) {
+        return false;
+    }
+    if (*val & ~mask) {
+        error_setg(errp, "value %s does not fit in %u byte%s", s, len,
+                   len == 1 ? "" : "s");
+        return false;
+    }
+    return true;
+}
+
+static McpRegisterWriteResult *mcp_pc_write(CPUState *cpu, const char *value,
+                                            const McpCpuSeen *was,
+                                            Error **errp)
+{
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GString) why = g_string_new(NULL);
+    McpRegisterWriteResult *res;
+    const char *hint = "";
+    uint64_t want, pc;
+    int mode;
+
+    if (!mcp_parse_reg_value(value, 8, &want, errp)) {
+        return NULL;
+    }
+    for (mode = 0; mode < PC_MODE_BITS; mode++) {
+        mcp_pc_set(cpu, want, mode);
+        if (mcp_pc_alone(cpu, was, want)) {
+            break;
+        }
+        if (mode) {
+            continue;
+        }
+        /* what the plain value changed, for the error */
+        pc = cpu->cc->get_pc(cpu);
+        if (pc != want) {
+            g_string_printf(why, "put it at 0x%" PRIx64 " instead", pc);
+            continue;
+        }
+        g_string_assign(why, "also change ");
+        if (!mcp_reg_append_changes(why, cpu, was, false, want - was->pc,
+                                    -1)) {
+            g_string_append(why, "its mode");
+        }
+        hint = ". Set the registers by name instead, or, in a branch delay"
+               " slot, debug-step once first";
+    }
+    if (mode == PC_MODE_BITS) {
+        if (!mcp_pc_restore(cpu, was)) {
+            error_setg(errp, "setting the pc of CPU %d to 0x%" PRIx64
+                       " would %s, and CPU %d could not be put back exactly"
+                       " as it was", cpu->cpu_index, want, why->str,
+                       cpu->cpu_index);
+            return NULL;
+        }
+        error_setg(errp, "CPU %d stays at 0x%" PRIx64 ": setting its pc to"
+                   " 0x%" PRIx64 " would %s%s", cpu->cpu_index, was->pc,
+                   want, why->str, hint);
+        return NULL;
+    }
+
+    res = g_new0(McpRegisterWriteResult, 1);
+    res->before = g_strdup_printf("0x%" PRIx64, was->pc);
+    res->after = g_strdup_printf("0x%" PRIx64, want);
+    g_string_printf(s, "set the pc of CPU %d to 0x%" PRIx64 " (it was 0x%"
+                    PRIx64 ")", cpu->cpu_index, want, was->pc);
+    if (want != was->pc) {
+        g_string_append(s, ", in ");
+        mcp_reg_append_changes(s, cpu, was, true, 0, -1);
+    }
+    res->summary = g_strdup(s->str);
+    return res;
+}
+
+static McpRegisterWriteResult *mcp_reg_write(CPUState *cpu, int reg,
+                                             const char *value,
+                                             const McpCpuSeen *was,
+                                             Error **errp)
+{
+    g_autoptr(GArray) names = gdb_get_register_list(cpu);
+    g_autoptr(GByteArray) old = g_byte_array_new();
+    g_autoptr(GByteArray) now = g_byte_array_new();
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GString) also = g_string_new(NULL);
+    g_autofree char *name = mcp_reg_name(names, reg);
+    bool be = cpu_internal_is_big_endian(cpu);
+    McpRegisterWriteResult *res;
+    uint64_t want, before, after, pc;
+    uint8_t buf[8];
+    unsigned int i;
+
+    gdb_read_register(cpu, old, reg);
+    if (!mcp_reg_decode(cpu, old, &before)) {
+        error_setg(errp, "%s has %u bytes; register-write sets registers of"
+                   " 1 to 8 bytes", name, old->len);
+        return NULL;
+    }
+    if (!mcp_parse_reg_value(value, old->len, &want, errp)) {
+        return NULL;
+    }
+    /* in the byte order mcp_reg_decode() reads */
+    for (i = 0; i < old->len; i++) {
+        buf[be ? old->len - 1 - i : i] = want >> (8 * i);
+    }
+    if (!gdb_write_register(cpu, buf, reg)) {
+        error_setg(errp, "CPU %d does not let GDB's stub write %s",
+                   cpu->cpu_index, name);
+        return NULL;
+    }
+    gdb_read_register(cpu, now, reg);
+    if (!mcp_reg_decode(cpu, now, &after)) {
+        after = want;
+    }
+
+    res = g_new0(McpRegisterWriteResult, 1);
+    res->before = g_strdup_printf("0x%" PRIx64, before);
+    res->after = g_strdup_printf("0x%" PRIx64, after);
+    g_string_printf(s, "set %s of CPU %d to 0x%" PRIx64 " (it was 0x%" PRIx64
+                    ")", name, cpu->cpu_index, want, before);
+    if (after != want) {
+        g_string_append_printf(s, ", but it reads back 0x%" PRIx64, after);
+    }
+    pc = cpu->cc->get_pc(cpu);
+    if (pc != was->pc) {
+        g_string_append_printf(s, "; the pc moved with it, to 0x%" PRIx64
+                               " (it was 0x%" PRIx64 ")", pc, was->pc);
+    }
+    if (mcp_reg_append_changes(also, cpu, was, true, 0, reg)) {
+        g_string_append_printf(s, "; it also changed %s", also->str);
+    }
+    res->summary = g_strdup(s->str);
+    return res;
+}
+
+McpRegisterWriteResult *qmp_register_write(const char *q_register,
+                                           const char *value, bool has_cpu,
+                                           int64_t cpu_index, Error **errp)
+{
+    McpRegisterWriteResult *res;
+    McpCpuSeen was;
+    CPUState *cpu;
+    int reg = -1;
+
+    if (!tcg_enabled()) {
+        error_setg(errp, "register-write needs TCG (-accel tcg)");
+        return NULL;
+    }
+    if (replay_mode != REPLAY_MODE_NONE) {
+        error_setg(errp, "registers are not written while QEMU records or"
+                   " replays");
+        return NULL;
+    }
+    if (mcp_debug.busy) {
+        error_setg(errp, "a debug tool is running the VM; wait until it"
+                   " ends");
+        return NULL;
+    }
+    if (runstate_is_running()) {
+        error_setg(errp, "the VM is running: stop it first with debug-run,"
+                   " debug-step or vm-power pause");
+        return NULL;
+    }
+    cpu = mcp_debug_cpu(has_cpu, cpu_index, errp);
+    if (!cpu) {
+        return NULL;
+    }
+    if (g_ascii_strcasecmp(q_register, "pc")) {
+        reg = mcp_reg_number(cpu, q_register);
+        if (reg < 0) {
+            g_autofree char *names = mcp_reg_names(cpu);
+
+            error_setg(errp, "'%s' is not a register; the registers are %s",
+                       q_register, names);
+            return NULL;
+        }
+    }
+    mcp_cpu_see(cpu, &was);
+    if (reg < 0) {
+        res = mcp_pc_write(cpu, value, &was, errp);
+    } else {
+        res = mcp_reg_write(cpu, reg, value, &was, errp);
+    }
+    mcp_cpu_seen_free(&was);
     return res;
 }
 

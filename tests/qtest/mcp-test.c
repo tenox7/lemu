@@ -2425,6 +2425,92 @@ static void test_debug_exception(void)
     unlink(bios);
 }
 
+/*
+ * register-write sets a register by GDB's name, or the pc.  In real
+ * mode the pc adds the code segment's base to EIP, so the pc moves EIP,
+ * and CS moves the pc.
+ */
+static void test_debug_register(void)
+{
+    g_autofree char *bios = debug_bios_fault();
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* at the div with bl = 0: make it 1, and the div does not fault */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf001a'}");
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 0);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "register-write", "{'register': 'ebx',"
+                   " 'value': '1'}");
+    g_assert_cmpstr(qdict_get_str(ret, "before"), ==, "0x0");
+    g_assert_cmpstr(qdict_get_str(ret, "after"), ==, "0x1");
+    g_assert_cmpstr(qdict_get_str(ret, "summary"), ==,
+                    "set ebx of CPU 0 to 0x1 (it was 0x0)");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-step", "{}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf001c");
+    qobject_unref(ret);
+
+    /* back to the div, with bl = 0 again: now it faults */
+    ret = debug_ok(qts, "register-write", "{'register': 'pc',"
+                   " 'value': '0xf001a'}");
+    g_assert_cmpstr(qdict_get_str(ret, "before"), ==, "0xf001c");
+    g_assert_cmpstr(qdict_get_str(ret, "after"), ==, "0xf001a");
+    g_assert_cmpstr(qdict_get_str(ret, "summary"), ==,
+                    "set the pc of CPU 0 to 0xf001a (it was 0xf001c), in eip"
+                    " (0x1c to 0x1a)");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "register-write", "{'register': 'EBX',"
+                   " 'value': '-256'}");
+    g_assert_cmpstr(qdict_get_str(ret, "after"), ==, "0xffffff00");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-step", "{}");
+    debug_summary_has(ret, "-> it took an interruption: the CPU went to"
+                      " 0xf001e");
+    qobject_unref(ret);
+
+    /* a pc it can't get to changes nothing */
+    debug_check_error(qts, "register-write", "{'register': 'pc',"
+                      " 'value': '0x100000000'}", "CPU 0 stays at 0xf001e:"
+                      " setting its pc to 0x100000000 would put it at 0x0"
+                      " instead");
+    ret = debug_ok(qts, "debug-step", "{}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf001f");
+    qobject_unref(ret);
+
+    /* the code segment takes the pc with it */
+    ret = debug_ok(qts, "register-write", "{'register': 'cs',"
+                   " 'value': '0xe000'}");
+    debug_summary_has(ret, "set cs of CPU 0 to 0xe000 (it was 0xf000); the"
+                      " pc moved with it, to 0xe001f (it was 0xf001f)");
+    qobject_unref(ret);
+    qobject_unref(debug_ok(qts, "register-write", "{'register': 'cs',"
+                           " 'value': '0xf000'}"));
+
+    debug_check_error(qts, "register-write", "{'register': 'nope',"
+                      " 'value': '0'}", "'nope' is not a register; the"
+                      " registers are pc, eax");
+    debug_check_error(qts, "register-write", "{'register': 'eax',"
+                      " 'value': '0x100000000'}",
+                      "value 0x100000000 does not fit in 4 bytes");
+    debug_check_error(qts, "register-write", "{'register': 'eax',"
+                      " 'value': '-2147483649'}", "does not fit in 4 bytes");
+    debug_check_error(qts, "register-write", "{'register': 'eax',"
+                      " 'value': 'zz'}", "is not a number");
+    debug_check_error(qts, "register-write", "{'register': 'st0',"
+                      " 'value': '0'}", "st0 has 10 bytes");
+    debug_check_error(qts, "register-write", "{'register': 'eax',"
+                      " 'value': '0', 'cpu': 3}", "there is no CPU 3");
+    qobject_unref(debug_ok(qts, "cont", "{}"));
+    debug_check_error(qts, "register-write", "{'register': 'eax',"
+                      " 'value': '0'}", "the VM is running");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 /* debug-trace logs the hits and lets the guest go on */
 static void test_debug_trace(void)
 {
@@ -3190,6 +3276,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/mask", test_debug_mask);
         qtest_add_func("/mcp/debug/several", test_debug_several);
         qtest_add_func("/mcp/debug/exception", test_debug_exception);
+        qtest_add_func("/mcp/debug/register", test_debug_register);
     }
     return g_test_run();
 }
