@@ -28,7 +28,9 @@
 #include "system/tcg.h"
 #include "ui/input.h"
 #ifdef CONFIG_TCG
+#include "exec/cpu-interrupt.h"
 #include "exec/tb-flush.h"
+#include "exec/watchpoint.h"
 #endif
 
 #define WRITE_MAX_BYTES         1024
@@ -491,62 +493,164 @@ static int mcp_debug_count_at(CPUState *only, uint64_t addr, CPUState **at)
     return n;
 }
 
+typedef struct McpWatchSeen {
+    CPUState *cpu;
+    uint64_t addr;
+    uint64_t pc;
+    bool write;
+} McpWatchSeen;
+
 typedef struct McpBreak {
     CPUState *only;
+    bool has_addr;
     uint64_t addr;
-    int hits;
+    int hits;                   /* CPUs there as the time ran out */
     CPUState *at;
+    bool has_watch;             /* the watched memory */
+    uint64_t waddr;
+    uint64_t wlen;
+    int wflags;                 /* BP_MEM_READ, BP_MEM_WRITE or both */
+    int whits;                  /* CPUs that touched it as the time ran out */
+    McpWatchSeen seen;
 } McpBreak;
 
 /*
  * Breakpoints are checked when a CPU looks for the next block of
  * translated code, and chained blocks don't look: flush them all, so
- * that every way to the address looks again.  The VM is stopped.
+ * that every way to the address looks again.  Watchpoints flush the
+ * TLB for their pages themselves.  The VM is stopped.
  */
 static void mcp_debug_insert(McpBreak *b)
 {
     CPUState *cpu;
 
     CPU_FOREACH(cpu) {
-        if (!b->only || cpu == b->only) {
+        if (b->only && cpu != b->only) {
+            continue;
+        }
+        if (b->has_addr) {
             cpu_breakpoint_insert(cpu, b->addr, BP_GDB, NULL);
         }
+        if (b->has_watch) {
+            cpu_watchpoint_insert(cpu, b->waddr, b->wlen,
+                                  BP_GDB | b->wflags, NULL);
+        }
     }
-    tb_flush__exclusive_or_serial();
+    if (b->has_addr) {
+        tb_flush__exclusive_or_serial();
+    }
 }
 
 /*
- * By address, not by reference: a GDB client that detaches removes
- * all BP_GDB breakpoints, ours too.
+ * Our watchpoint on @cpu, found again by what it watches: a GDB client
+ * that detaches removes all BP_GDB watchpoints, ours too
  */
+static CPUWatchpoint *mcp_watch_find(McpBreak *b, CPUState *cpu)
+{
+    CPUWatchpoint *wp;
+
+    QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
+        if (wp->vaddr == b->waddr && wp->len == b->wlen &&
+            (wp->flags & ~BP_WATCHPOINT_HIT) == (BP_GDB | b->wflags)) {
+            return wp;
+        }
+    }
+    return NULL;
+}
+
+/* A CPU's hit is dealt with: it must not stop the VM again */
+static void mcp_watch_clear_hit(CPUState *cpu, CPUWatchpoint *wp)
+{
+    wp->flags &= ~BP_WATCHPOINT_HIT;
+    cpu->watchpoint_hit = NULL;
+    /* raised as the access ended; a single step may have stopped first */
+    cpu_reset_interrupt(cpu, CPU_INTERRUPT_DEBUG);
+}
+
+/*
+ * How many CPUs touched the watched memory, with what the first of
+ * them did in *@seen.  Their hits are cleared, as gdbstub does.
+ */
+static int mcp_watch_hits(McpBreak *b, McpWatchSeen *seen)
+{
+    CPUState *cpu;
+    int n = 0;
+
+    if (!b->has_watch) {
+        return 0;
+    }
+    CPU_FOREACH(cpu) {
+        CPUWatchpoint *wp = cpu->watchpoint_hit;
+
+        if (!wp || wp != mcp_watch_find(b, cpu)) {
+            continue;
+        }
+        if (!n++) {
+            seen->cpu = cpu;
+            seen->addr = wp->hitaddr;
+            seen->pc = wp->hitpc;
+            seen->write = wp->flags & BP_WATCHPOINT_HIT_WRITE;
+        }
+        mcp_watch_clear_hit(cpu, wp);
+    }
+    return n;
+}
+
+/* Breakpoints by address, not by reference, for the same reason */
 static void mcp_debug_remove(McpBreak *b)
 {
     CPUState *cpu;
 
     CPU_FOREACH(cpu) {
-        if (!b->only || cpu == b->only) {
+        CPUWatchpoint *wp;
+
+        if (b->only && cpu != b->only) {
+            continue;
+        }
+        if (b->has_addr) {
             cpu_breakpoint_remove(cpu, b->addr, BP_GDB);
         }
+        wp = b->has_watch ? mcp_watch_find(b, cpu) : NULL;
+        if (wp) {
+            /* a hit that has not stopped the VM yet never will */
+            if (cpu->watchpoint_hit == wp) {
+                mcp_watch_clear_hit(cpu, wp);
+            }
+            cpu_watchpoint_remove_by_ref(cpu, wp);
+        }
     }
+}
+
+/* CPUs at the address, or that touched the watched memory */
+static void mcp_debug_late_hits(McpBreak *b)
+{
+    b->whits = mcp_watch_hits(b, &b->seen);
+    b->hits = b->has_addr ? mcp_debug_count_at(b->only, b->addr, &b->at) : 0;
 }
 
 /*
  * The time ran out with the VM running: take the breakpoints away with
  * the vCPUs paused.  A CPU may have got to the address just now; then
- * the VM stops there, as for any hit.
+ * the VM stops there, as for any hit.  A CPU that hit the watchpoint
+ * has done the access by now (its last instruction runs with
+ * interrupts off) and has asked to stop the VM: it stops.
  */
 static void mcp_debug_remove_running(void *opaque)
 {
     McpBreak *b = opaque;
 
     if (!runstate_is_running()) {
+        /* it may have stopped for a hit after the wait gave up */
+        if (runstate_check(RUN_STATE_DEBUG)) {
+            mcp_debug_late_hits(b);
+        }
         mcp_debug_remove(b);
         return;
     }
     pause_all_vcpus();
+    mcp_debug_late_hits(b);
     mcp_debug_remove(b);
-    b->hits = mcp_debug_count_at(b->only, b->addr, &b->at);
-    if (b->hits) {
+    if (b->hits || b->whits) {
         qemu_system_debug_request();
     } else {
         resume_all_vcpus();
@@ -755,7 +859,8 @@ static McpMem *mcp_parse_memory(CPUState *cpu, McpDebugMemoryList *list,
                    MEMORY_RANGES_MAX);
         return NULL;
     }
-    mem = g_new0(McpMem, MAX(n, 1));
+    /* one more, for the watched memory */
+    mem = g_new0(McpMem, n + 1);
     for (l = list, n = 0; l; l = l->next, n++) {
         McpDebugMemory *d = l->value;
 
@@ -772,6 +877,64 @@ static McpMem *mcp_parse_memory(CPUState *cpu, McpDebugMemoryList *list,
     }
     *count = n;
     return g_steal_pointer(&mem);
+}
+
+#define WATCH_LEN               4
+#define WATCH_LEN_MAX           4096
+#define WATCH_WORDS_SHOWN       16
+
+/*
+ * The memory to watch into @b, and into @shown the memory to show when
+ * the VM stops.  Registers are read now, from the CPU the tool shows.
+ */
+static bool mcp_parse_watch(McpWatch *w, McpBreak *b, McpMem *shown,
+                            Error **errp)
+{
+    static const int flags[] = {
+        [MCP_WATCH_ACCESS_WRITE] = BP_MEM_WRITE,
+        [MCP_WATCH_ACCESS_READ] = BP_MEM_READ,
+        [MCP_WATCH_ACCESS_ACCESS] = BP_MEM_ACCESS,
+    };
+    CPUState *cpu = b->only ? b->only : mcp_debug_cpu(false, 0, errp);
+    McpMem m = { 0 };
+    const char *bad = NULL;
+
+    if (!cpu) {
+        return false;
+    }
+    if (!mcp_parse_mem_address(cpu, w->address, &m, errp)) {
+        return false;
+    }
+    if (m.has_reg && runstate_is_running()) {
+        error_setg(errp, "watch address '%s' reads registers, so it needs"
+                   " the VM stopped (debug-step or vm-power pause first)",
+                   w->address);
+        return false;
+    }
+    if (!mcp_mem_address(cpu, &m, &b->waddr, &bad)) {
+        error_setg(errp, "watch address '%s': CPU %d has no integer"
+                   " register %s", w->address, cpu->cpu_index, bad);
+        return false;
+    }
+    b->wlen = w->has_length ? w->length : WATCH_LEN;
+    if (b->wlen < 1 || b->wlen > WATCH_LEN_MAX) {
+        error_setg(errp, "watch length must be 1 to %d", WATCH_LEN_MAX);
+        return false;
+    }
+    if (b->waddr + b->wlen - 1 < b->waddr) {
+        error_setg(errp, "watched memory runs past the end of the address"
+                   " space");
+        return false;
+    }
+    b->wflags = flags[w->has_access ? w->access : MCP_WATCH_ACCESS_WRITE];
+    b->has_watch = true;
+
+    shown->n_terms = 1;
+    shown->term[0].num = b->waddr;
+    shown->words = MIN(DIV_ROUND_UP(b->wlen + (b->waddr & 3), 4),
+                       WATCH_WORDS_SHOWN);
+    shown->term[0].num &= ~3ULL;
+    return true;
 }
 
 /*
@@ -1023,7 +1186,29 @@ typedef enum {
     RUN_CANCELLED,
 } McpRunResult;
 
+/* "reached 0x1000", "wrote to 0x2000", or both, for the summary */
+static void mcp_debug_what(GString *s, McpBreak *b)
+{
+    static const char *const verb[] = {
+        [BP_MEM_WRITE] = "wrote to",
+        [BP_MEM_READ] = "read",
+        [BP_MEM_ACCESS] = "touched",
+    };
+
+    if (b->has_addr) {
+        g_string_append_printf(s, "reached 0x%" PRIx64, b->addr);
+    }
+    if (b->has_addr && b->has_watch) {
+        g_string_append(s, " or ");
+    }
+    if (b->has_watch) {
+        g_string_append_printf(s, "%s 0x%" PRIx64, verb[b->wflags],
+                               b->waddr);
+    }
+}
+
 McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
+                                         McpWatch *watch,
                                          bool has_hits, int64_t hits,
                                          bool has_cpu, int64_t cpu_index,
                                          bool has_memory,
@@ -1036,18 +1221,25 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     g_autoptr(GString) s = g_string_new(NULL);
     g_autofree McpMem *mem = NULL;
     McpBreak b = { 0 };
+    McpWatchSeen seen = { 0 };
     RunState paused = RUN_STATE_PAUSED;
     McpRunResult result = RUN_TIMEOUT;
     McpStepResult step;
     McpDebugStop *res;
     CPUState *at = NULL, *cpu;
     int64_t end, n_hits = 0, n_retries = 0;
-    int n_mem = 0, k;
-    bool inserted = false, retry = false, interrupted;
+    int n_mem = 0, k, w;
+    bool inserted = false, retry = false, interrupted, by_watch = false;
+    const char *hit_word;
 
     if (!ctx) {
         qemu_input_ctx_init(&local, NULL);
         ctx = &local;
+    }
+    if (!address && !watch) {
+        error_setg(errp, "give an address to stop at, memory to watch, or"
+                   " both");
+        return NULL;
     }
     hits = has_hits ? hits : 1;
     if (hits < 1 || hits > RUN_HITS_MAX) {
@@ -1056,9 +1248,10 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     }
     timeout_ms = has_timeout_ms ? timeout_ms : RUN_DEFAULT_MS;
     timeout_ms = MIN(MAX(timeout_ms, 0), mcp_wait_max_ms());
-    if (!mcp_parse_address(address, "address", &b.addr, errp)) {
+    if (address && !mcp_parse_address(address, "address", &b.addr, errp)) {
         return NULL;
     }
+    b.has_addr = address;
     if (has_cpu) {
         b.only = mcp_debug_cpu(true, cpu_index, errp);
         if (!b.only) {
@@ -1069,15 +1262,19 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     if (!mem) {
         return NULL;
     }
+    if (watch && !mcp_parse_watch(watch, &b, &mem[n_mem], errp)) {
+        return NULL;
+    }
     if (!mcp_debug_begin(ctx, errp)) {
         return NULL;
     }
     end = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + timeout_ms;
+    hit_word = !b.has_watch ? "arrival" : b.has_addr ? "hit" : "access";
 
     /* a CPU there when the running VM stops has got there */
     if (runstate_is_running()) {
         mcp_debug_outside(mcp_debug_stop, &paused);
-        if (!runstate_is_running()) {
+        if (!runstate_is_running() && b.has_addr) {
             n_hits = mcp_debug_count_at(b.only, b.addr, &at);
             if (n_hits) {
                 n_retries += mcp_debug_retries(&b, at, &retry);
@@ -1095,15 +1292,27 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         }
         /* a CPU stopped at the address goes on to the next arrival */
         step = STEP_DONE;
+        w = 0;
         CPU_FOREACH(cpu) {
             CPUState *dummy;
 
-            if ((!b.only || cpu == b.only) &&
+            if (b.has_addr && (!b.only || cpu == b.only) &&
                 mcp_debug_count_at(cpu, b.addr, &dummy)) {
                 step = mcp_debug_step_one(ctx, cpu, &interrupted);
+                /* that instruction may touch the watched memory */
+                w += mcp_watch_hits(&b, &seen);
                 if (step != STEP_DONE && step != STEP_HALTED) {
                     break;
                 }
+            }
+        }
+        if (w) {
+            n_hits += w;
+            at = seen.cpu;
+            by_watch = true;
+            retry = false;
+            if (n_hits >= hits) {
+                break;
             }
         }
         if (step == STEP_STOPPED || step == STEP_NOT_STARTED) {
@@ -1123,27 +1332,43 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
             result = ctx->cancelled ? RUN_CANCELLED : RUN_TIMEOUT;
             mcp_debug_outside(mcp_debug_remove_running, &b);
             inserted = false;
-            if (b.hits) {
+            if (b.hits || b.whits) {
                 /* got there as the time ran out; its stop comes next */
-                n_hits += b.hits;
-                at = b.at;
-                retry = mcp_debug_retry(at, b.addr);
-                n_retries += retry;
+                n_hits += b.hits + b.whits;
+                by_watch = b.whits;
+                if (by_watch) {
+                    at = b.seen.cpu;
+                    seen = b.seen;
+                    retry = false;
+                } else {
+                    at = b.at;
+                    retry = mcp_debug_retry(at, b.addr);
+                    n_retries += retry;
+                }
                 result = n_hits >= hits ? RUN_REACHED : RUN_STOPPED;
                 mcp_debug_wait_stop(ctx, qemu_clock_get_ms(QEMU_CLOCK_REALTIME)
                                     + STEP_WAIT_MS, NULL);
             }
             break;
         }
-        k = runstate_check(RUN_STATE_DEBUG) ?
+        k = b.has_addr && runstate_check(RUN_STATE_DEBUG) ?
             mcp_debug_count_at(b.only, b.addr, &at) : 0;
-        if (!k) {
+        w = runstate_check(RUN_STATE_DEBUG) ? mcp_watch_hits(&b, &seen) : 0;
+        if (!k && !w) {
             at = NULL;
             result = RUN_STOPPED;
             break;
         }
-        n_retries += mcp_debug_retries(&b, at, &retry);
-        n_hits += k;
+        retry = false;
+        if (k) {
+            n_retries += mcp_debug_retries(&b, at, &retry);
+        }
+        by_watch = w;
+        if (by_watch) {
+            at = seen.cpu;
+            retry = false;
+        }
+        n_hits += k + w;
     }
     if (n_hits >= hits) {
         result = RUN_REACHED;
@@ -1174,12 +1399,32 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         res->has_retry = true;
         res->retry = true;
     }
+    if (at && by_watch) {
+        res->watch = g_new0(McpWatchHit, 1);
+        res->watch->address = g_strdup_printf("0x%" PRIx64, seen.addr);
+        res->watch->access = g_strdup(seen.write ? "write" : "read");
+        res->watch->pc = g_strdup_printf("0x%" PRIx64, seen.pc);
+    }
     switch (result) {
     case RUN_REACHED:
+        if (by_watch) {
+            g_autofree char *insn = mcp_debug_insn(at, seen.pc);
+
+            g_string_printf(s, "CPU %d %s 0x%" PRIx64, at->cpu_index,
+                            seen.write ? "wrote to" : "read", seen.addr);
+            if (hits > 1) {
+                g_string_append_printf(s, " (%s %" PRId64 ")", hit_word,
+                                       n_hits);
+            }
+            g_string_append_printf(s, "; the VM is stopped after the"
+                                   " instruction that did it:\n%s",
+                                   insn ? insn : "");
+            break;
+        }
         g_string_printf(s, "CPU %d reached 0x%" PRIx64, at->cpu_index,
                         b.addr);
         if (hits > 1) {
-            g_string_append_printf(s, " (arrival %" PRId64 ")", n_hits);
+            g_string_append_printf(s, " (%s %" PRId64 ")", hit_word, n_hits);
         }
         g_string_append(s, "; the VM is stopped");
         if (retry) {
@@ -1196,26 +1441,32 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         }
         break;
     case RUN_TIMEOUT:
-        g_string_printf(s, "no CPU reached 0x%" PRIx64 " in %.1f s", b.addr,
-                        timeout_ms / 1000.0);
+        g_string_assign(s, "no CPU ");
+        mcp_debug_what(s, &b);
+        g_string_append_printf(s, " in %.1f s", timeout_ms / 1000.0);
         if (hits > 1) {
-            g_string_append_printf(s, " (%" PRId64 " of %" PRId64
-                                   " arrivals)", n_hits, hits);
+            g_string_append_printf(s, " (%" PRId64 " of %" PRId64 " %ss)",
+                                   n_hits, hits, hit_word);
         }
         g_string_append(s, "; the VM keeps running");
         break;
     case RUN_STOPPED:
         if (at) {
-            g_string_printf(s, "CPU %d reached 0x%" PRIx64 " as the time ran "
-                            "out (arrival %" PRId64 " of %" PRId64 "); "
-                            "the VM is stopped", at->cpu_index, b.addr,
-                            n_hits, hits);
-        } else if (res->running) {
-            g_string_printf(s, "something else started the VM before a CPU "
-                            "reached 0x%" PRIx64, b.addr);
+            g_string_printf(s, "CPU %d %s 0x%" PRIx64 " as the time ran out"
+                            " (%s %" PRId64 " of %" PRId64 "); the VM is"
+                            " stopped", at->cpu_index,
+                            by_watch ? (seen.write ? "wrote to" : "read") :
+                            "reached", by_watch ? seen.addr : b.addr,
+                            hit_word, n_hits, hits);
         } else {
-            g_string_printf(s, "the VM stopped (%s) before a CPU reached 0x%"
-                            PRIx64, RunState_str(runstate_get()), b.addr);
+            if (res->running) {
+                g_string_assign(s, "something else started the VM");
+            } else {
+                g_string_printf(s, "the VM stopped (%s)",
+                                RunState_str(runstate_get()));
+            }
+            g_string_append(s, " before a CPU ");
+            mcp_debug_what(s, &b);
         }
         break;
     default:
@@ -1226,7 +1477,8 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         if (!at) {
             g_string_append_printf(s, "; CPU %d:", cpu->cpu_index);
         }
-        mcp_debug_show(s, cpu, mem, n_mem);
+        /* and the watched memory, after the memory asked for */
+        mcp_debug_show(s, cpu, mem, n_mem + b.has_watch);
     }
     res->summary = g_strdup(s->str);
     return res;

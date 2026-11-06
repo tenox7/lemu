@@ -127,6 +127,7 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
 
             /* This call also restores vCPU state */
             tb_check_watchpoint(cpu, ra);
+            wp->hitpc = cpu->cc->get_pc(cpu);
             if (wp->flags & BP_STOP_BEFORE_ACCESS) {
                 cpu->exception_index = EXCP_DEBUG;
                 cpu_loop_exit(cpu);

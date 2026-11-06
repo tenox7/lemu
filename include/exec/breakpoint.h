@@ -36,6 +36,7 @@ typedef struct CPUWatchpoint {
     vaddr vaddr;
     vaddr len;
     vaddr hitaddr;
+    vaddr hitpc;        /* the instruction that touched it */
     MemTxAttrs hitattrs;
     int flags; /* BP_* */
     QTAILQ_ENTRY(CPUWatchpoint) entry;

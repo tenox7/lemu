@@ -1463,30 +1463,89 @@
 #     first, such as a TLB miss or a page fault, and the CPU came back
 #     soon after.  Run debug-run again to go on.
 #
+# @watch: what the CPU did to the watched memory, when that stopped
+#     the VM (debug-run)
+#
 # Since: 11.2
 ##
 { 'struct': 'McpDebugStop',
   'base': 'McpResult',
   'data': { 'reached': 'bool', '*cpu': 'int', '*pc': 'str',
             '*hits': 'int', '*steps': 'int', 'running': 'bool',
-            '*retry': 'bool' },
+            '*retry': 'bool', '*watch': 'McpWatchHit' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpWatchAccess:
+#     What a CPU does to watched memory to stop the VM.
+#
+# @write: writes to it
+#
+# @read: reads it
+#
+# @access: reads or writes it
+#
+# Since: 11.2
+##
+{ 'enum': 'McpWatchAccess',
+  'data': [ 'write', 'read', 'access' ],
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpWatch:
+#     Memory to watch (a data watchpoint).
+#
+# @address: the first byte: a virtual address as the CPU sees it,
+#     written like a @McpDebugMemory address; registers in it need the
+#     VM stopped
+#
+# @length: how many bytes, up to 4096 (default: 4)
+#
+# @access: what stops the VM (default: write)
+#
+# Since: 11.2
+##
+{ 'struct': 'McpWatch',
+  'data': { 'address': 'str', '*length': 'int',
+            '*access': 'McpWatchAccess' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpWatchHit:
+#     What a CPU did to watched memory.
+#
+# @address: the first watched byte it touched, in hex
+#
+# @access: "read" or "write"
+#
+# @pc: the instruction that did it, in hex; the CPU has run it
+#
+# Since: 11.2
+##
+{ 'struct': 'McpWatchHit',
+  'data': { 'address': 'str', 'access': 'str', 'pc': 'str' },
   'if': 'CONFIG_TCG' }
 
 ##
 # @debug-run:
 #     Let the guest run until a CPU gets to an address (a breakpoint),
-#     then stop the VM and show the instruction there, the registers
-#     and any @memory.  Use it instead of a GDB script.  The VM stays
-#     stopped: look around with hmp, go on with debug-step or another
-#     debug-run, or resume it with vm-power.  A CPU that is stopped at
-#     @address when the call begins first steps past it, so the call
-#     stops at the next arrival.
+#     or touches watched memory, then stop the VM and show where it
+#     is, the registers and any @memory.  Use it instead of a GDB
+#     script.  The VM stays stopped: look around with hmp, go on with
+#     debug-step or another debug-run, or resume it with vm-power.  A
+#     CPU that is stopped at @address when the call begins first steps
+#     past it, so the call stops at the next arrival.
 #
 # @address: where to stop: hex with 0x, or decimal.  A virtual
 #     address as the CPU sees it (on x86 the linear address: CS base
-#     plus EIP)
+#     plus EIP).  Give it, @watch, or both.
 #
-# @hits: stop at this arrival, counting from 1 (default: 1)
+# @watch: stop after a CPU writes or reads this memory, with the
+#     instruction that did it.  Only CPUs are watched, not devices
+#     that write memory themselves (DMA).
+#
+# @hits: stop at this arrival or watched access, counting from 1
+#     (default: 1)
 #
 # @cpu: watch only this CPU (default: all)
 #
@@ -1502,8 +1561,9 @@
 # Since: 11.2
 ##
 { 'command': 'debug-run',
-  'data': { 'address': 'str', '*hits': 'int', '*cpu': 'int',
-            '*memory': [ 'McpDebugMemory' ], '*timeout-ms': 'int' },
+  'data': { '*address': 'str', '*watch': 'McpWatch', '*hits': 'int',
+            '*cpu': 'int', '*memory': [ 'McpDebugMemory' ],
+            '*timeout-ms': 'int' },
   'returns': 'McpDebugStop',
   'features': [ 'mcp' ],
   'coroutine': true,

@@ -63,7 +63,7 @@ only when exactly one VM is running and you started it.
 | `media` | List, insert or eject CDs and floppies; put host files on a new one, or copy the files off a floppy |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
-| `debug-run` | Run until a CPU gets to an address (a breakpoint), then show the instruction, the registers and memory |
+| `debug-run` | Run until a CPU gets to an address (a breakpoint) or touches watched memory, then show the instruction, the registers and memory |
 | `debug-step` | Run one CPU an instruction at a time, and show each one |
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
@@ -124,6 +124,7 @@ Use these:
 | Disassemble guest code | `hmp` `x /10i ADDR` |
 | Save memory to a file | `hmp` `pmemsave ADDR SIZE FILE` |
 | Stop when the guest gets to an address (a breakpoint) | `debug-run` |
+| Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |
@@ -188,6 +189,11 @@ Use these:
   GDB's; CPUs without names there (alpha, hppa, mips) take `rN`, which
   is the general register N on most CPUs. `string: true` shows the C
   string there.
+- **What writes this memory?** `debug-run` with `watch` (`address`,
+  `length`, and `write`, `read` or `access`) stops right after a CPU
+  touches it, and shows the instruction that did it. With an
+  `address` too, whichever comes first stops it. Only CPUs are
+  watched, not devices that write memory themselves (DMA).
 - **TLB misses and page faults:** when the CPU has no mapping for an
   address right now, the debug tools say so instead of showing the
   instruction or the memory there. Kernels are often mapped 1:1: ask

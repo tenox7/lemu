@@ -1819,6 +1819,155 @@ static void test_debug_registers(void)
 }
 
 /*
+ * A BIOS that writes a counter to 0x1000 and reads it back, in a loop.
+ * At f000:0000, after a far jump:
+ *
+ *  0000  xor ax,ax / mov ds,ax
+ *  0004  mov bx,1000
+ *  0007  inc ax                          loop
+ *  0008  mov [bx],ax                     WATCH_WRITER
+ *  000a  mov cx,[bx]                     WATCH_READER
+ *  000c  jmp 0007
+ */
+#define WATCH_WRITER    0xf0008
+#define WATCH_READER    0xf000a
+
+static char *debug_bios_watch(void)
+{
+    static const uint8_t code[] = {
+        0x31, 0xc0, 0x8e, 0xd8,
+        0xbb, 0x00, 0x10,
+        0x40,
+        0x89, 0x07,
+        0x8b, 0x0f,
+        0xeb, 0xf9,
+    };
+    static const uint8_t reset[] = { 0xea, 0x00, 0x00, 0x00, 0xf0 };
+    g_autofree uint8_t *rom = g_malloc(64 * KiB);
+    char *path = NULL;
+    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    memset(rom, 0xf4, 64 * KiB);
+    memcpy(rom, code, sizeof(code));
+    memcpy(rom + 0xfff0, reset, sizeof(reset));
+    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
+    close(fd);
+    return path;
+}
+
+static void debug_check_watch(QDict *ret, const char *access, uint64_t pc,
+                              uint64_t next)
+{
+    QDict *watch = qdict_get_qdict(ret, "watch");
+    g_autofree char *want_pc = g_strdup_printf("0x%" PRIx64, pc);
+    g_autofree char *want_next = g_strdup_printf("0x%" PRIx64, next);
+
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(watch);
+    g_assert_cmpstr(qdict_get_str(watch, "address"), ==, "0x1000");
+    g_assert_cmpstr(qdict_get_str(watch, "access"), ==, access);
+    g_assert_cmpstr(qdict_get_str(watch, "pc"), ==, want_pc);
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, want_next);
+}
+
+/* debug-run stops after a CPU writes or reads watched memory */
+static void test_debug_watch(void)
+{
+    g_autofree char *bios = debug_bios_watch();
+    QTestState *qts;
+    QDict *ret;
+    int i;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    ret = debug_ok(qts, "debug-run",
+                   "{'watch': {'address': '0x1000', 'length': 2}}");
+    debug_check_watch(ret, "write", WATCH_WRITER, WATCH_READER);
+    debug_summary_has(ret, "CPU 0 wrote to 0x1000; the VM is stopped after"
+                      " the instruction that did it:\n0x000f0008:");
+    debug_summary_has(ret, "Memory at 0x1000:\n00001000: 0x00000001\n");
+    qobject_unref(ret);
+
+    /* the next write, then the read after it */
+    ret = debug_ok(qts, "debug-run",
+                   "{'watch': {'address': '0x1000', 'length': 2}}");
+    debug_check_watch(ret, "write", WATCH_WRITER, WATCH_READER);
+    debug_summary_has(ret, "00001000: 0x00000002\n");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run",
+                   "{'watch': {'address': '0x1001', 'access': 'read'}}");
+    g_assert_cmpstr(qdict_get_str(qdict_get_qdict(ret, "watch"), "access"),
+                    ==, "read");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf000c");
+    debug_summary_has(ret, "CPU 0 read 0x1001;");
+    qobject_unref(ret);
+
+    /* the third write from here; a register needs the VM stopped */
+    ret = debug_ok(qts, "debug-run",
+                   "{'watch': {'address': 'ebx', 'length': 2}, 'hits': 3}");
+    debug_check_watch(ret, "write", WATCH_WRITER, WATCH_READER);
+    debug_summary_has(ret, "(access 3)");
+    debug_summary_has(ret, "00001000: 0x00000005\n");
+    qobject_unref(ret);
+
+    /*
+     * A breakpoint and a watch.  The CPU at the address steps past it,
+     * and that step reads the watched memory; next time it steps past
+     * the jmp, and the write comes first; then the breakpoint does.
+     */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf000a',"
+                   " 'watch': {'address': '0x1000', 'access': 'access'}}");
+    debug_check_watch(ret, "read", WATCH_READER, 0xf000c);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf000c',"
+                   " 'watch': {'address': '0x1000', 'access': 'access'}}");
+    debug_check_watch(ret, "write", WATCH_WRITER, WATCH_READER);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf0007',"
+                   " 'watch': {'address': '0x1000'}}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(!qdict_haskey(ret, "watch"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf0007");
+    qobject_unref(ret);
+
+    /*
+     * The time runs out while the guest keeps writing, maybe just as a
+     * CPU writes: either way, the reply says whether the VM runs
+     */
+    for (i = 0; i < 10; i++) {
+        bool running;
+
+        ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x1000'},"
+                       " 'hits': 1000000, 'timeout-ms': 20}");
+        running = qdict_get_bool(ret, "running");
+        qobject_unref(ret);
+        g_usleep(50 * 1000);
+        ret = debug_ok(qts, "query-status", "{}");
+        g_assert_cmpint(qdict_get_bool(ret, "running"), ==, running);
+        qobject_unref(ret);
+    }
+
+    /* nobody touches 0x2000: the guest goes on */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x2000'},"
+                   " 'timeout-ms': 200}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    debug_summary_has(ret, "no CPU wrote to 0x2000 in 0.2 s;");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-run", "{'watch': {'address': 'ebx'}}",
+                      "needs the VM stopped");
+    debug_check_error(qts, "debug-run", "{}", "or both");
+    debug_check_error(qts, "debug-run",
+                      "{'watch': {'address': '0x1000', 'length': 0}}",
+                      "watch length must be 1 to 4096");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
  * A debug-run step that does not get to its address stops the steps,
  * and a debug-step that does all its steps lets them go on
  */
@@ -2498,6 +2647,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/steps/debug", test_steps_debug);
         qtest_add_func("/mcp/debug/retry", test_debug_retry);
         qtest_add_func("/mcp/debug/registers", test_debug_registers);
+        qtest_add_func("/mcp/debug/watch", test_debug_watch);
     }
     return g_test_run();
 }
