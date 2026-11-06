@@ -1230,9 +1230,23 @@ static void gxt_invalidate_display(void *opaque)
     s->full_update = true;
 }
 
+/* Where gxt_draw_cursor() puts the cursor image */
+static bool gxt_cursor_state(void *opaque, QemuCursorState *cs)
+{
+    GxtState *s = opaque;
+
+    cs->visible = s->dac[DAC_CURSOR_ON] & 1;
+    cs->x = dac_word(s, DAC_CURSOR_X) - s->dac[DAC_HOT_X];
+    cs->y = dac_word(s, DAC_CURSOR_Y) - s->dac[DAC_HOT_Y];
+    cs->w = CURSOR_DIM;
+    cs->h = CURSOR_DIM;
+    return true;
+}
+
 static const GraphicHwOps gxt_gfx_ops = {
     .gfx_update = gxt_update_display,
     .invalidate = gxt_invalidate_display,
+    .cursor_state = gxt_cursor_state,
 };
 
 static void gxt_reset(DeviceState *dev)

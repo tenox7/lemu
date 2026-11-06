@@ -627,6 +627,19 @@ static void s3_cursor_invalidate(VGACommonState *v)
     }
 }
 
+/* Where s3_cursor_draw_line() puts the cursor image */
+static bool s3_cursor_state(VGACommonState *v, QemuCursorState *cs)
+{
+    S3TrioState *s = container_of(v, S3TrioState, vga);
+
+    cs->visible = s3_cursor_on(s);
+    cs->x = (int)v->hw_cursor_x - (v->cr[0x4e] & 0x3f);
+    cs->y = (int)v->hw_cursor_y - (v->cr[0x4f] & 0x3f);
+    cs->w = 64;
+    cs->h = 64;
+    return true;
+}
+
 static uint32_t s3_cursor_color(S3TrioState *s, const uint8_t *c)
 {
     const uint8_t *pal;
@@ -1455,6 +1468,7 @@ static void s3_trio_realize(PCIDevice *dev, Error **errp)
     s->vga.get_resolution = s3_trio_get_resolution;
     s->vga.cursor_invalidate = s3_cursor_invalidate;
     s->vga.cursor_draw_line = s3_cursor_draw_line;
+    s->vga.cursor_state = s3_cursor_state;
 
     isa_register_portio_list(NULL, &s->portio, 0, s3_trio_portio_list, s, "s3_trio");
 

@@ -246,6 +246,21 @@ static void ati_cursor_define(ATIVGAState *s)
     qemu_console_set_cursor(s->vga.con, s->cursor);
 }
 
+/* Where the cursor image is, read from the registers as the guest set them */
+static bool ati_cursor_state(VGACommonState *vga, QemuCursorState *cs)
+{
+    ATIVGAState *s = container_of(vga, ATIVGAState, vga);
+    uint32_t offs = s->regs.cur_hv_offs;
+
+    cs->visible = s->regs.crtc_gen_cntl & CRTC2_CUR_EN;
+    /* less the part hidden beyond the left and top edges */
+    cs->x = (int)(s->regs.cur_hv_pos >> 16) - ati_cursor_xoff(offs);
+    cs->y = (int)(s->regs.cur_hv_pos & 0xffff) - (int)(offs & 0x3f);
+    cs->w = 64;
+    cs->h = 64;
+    return true;
+}
+
 /* Alternatively support guest rendered hardware cursor */
 static void ati_cursor_invalidate(VGACommonState *vga)
 {
@@ -1328,6 +1343,7 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     vga_init(vga, OBJECT(s), pci_address_space(dev),
              pci_address_space_io(dev), true);
     vga->con = qemu_graphic_console_create(DEVICE(s), 0, s->vga.hw_ops, vga);
+    vga->cursor_state = ati_cursor_state;
     if (s->cursor_guest_mode) {
         vga->cursor_invalidate = ati_cursor_invalidate;
         vga->cursor_draw_line = ati_cursor_draw_line;

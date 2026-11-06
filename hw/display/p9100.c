@@ -559,9 +559,27 @@ static void p9100_invalidate_display(void *opaque)
     memory_region_set_dirty(&s->vram, 0, s->vram_size);
 }
 
+/* Where p9100_cursor_overlay() puts the cursor image */
+static bool p9100_cursor_state(void *opaque, QemuCursorState *cs)
+{
+    P9100State *s = opaque;
+    const uint8_t *idx = s->dac_indexed;
+    uint8_t ctl = idx[RGB525_IDX_CURSOR_CTL];
+
+    cs->visible = ctl & 0x3;
+    cs->x = ((idx[RGB525_IDX_CURSOR_XH] << 8) | idx[RGB525_IDX_CURSOR_XL]) -
+            idx[RGB525_IDX_CURSOR_HOTX];
+    cs->y = ((idx[RGB525_IDX_CURSOR_YH] << 8) | idx[RGB525_IDX_CURSOR_YL]) -
+            idx[RGB525_IDX_CURSOR_HOTY];
+    cs->w = RGB525_CURSOR_DIM(ctl);
+    cs->h = cs->w;
+    return true;
+}
+
 static const GraphicHwOps p9100_gfx_ops = {
     .gfx_update = p9100_update_display,
     .invalidate = p9100_invalidate_display,
+    .cursor_state = p9100_cursor_state,
 };
 
 static unsigned p9100_dac_index(P9100State *s)

@@ -739,14 +739,29 @@ static const MemoryRegionOps tcx_dummy_ops = {
     },
 };
 
+/* Where tcx_draw_cursor32() puts the cursor image */
+static bool tcx_cursor_state(void *opaque, QemuCursorState *cs)
+{
+    TCXState *s = opaque;
+
+    cs->visible = s->cursx < s->width && s->cursy < s->height;
+    cs->x = s->cursx;
+    cs->y = s->cursy;
+    cs->w = 32;
+    cs->h = 32;
+    return true;
+}
+
 static const GraphicHwOps tcx_ops = {
     .invalidate = tcx_invalidate_display,
     .gfx_update = tcx_update_display,
+    .cursor_state = tcx_cursor_state,
 };
 
 static const GraphicHwOps tcx24_ops = {
     .invalidate = tcx24_invalidate_display,
     .gfx_update = tcx24_update_display,
+    .cursor_state = tcx_cursor_state,
 };
 
 static void tcx_realize(DeviceState *dev, Error **errp)

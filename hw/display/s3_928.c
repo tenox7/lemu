@@ -117,6 +117,35 @@ static int s3_cursor_top(S3928State *s)
         ((s->vga.cr[0x48] & 7) << 8) | s->vga.cr[0x49];
 }
 
+/* Where s3_cursor_draw_line() puts the cursor image */
+static bool s3_cursor_state(VGACommonState *vga, QemuCursorState *cs)
+{
+    S3928State *s = container_of(vga, S3928State, vga);
+    int size = s3_cursor_size(s);
+    int bpp, x, step;
+
+    cs->visible = s3_cursor_enabled(s);
+    if (s3_cursor_external(s)) {
+        cs->x = (int)s->cursor_x - size;
+        cs->y = (int)s->cursor_y - size;
+        cs->w = size;
+        cs->h = size;
+        return true;
+    }
+    /* as s3_vram_cursor_line() */
+    bpp = vga->get_bpp(vga);
+    x = ((vga->cr[0x46] & 7) << 8) | vga->cr[0x47];
+    step = (bpp == 15 || bpp == 16) && !(vga->cr[0x45] & 4) ? 2 : 1;
+    if (bpp == 15 || bpp == 16 || bpp == 32) {
+        x >>= 1;
+    }
+    cs->x = x - (vga->cr[0x4e] & 63) / step;
+    cs->y = s3_cursor_top(s) - (vga->cr[0x4f] & 63);
+    cs->w = 64 / step;
+    cs->h = 64;
+    return true;
+}
+
 static void s3_cursor_invalidate(VGACommonState *vga)
 {
     S3928State *s = container_of(vga, S3928State, vga);
@@ -1279,6 +1308,7 @@ static void s3_realize(DeviceState *dev, Error **errp)
     vga->get_resolution = s3_resolution;
     vga->cursor_invalidate = s3_cursor_invalidate;
     vga->cursor_draw_line = s3_cursor_draw_line;
+    vga->cursor_state = s3_cursor_state;
     /* Cursor composition must never write into a shared guest VRAM surface. */
     vga->force_shadow = true;
     memory_region_init_io(&s->ports, OBJECT(dev), &s3_vga_ops, s,

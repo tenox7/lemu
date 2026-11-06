@@ -235,9 +235,35 @@ void qemu_console_hw_text_update(QemuConsole *con, uint32_t *chardata)
 
 bool qemu_console_hw_cursor_state(QemuConsole *con, QemuCursorState *cs)
 {
+    QemuGraphicConsole *gc;
+
     memset(cs, 0, sizeof(*cs));
-    return con && con->hw_ops && con->hw_ops->cursor_state &&
-           con->hw_ops->cursor_state(con->hw, cs);
+    if (!con) {
+        return false;
+    }
+    if (con->hw_ops && con->hw_ops->cursor_state &&
+        con->hw_ops->cursor_state(con->hw, cs)) {
+        return true;
+    }
+    /*
+     * A card that hands its cursor to the display instead of drawing it
+     * (qemu_console_set_cursor, qemu_console_set_mouse) gives the
+     * hotspot's position.
+     */
+    memset(cs, 0, sizeof(*cs));
+    if (!QEMU_IS_GRAPHIC_CONSOLE(con)) {
+        return false;
+    }
+    gc = QEMU_GRAPHIC_CONSOLE(con);
+    if (!gc->cursor) {
+        return false;
+    }
+    cs->visible = gc->cursor_on;
+    cs->x = gc->cursor_x - gc->cursor->hot_x;
+    cs->y = gc->cursor_y - gc->cursor->hot_y;
+    cs->w = gc->cursor->width;
+    cs->h = gc->cursor->height;
+    return true;
 }
 
 static void displaychangelistener_gfx_switch(DisplayChangeListener *dcl,

@@ -1424,9 +1424,22 @@ static void artist_invalidate(void *opaque)
     memory_region_set_dirty(&buf->mr, 0, buf->size);
 }
 
+/* Where artist_draw_cursor() puts the cursor image */
+static bool artist_cursor_state(void *opaque, QemuCursorState *cs)
+{
+    ARTISTState *s = opaque;
+
+    cs->visible = cursor_visible(s);
+    artist_get_cursor_pos(s, &cs->x, &cs->y);
+    cs->w = s->cursor_width;
+    cs->h = s->cursor_height;
+    return true;
+}
+
 static const GraphicHwOps artist_ops = {
     .invalidate  = artist_invalidate,
     .gfx_update = artist_update_display,
+    .cursor_state = artist_cursor_state,
 };
 
 static void artist_initfn(Object *obj)

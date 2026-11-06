@@ -1464,6 +1464,19 @@ static uint32_t s3_hwc_base(S3TrioState *s)
     return ((((cr[0x4c] & 0x0f) << 8) | cr[0x4d]) * KiB) & s3_vram_mask(s);
 }
 
+/* Where s3_cursor_draw_line() puts the cursor image */
+static bool s3_cursor_state(VGACommonState *vga, QemuCursorState *cs)
+{
+    uint8_t *cr = vga->cr;
+
+    cs->visible = s3_hwc_on(vga);
+    cs->x = (((cr[0x46] & 7) << 8) | cr[0x47]) - (cr[0x4e] & 0x3f);
+    cs->y = (((cr[0x48] & 7) << 8) | cr[0x49]) - (cr[0x4f] & 0x3f);
+    cs->w = 64;
+    cs->h = 64;
+    return true;
+}
+
 static void s3_cursor_invalidate(VGACommonState *vga)
 {
     S3TrioState *s = container_of(vga, S3TrioState, vga);
@@ -1593,6 +1606,7 @@ static void s3_realize(PCIDevice *d, Error **errp)
     vga->get_resolution = s3_get_resolution;
     vga->cursor_invalidate = s3_cursor_invalidate;
     vga->cursor_draw_line = s3_cursor_draw_line;
+    vga->cursor_state = s3_cursor_state;
     vga->big_endian_fb = false;
     vga->con = qemu_graphic_console_create(DEVICE(d), 0, vga->hw_ops, vga);
 
