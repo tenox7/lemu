@@ -333,6 +333,22 @@ static void test_screen_blink(void)
     screen_free(&s);
 }
 
+/*
+ * Quit while a command waits for its input to go out.  Ending the wait
+ * lets the command finish at once; nothing may touch what it left on
+ * its stack after that (QEMU used to abort here).
+ */
+static void test_input_quit(gconstpointer cmd)
+{
+    QTestState *qts = qtest_init("-machine pc,vmport=off -display none"
+                                 " -vga std");
+
+    qtest_qmp_send_raw(qts, "%s", (const char *)cmd);
+    /* the clock does not move, so the input stays queued */
+    g_usleep(300 * 1000);
+    qtest_quit(qts);
+}
+
 /* Serial */
 
 #define COM1            0x3f8
@@ -946,6 +962,14 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/keys", test_keys);
     qtest_add_func("/mcp/screen/change", test_screen_change);
     qtest_add_func("/mcp/screen/blink", test_screen_blink);
+    qtest_add_data_func("/mcp/input/quit-key",
+                        "{\"execute\": \"key\", \"arguments\":"
+                        " {\"keys\": [\"a\", \"b\", \"c\"]}}",
+                        test_input_quit);
+    qtest_add_data_func("/mcp/input/quit-mouse",
+                        "{\"execute\": \"mouse-move\", \"arguments\":"
+                        " {\"x\": 100, \"y\": 100}}",
+                        test_input_quit);
     qtest_add_func("/mcp/vm-stats", test_vm_stats);
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);

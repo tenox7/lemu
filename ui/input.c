@@ -820,13 +820,27 @@ void qemu_input_ctx_end(QemuInputCtx *ctx)
 
 void qemu_input_cancel_all(void)
 {
-    QemuInputPending *p, *next;
-    QemuInputCtx *ctx;
+    QemuInputPending *p;
 
-    QLIST_FOREACH(ctx, &input_ctxs, node) {
-        qemu_input_ctx_cancel(ctx);
+    /*
+     * A woken caller may run at once and end its context, so look again
+     * from the top after each one
+     */
+    for (;;) {
+        QemuInputCtx *ctx, *todo = NULL;
+
+        QLIST_FOREACH(ctx, &input_ctxs, node) {
+            if (!ctx->cancelled) {
+                todo = ctx;
+                break;
+            }
+        }
+        if (!todo) {
+            break;
+        }
+        qemu_input_ctx_cancel(todo);
     }
-    QTAILQ_FOREACH_SAFE(p, &input_pending, node, next) {
+    while ((p = QTAILQ_FIRST(&input_pending))) {
         qemu_input_batch_cancel(p->id);
     }
 }
@@ -835,7 +849,12 @@ void qemu_input_ctx_cancel(QemuInputCtx *ctx)
 {
     ctx->cancelled = true;
     if (ctx->batch) {
+        /*
+         * Ending the batch wakes the caller.  It may run at once and end
+         * @ctx, which lives on its stack, so don't touch @ctx after this.
+         */
         qemu_input_batch_cancel(ctx->batch);
+        return;
     }
     qemu_co_sleep_wake(&ctx->sleep);
 }
