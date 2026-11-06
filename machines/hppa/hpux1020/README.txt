@@ -3,6 +3,7 @@ HP-UX 10.20 on QEMU's HP B160L (four PA-7300LC CPUs, 512 MB, Artist graphics, SC
 Run ./run.sh (macOS 26+ arm64, Linux x86_64/aarch64 with glibc 2.34+ and X11/XWayland) or run.cmd (Windows 10+ x64).
 Log in as root, password root, at the HP VUE login in the QEMU window (1280x1024, about 90 s after the start), telnet localhost 10223 or rsh localhost port 10514.
 Installed: the December 1999 Workstation ACE; HP C (ANSI C), C++, FORTRAN 77, Fortran 90 and Pascal; SoftBench; GlancePlus; Netscape Navigator 4.05 and Enterprise Server; Lotus Notes R4; Wabi 2.2; Advanced Server/9000; TN3270. gcc 4.2.2 is in /usr/local/pa11_32/bin, GNU tools (bash, gmake, gtar, gzip, binutils) and more in /usr/local/bin, perl in /usr/contrib/bin.
+Apps: the small arrow above the Apps icon on the front panel (next to Wabi) opens launchers for Lotus Notes, Netscape, NEdit, TenoxVNC, SNG, SoftBench, SAM, TN3270, Image Viewer, Screen Capture and Whiteboard. In an hpterm, notes also starts Lotus Notes. Only one Notes can run at a time; if it is frozen, Apps > Lotus Notes offers to restart it.
 Click in the QEMU window to grab the mouse; Ctrl-Alt-G (Ctrl-Option-G on a Mac) lets it go.
 Extra QEMU options are passed through, e.g. ./run.sh -display vnc=127.0.0.1:1. With -display none the X server does not start.
 The terminal holds the QEMU monitor. quit there stops QEMU at once.
