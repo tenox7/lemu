@@ -1609,10 +1609,6 @@ static void test_debug_run(void)
 }
 
 /*
- * memory-write changes RAM and ROM but no device, and code made from
- * the old bytes goes away; debug-profile finds the loop
- */
-/*
  * A BIOS whose loop takes a fault that comes back to the instruction,
  * as a TLB miss does.  At f000:0000, after a far jump from the reset
  * vector, so that the IRET comes back to the same address:
@@ -1725,6 +1721,104 @@ static void test_debug_retry(void)
 }
 
 /*
+ * A BIOS that puts the address of a string in ESI and 0x7c00 in ESP,
+ * then loops at REGS_LOOP.  At f000:0000, after a far jump:
+ *
+ *  0000  mov esi,000f0040
+ *  0006  mov esp,00007c00
+ *  000c  jmp 000c
+ *  0040  the string
+ */
+#define REGS_LOOP       0xf000c
+
+static char *debug_bios_regs(void)
+{
+    static const uint8_t code[] = {
+        0x66, 0xbe, 0x40, 0x00, 0x0f, 0x00,
+        0x66, 0xbc, 0x00, 0x7c, 0x00, 0x00,
+        0xeb, 0xfe,
+    };
+    static const char str[] = "Hi, \"MCP\"\n\x01";
+    static const uint8_t reset[] = { 0xea, 0x00, 0x00, 0x00, 0xf0 };
+    g_autofree uint8_t *rom = g_malloc(64 * KiB);
+    char *path = NULL;
+    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    memset(rom, 0xf4, 64 * KiB);
+    memcpy(rom, code, sizeof(code));
+    memcpy(rom + 0x40, str, sizeof(str));
+    memcpy(rom + 0xfff0, reset, sizeof(reset));
+    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
+    close(fd);
+    return path;
+}
+
+static void debug_summary_has(QDict *ret, const char *want)
+{
+    const char *summary = qdict_get_str(ret, "summary");
+
+    if (!strstr(summary, want)) {
+        g_test_message("'%s' lacks '%s'", summary, want);
+        g_assert_not_reached();
+    }
+}
+
+/* Memory at a register plus or minus an offset, and C strings */
+static void test_debug_registers(void)
+{
+    g_autofree char *bios = debug_bios_regs();
+    g_autofree char *args = NULL;
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    args = g_strdup_printf("{'address': '0x%x', 'memory': ["
+                           " {'address': 'esi', 'string': true},"
+                           " {'address': '$ESI+4', 'string': true},"
+                           " {'address': 'pc+0x100', 'string': true},"
+                           " {'address': 'esp-4', 'words': 1},"
+                           " {'address': 'pc', 'words': 1}]}", REGS_LOOP);
+    ret = debug_ok(qts, "debug-run", args);
+    g_assert(qdict_get_bool(ret, "reached"));
+    debug_summary_has(ret, "String at esi = 0xf0040: "
+                      "\"Hi, \\\"MCP\\\"\\n\\x01\"\n");
+    debug_summary_has(ret, "String at $ESI+4 = 0xf0044: "
+                      "\"\\\"MCP\\\"\\n\\x01\"\n");
+    debug_summary_has(ret, "String at pc+0x100 = 0xf010c: \"\\xf4\\xf4");
+    debug_summary_has(ret, "(no zero byte in the first 256 bytes)");
+    debug_summary_has(ret, "Memory at esp-4 = 0x7bfc:\n");
+    debug_summary_has(ret, "Memory at pc = 0xf000c:\n000f000c: 0xf4f4feeb");
+    qobject_unref(ret);
+
+    /* a base and a register, as for a segment or a space */
+    ret = debug_ok(qts, "debug-step", "{'memory': [{'address':"
+                   " '0x10 + esi - 0x50', 'words': 1},"
+                   " {'address': '0x1000', 'words': 1}]}");
+    debug_summary_has(ret, "Memory at 0x10 + esi - 0x50 = 0xf0000:\n"
+                      "000f0000: 0x0040be66");
+    debug_summary_has(ret, "Memory at 0x1000:\n");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-step", "{'memory': [{'address': 'foo'}]}",
+                      "'foo' is not a number or a register; the registers"
+                      " are pc, eax, ecx");
+    debug_check_error(qts, "debug-step",
+                      "{'memory': [{'address': 'esp+0xzz'}]}",
+                      "'0xzz' is not a number");
+    debug_check_error(qts, "debug-step",
+                      "{'memory': [{'address': 'esp+'}]}",
+                      "'' is not a number or a register");
+    debug_check_error(qts, "debug-step",
+                      "{'memory': [{'address': '1+2+3+4+5'}]}",
+                      "more than 4 parts");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
  * A debug-run step that does not get to its address stops the steps,
  * and a debug-step that does all its steps lets them go on
  */
@@ -1767,6 +1861,10 @@ static void test_steps_debug(void)
     unlink(bios);
 }
 
+/*
+ * memory-write changes RAM and ROM but no device, and code made from
+ * the old bytes goes away; debug-profile finds the loop
+ */
 static void test_debug_memory(void)
 {
     g_autofree char *bios = debug_bios();
@@ -2399,6 +2497,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
         qtest_add_func("/mcp/steps/debug", test_steps_debug);
         qtest_add_func("/mcp/debug/retry", test_debug_retry);
+        qtest_add_func("/mcp/debug/registers", test_debug_registers);
     }
     return g_test_run();
 }

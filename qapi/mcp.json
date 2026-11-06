@@ -1415,17 +1415,28 @@
 # @McpDebugMemory:
 #     Guest memory that a debug tool shows when the CPU stops.
 #
-# @address: the first address: hex with 0x, or decimal
+# @address: the first address: hex with 0x, or decimal.  It may add
+#     and take away registers of the CPU that stopped, with their
+#     values then: sp, sp+16, r30-0x20, or 0x657500000000+r26 when a
+#     register holds only the offset in a space or a segment.  The
+#     names are GDB's (an unknown one gets the list); pc is where the
+#     CPU is.  CPUs whose registers have no names there (alpha, hppa,
+#     mips) take rN, GDB's register N, which on most CPUs is the
+#     general register N.
 #
 # @words: how many 32-bit words, up to 256 (default: 8)
 #
 # @physical: a physical address; otherwise a virtual one, through the
 #     MMU of the CPU that stopped (default: false)
 #
+# @string: show a C string there instead, up to its zero byte or 256
+#     bytes; @words does not count then (default: false)
+#
 # Since: 11.2
 ##
 { 'struct': 'McpDebugMemory',
-  'data': { 'address': 'str', '*words': 'int', '*physical': 'bool' },
+  'data': { 'address': 'str', '*words': 'int', '*physical': 'bool',
+            '*string': 'bool' },
   'if': 'CONFIG_TCG' }
 
 ##

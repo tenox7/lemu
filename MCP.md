@@ -181,6 +181,13 @@ Use these:
   Addresses are virtual, as the CPU sees them (on x86: the CS base plus
   EIP). These tools need TCG, the default for the old CPUs, and no GDB
   stub.
+- **Memory at a register:** a `memory` address can add and take away
+  registers, read when the CPU stops: `sp+16`, `r26`, or
+  `0x657500000000+r26` when the register holds only the offset in a
+  space or segment (take the base from the register dump). Names are
+  GDB's; CPUs without names there (alpha, hppa, mips) take `rN`, which
+  is the general register N on most CPUs. `string: true` shows the C
+  string there.
 - **TLB misses and page faults:** when the CPU has no mapping for an
   address right now, the debug tools say so instead of showing the
   instruction or the memory there. Kernels are often mapped 1:1: ask

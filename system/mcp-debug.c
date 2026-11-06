@@ -7,12 +7,15 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/gdbstub.h"
 #include "exec/replay-core.h"
+#include "exec/target_page.h"
 #include "hw/core/cpu.h"
 #include "monitor/mcp.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-mcp.h"
 #include "qemu/coroutine.h"
+#include "qemu/ctype.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
 #include "qemu/rcu.h"
@@ -550,14 +553,195 @@ static void mcp_debug_remove_running(void *opaque)
     }
 }
 
+/*
+ * The GDB register number of @name on @cpu: a name from its GDB target
+ * description, or rN for register N when the description has no names
+ * for its core registers (alpha, hppa, mips).  -1 when it has none.
+ */
+static int mcp_reg_number(CPUState *cpu, const char *name)
+{
+    g_autoptr(GArray) regs = gdb_get_register_list(cpu);
+    const char *end;
+    unsigned int i, n;
+
+    for (i = 0; i < regs->len; i++) {
+        GDBRegDesc *r = &g_array_index(regs, GDBRegDesc, i);
+
+        if (r->name && !g_ascii_strcasecmp(r->name, name)) {
+            return r->gdb_reg;
+        }
+    }
+    if (!cpu->cc->gdb_core_xml_file && (name[0] == 'r' || name[0] == 'R') &&
+        qemu_isdigit(name[1]) && !qemu_strtoui(name + 1, &end, 10, &n) &&
+        !*end && n < cpu->cc->gdb_num_core_regs) {
+        return n;
+    }
+    return -1;
+}
+
+/*
+ * The value of register @name of @cpu, when it is an integer: pc is
+ * where the debug tools say the CPU is, the others are GDB's
+ */
+static bool mcp_reg_value(CPUState *cpu, const char *name, uint64_t *val)
+{
+    g_autoptr(GByteArray) buf = NULL;
+    int reg, len, i;
+    bool be;
+
+    if (!g_ascii_strcasecmp(name, "pc")) {
+        *val = cpu->cc->get_pc(cpu);
+        return true;
+    }
+    reg = mcp_reg_number(cpu, name);
+    if (reg < 0) {
+        return false;
+    }
+    buf = g_byte_array_new();
+    len = gdb_read_register(cpu, buf, reg);
+    if (len != 1 && len != 2 && len != 4 && len != 8) {
+        return false;
+    }
+    /* in the byte order the CPU runs in now, as GDB wants it */
+    be = cpu_internal_is_big_endian(cpu);
+    *val = 0;
+    for (i = 0; i < len; i++) {
+        *val = *val << 8 | buf->data[be ? i : len - 1 - i];
+    }
+    return true;
+}
+
+/* The registers an address may name, for an error */
+static char *mcp_reg_names(CPUState *cpu)
+{
+    g_autoptr(GArray) regs = gdb_get_register_list(cpu);
+    GString *s = g_string_new("pc");
+    unsigned int i;
+
+    for (i = 0; i < regs->len && i < 64; i++) {
+        GDBRegDesc *r = &g_array_index(regs, GDBRegDesc, i);
+
+        if (r->name && g_ascii_strcasecmp(r->name, "pc")) {
+            g_string_append_printf(s, ", %s", r->name);
+        }
+    }
+    if (i < regs->len) {
+        g_string_append(s, " and more");
+    }
+    if (!cpu->cc->gdb_core_xml_file) {
+        g_string_append_printf(s, "%s r0 to r%d (GDB's numbers: on most CPUs"
+                               " rN is the general register N)",
+                               regs->len ? " and" : ",",
+                               cpu->cc->gdb_num_core_regs - 1);
+    }
+    return g_string_free(s, false);
+}
+
+#define REG_NAME_MAX    32
+#define ADDR_TERMS_MAX  4
+#define STRING_MAX      256
+
+typedef struct McpAddrTerm {
+    char reg[REG_NAME_MAX];     /* a register, or "" for @num */
+    uint64_t num;
+    bool minus;
+} McpAddrTerm;
+
 typedef struct McpMem {
-    uint64_t addr;
+    const char *text;           /* as asked */
+    McpAddrTerm term[ADDR_TERMS_MAX];
+    int n_terms;
+    bool has_reg;
     int words;
     bool physical;
+    bool string;
 } McpMem;
 
-static McpMem *mcp_parse_memory(McpDebugMemoryList *list, int *count,
-                                Error **errp)
+/*
+ * A memory address: numbers and registers of the CPU that stops, added
+ * and taken away, such as 0x1000, sp, sp+16 or 0x657500000000+r26 (a
+ * space or segment base and an offset).  @cpu is one like that CPU.
+ */
+static bool mcp_parse_mem_address(CPUState *cpu, const char *s, McpMem *m,
+                                  Error **errp)
+{
+    const char *p = s;
+    bool minus = false;
+
+    m->text = s;
+    for (;;) {
+        McpAddrTerm *t = &m->term[m->n_terms];
+        size_t len;
+        g_autofree char *word = NULL;
+        const char *name;
+
+        if (m->n_terms++ == ADDR_TERMS_MAX) {
+            error_setg(errp, "memory address '%s' has more than %d parts",
+                       s, ADDR_TERMS_MAX);
+            return false;
+        }
+        while (qemu_isspace(*p)) {
+            p++;
+        }
+        len = strcspn(p, "+- ");
+        word = g_strndup(p, len);
+        p += len;
+        t->minus = minus;
+        name = word[0] == '$' ? word + 1 : word;
+        if (qemu_isdigit(word[0])) {
+            if (!mcp_parse_address(word, "memory address", &t->num, errp)) {
+                return false;
+            }
+        } else if (!cpu) {
+            error_setg(errp, "memory address '%s': this VM has no CPU", s);
+            return false;
+        } else if (!*name || strlen(name) >= REG_NAME_MAX ||
+                   (mcp_reg_number(cpu, name) < 0 &&
+                    g_ascii_strcasecmp(name, "pc"))) {
+            g_autofree char *names = mcp_reg_names(cpu);
+
+            error_setg(errp, "memory address '%s': '%s' is not a number or"
+                       " a register; the registers are %s", s, word, names);
+            return false;
+        } else {
+            pstrcpy(t->reg, sizeof(t->reg), name);
+            m->has_reg = true;
+        }
+        while (qemu_isspace(*p)) {
+            p++;
+        }
+        if (!*p) {
+            return true;
+        }
+        minus = *p++ == '-';
+    }
+}
+
+/*
+ * The address @m names, with the registers of @cpu now.  *@bad is a
+ * register that has no integer value.
+ */
+static bool mcp_mem_address(CPUState *cpu, McpMem *m, uint64_t *addr,
+                            const char **bad)
+{
+    int i;
+
+    *addr = 0;
+    for (i = 0; i < m->n_terms; i++) {
+        McpAddrTerm *t = &m->term[i];
+        uint64_t v = t->num;
+
+        if (t->reg[0] && !mcp_reg_value(cpu, t->reg, &v)) {
+            *bad = t->reg;
+            return false;
+        }
+        *addr += t->minus ? -v : v;
+    }
+    return true;
+}
+
+static McpMem *mcp_parse_memory(CPUState *cpu, McpDebugMemoryList *list,
+                                int *count, Error **errp)
 {
     g_autofree McpMem *mem = NULL;
     McpDebugMemoryList *l;
@@ -575,8 +759,7 @@ static McpMem *mcp_parse_memory(McpDebugMemoryList *list, int *count,
     for (l = list, n = 0; l; l = l->next, n++) {
         McpDebugMemory *d = l->value;
 
-        if (!mcp_parse_address(d->address, "memory address", &mem[n].addr,
-                               errp)) {
+        if (!mcp_parse_mem_address(cpu, d->address, &mem[n], errp)) {
             return NULL;
         }
         mem[n].words = d->has_words ? d->words : MEMORY_WORDS;
@@ -585,9 +768,77 @@ static McpMem *mcp_parse_memory(McpDebugMemoryList *list, int *count,
             return NULL;
         }
         mem[n].physical = d->has_physical && d->physical;
+        mem[n].string = d->has_string && d->string;
     }
     *count = n;
     return g_steal_pointer(&mem);
+}
+
+/*
+ * The C string at @addr, quoted, up to STRING_MAX bytes; NULL when not
+ * a byte of it can be read
+ */
+static char *mcp_read_string(CPUState *cpu, uint64_t addr, bool physical)
+{
+    uint64_t page = qemu_target_page_size();
+    uint8_t buf[STRING_MAX];
+    GString *s;
+    int len = 0, i;
+    bool ended = false;
+
+    /* a page at a time: the next one may not be mapped */
+    while (len < STRING_MAX && !ended) {
+        uint64_t a = addr + len;
+        int chunk = MIN(STRING_MAX - len, page - (a & (page - 1)));
+        bool ok;
+
+        if (physical) {
+            ok = address_space_read(cpu->as, a, MEMTXATTRS_UNSPECIFIED,
+                                    buf + len, chunk) == MEMTX_OK;
+        } else {
+            ok = cpu_memory_rw_debug(cpu, a, buf + len, chunk, false) == 0;
+        }
+        if (!ok) {
+            break;
+        }
+        ended = memchr(buf + len, 0, chunk);
+        len += chunk;
+    }
+    if (!len) {
+        return NULL;
+    }
+    s = g_string_new("\"");
+    for (i = 0; i < len && buf[i]; i++) {
+        switch (buf[i]) {
+        case '\n':
+            g_string_append(s, "\\n");
+            break;
+        case '\r':
+            g_string_append(s, "\\r");
+            break;
+        case '\t':
+            g_string_append(s, "\\t");
+            break;
+        case '"':
+        case '\\':
+            g_string_append_printf(s, "\\%c", buf[i]);
+            break;
+        default:
+            if (buf[i] >= 0x20 && buf[i] < 0x7f) {
+                g_string_append_c(s, buf[i]);
+            } else {
+                g_string_append_printf(s, "\\x%02x", buf[i]);
+            }
+        }
+    }
+    g_string_append_c(s, '"');
+    if (!ended && len < STRING_MAX) {
+        g_string_append(s, " (no zero byte; the rest can't be read)");
+    } else if (!ended) {
+        g_string_append_printf(s, " (no zero byte in the first %d bytes)",
+                               STRING_MAX);
+    }
+    return g_string_free(s, false);
 }
 
 static bool mcp_debug_mapped(CPUState *cpu, uint64_t addr)
@@ -625,21 +876,43 @@ static void mcp_debug_show(GString *s, CPUState *cpu, McpMem *mem, int n)
     g_string_append_printf(s, "Next instruction:\n%s\nRegisters:\n%s\n",
                            insn, g_strchomp(regs));
     for (i = 0; i < n; i++) {
+        const char *what = mem[i].string ? "String" : "Memory";
+        const char *bad = NULL;
         g_autofree char *dump = NULL;
+        g_autofree char *where = NULL;
+        uint64_t addr;
 
-        if (!mem[i].physical && !mcp_debug_mapped(cpu, mem[i].addr)) {
-            g_string_append_printf(s, "\nMemory at 0x%" PRIx64 ": not mapped"
-                                   " for CPU %d now. If it is at the same"
-                                   " physical address (kernels often are),"
-                                   " ask for it with physical: true.\n",
-                                   mem[i].addr, cpu->cpu_index);
+        if (!mcp_mem_address(cpu, &mem[i], &addr, &bad)) {
+            g_string_append_printf(s, "\n%s at %s: CPU %d has no integer"
+                                   " register %s\n", what, mem[i].text,
+                                   cpu->cpu_index, bad);
             continue;
         }
-        dump = mcp_cpu_memory(cpu, mem[i].addr, mem[i].words,
-                              mem[i].physical);
-        g_string_append_printf(s, "\nMemory at %s0x%" PRIx64 ":\n%s",
-                               mem[i].physical ? "physical " : "",
-                               mem[i].addr, dump ? dump : "");
+        where = g_strdup_printf("%s%s%s0x%" PRIx64,
+                                mem[i].has_reg ? mem[i].text : "",
+                                mem[i].has_reg ? " = " : "",
+                                mem[i].physical ? "physical " : "", addr);
+        if (!mem[i].physical && !mcp_debug_mapped(cpu, addr)) {
+            g_string_append_printf(s, "\n%s at %s: not mapped for CPU %d now"
+                                   " (step on until the guest uses it).%s"
+                                   " If it is at the same physical address"
+                                   " (kernels often are), ask for it with"
+                                   " physical: true.\n", what, where,
+                                   cpu->cpu_index, mem[i].has_reg ?
+                                   " If a register holds only the offset in"
+                                   " a space or segment, add its base." : "");
+            continue;
+        }
+        if (mem[i].string) {
+            dump = mcp_read_string(cpu, addr, mem[i].physical);
+            g_string_append_printf(s, "\nString at %s: %s\n", where,
+                                   dump ? dump : "(it can't be read: no RAM"
+                                   " or ROM there)");
+            continue;
+        }
+        dump = mcp_cpu_memory(cpu, addr, mem[i].words, mem[i].physical);
+        g_string_append_printf(s, "\nMemory at %s:\n%s", where,
+                               dump ? dump : "");
     }
 }
 
@@ -786,15 +1059,15 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     if (!mcp_parse_address(address, "address", &b.addr, errp)) {
         return NULL;
     }
-    mem = mcp_parse_memory(memory, &n_mem, errp);
-    if (!mem) {
-        return NULL;
-    }
     if (has_cpu) {
         b.only = mcp_debug_cpu(true, cpu_index, errp);
         if (!b.only) {
             return NULL;
         }
+    }
+    mem = mcp_parse_memory(b.only ? b.only : first_cpu, memory, &n_mem, errp);
+    if (!mem) {
+        return NULL;
     }
     if (!mcp_debug_begin(ctx, errp)) {
         return NULL;
@@ -988,12 +1261,12 @@ McpDebugStop *coroutine_fn qmp_debug_step(bool has_count, int64_t count,
         error_setg(errp, "count must be 1 to %d", STEP_MAX);
         return NULL;
     }
-    mem = mcp_parse_memory(memory, &n_mem, errp);
-    if (!mem) {
+    cpu = mcp_debug_cpu(has_cpu, cpu_index, errp);
+    if (!cpu) {
         return NULL;
     }
-    cpu = mcp_debug_cpu(has_cpu, cpu_index, errp);
-    if (!cpu || !mcp_debug_begin(ctx, errp)) {
+    mem = mcp_parse_memory(cpu, memory, &n_mem, errp);
+    if (!mem || !mcp_debug_begin(ctx, errp)) {
         return NULL;
     }
     if (runstate_is_running()) {
