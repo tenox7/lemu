@@ -805,13 +805,19 @@
 #
 # @list: list removable drives and what is in them
 #
-# @insert: insert @file (closes the tray)
+# @insert: insert @file, or a new medium made from @files (closes the
+#     tray)
 #
 # @eject: eject the medium (opens the tray)
 #
+# @copy-out: copy the files on the floppy in @device into the host
+#     folder @to; let the guest finish writing first (unmount it, or
+#     wait for the drive light)
+#
 # Since: 11.2
 ##
-{ 'enum': 'McpMediaAction', 'data': [ 'list', 'insert', 'eject' ] }
+{ 'enum': 'McpMediaAction',
+  'data': [ 'list', 'insert', 'eject', 'copy-out' ] }
 
 ##
 # @McpMediaResult:
@@ -827,13 +833,24 @@
 
 ##
 # @media:
-#     List, insert or eject CD-ROM and floppy media.
+#     List, insert or eject CD-ROM and floppy media.  Also moves files
+#     in and out of a guest with no network: insert a medium made from
+#     host files, or copy the files off a floppy the guest wrote.
 #
 # @action: what to do
 #
-# @device: the drive, as listed (needed for insert and eject)
+# @device: the drive, as listed (needed for all but list)
 #
 # @file: the image file to insert
+#
+# @files: host files and folders to insert instead of @file, on a new
+#     medium: a CD-ROM drive gets a disc (ISO 9660: 8.3 names, and the
+#     real names in guests that read Rock Ridge), other drives a 1.44
+#     MB floppy (FAT12, 8.3 names).  An empty list gives a blank
+#     floppy for the guest to write to.  The medium is deleted when
+#     the drive gets another one or is emptied, so copy-out first
+#
+# @to: the host folder that copy-out writes to (made if needed)
 #
 # @format: image format, e.g. "raw" (default: probed)
 #
@@ -849,7 +866,8 @@
 ##
 { 'command': 'media',
   'data': { 'action': 'McpMediaAction', '*device': 'str', '*file': 'str',
-            '*format': 'str', '*read-only': 'bool', '*force': 'bool' },
+            '*files': [ 'str' ], '*to': 'str', '*format': 'str',
+            '*read-only': 'bool', '*force': 'bool' },
   'returns': 'McpMediaResult',
   'features': [ 'mcp' ] }
 

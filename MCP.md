@@ -59,7 +59,7 @@ only when exactly one VM is running and you started it.
 | `pointer-locate` | Find where the guest's mouse pointer really is |
 | `serial-read`, `serial-write`, `serial-expect` | Read, write and wait for serial port text |
 | `serial-run` | Run a command in a shell on a serial port: get its output and exit status in one call |
-| `media` | List, insert or eject CDs and floppies |
+| `media` | List, insert or eject CDs and floppies; put host files on a new one, or copy the files off a floppy |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
 | `debug-run` | Run until a CPU gets to an address (a breakpoint), then show the instruction, the registers and memory |
@@ -90,6 +90,9 @@ The server sends these rules to every agent that connects:
   console is a graphics screen, start a getty on a serial port first.
   Old Unix tools lack GNU options such as `grep -A` and `sed -i`: use
   `awk`.
+- **Files without a network:** `media` `insert` with `files` puts host
+  files on a new CD or floppy. To get files out, insert a blank floppy
+  (`files: []`), let the guest write to it, then `media` `copy-out`.
 - **Check the focus before typing.** Keys go to the focused window.
 - **Old dialogs:** use Tab and Shift+Tab to reach a control, then
   Space. Radio buttons and check boxes need Space. Enter presses the
@@ -131,6 +134,8 @@ Use these:
 | Crop or zoom a screenshot | `screenshot` with `region` and `scale` |
 | Find a screen that went by | `frames` |
 | Change a CD or floppy | `media` |
+| Put host files into a guest | `media` `insert` with `files` |
+| Get files out of a guest | `media` `insert` with `files: []`, the guest writes to the floppy, then `media` `copy-out` |
 
 - **Every serial port works.** The serial tools see what the guest
   writes to every serial port, whatever it is connected to: a socket, a
@@ -153,9 +158,17 @@ Use these:
   a running VM, with no restart. Don't use `debug-run` or `debug-step`
   while a GDB client is attached.
 
-Not covered yet: copying files. For guests that run `rshd`, an rsh MCP
-server such as [rsh-mcp](https://github.com/tenox7/rsh-mcp) runs
-commands and copies files.
+- **Copying files** needs nothing in the guest. `media` `insert` with
+  `files` makes a disc for a CD-ROM drive, or a 1.44 MB floppy for
+  other drives, from host files and folders. Every guest reads the 8.3
+  names; Unix guests that read Rock Ridge see the real names on a disc.
+  Mount it as the guest's CD or DOS file system (`hsfs`, `cdrfs`,
+  `cdfs`, `iso9660`, `pcfs`, `msdos`). `copy-out` reads FAT12 and FAT16,
+  with the long names Windows writes. A medium lemu made is deleted when
+  its drive gets another one, so copy out first.
+- **Guests with `rshd`:** an rsh MCP server such as
+  [rsh-mcp](https://github.com/tenox7/rsh-mcp) runs commands and copies
+  files over the network, which is faster.
 
 ## Safety
 

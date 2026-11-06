@@ -21,8 +21,11 @@
 #include "qapi/qapi-commands-mcp.h"
 #include "qapi/qapi-commands-misc.h"
 #include "qemu/coroutine.h"
+#include "qemu/cutils.h"
 #include "qemu/timer.h"
 #include "qom/object.h"
+#include "system/block-backend.h"
+#include "system/mcp-image.h"
 #include "system/mcp-serial.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -338,10 +341,188 @@ static bool mcp_find_drive(const char *device, BlockInfo **out,
     return false;
 }
 
+/*
+ * Media lemu made from host files.  Each is deleted when its drive gets
+ * another medium or is emptied, and at exit.
+ */
+typedef struct McpMadeImage {
+    char *drive;
+    char *path;
+} McpMadeImage;
+
+static GPtrArray *mcp_made_images;
+static Notifier mcp_made_exit;
+
+static void mcp_made_free(gpointer opaque)
+{
+    McpMadeImage *m = opaque;
+
+    unlink(m->path);
+    g_free(m->drive);
+    g_free(m->path);
+    g_free(m);
+}
+
+static void mcp_made_exit_notify(Notifier *n, void *data)
+{
+    g_ptr_array_set_size(mcp_made_images, 0);
+}
+
+/* @drive no longer holds the media lemu made for it */
+static void mcp_made_drop(const char *drive)
+{
+    guint i;
+
+    for (i = mcp_made_images ? mcp_made_images->len : 0; i-- > 0;) {
+        McpMadeImage *m = g_ptr_array_index(mcp_made_images, i);
+
+        if (!strcmp(m->drive, drive)) {
+            g_ptr_array_remove_index(mcp_made_images, i);
+        }
+    }
+}
+
+static void mcp_made_add(const char *drive, const char *path)
+{
+    McpMadeImage *m = g_new0(McpMadeImage, 1);
+
+    if (!mcp_made_images) {
+        mcp_made_images = g_ptr_array_new_with_free_func(mcp_made_free);
+        mcp_made_exit.notify = mcp_made_exit_notify;
+        qemu_add_exit_notifier(&mcp_made_exit);
+    }
+    m->drive = g_strdup(drive);
+    m->path = g_strdup(path);
+    g_ptr_array_add(mcp_made_images, m);
+}
+
+/*
+ * Make a medium from @files for drive @bi: its file, or NULL.  @what
+ * says what it is, @notes what the guest sees.
+ */
+static char *mcp_media_make(BlockInfo *bi, strList *files, GString *what,
+                            GString *notes, Error **errp)
+{
+    bool disc = mcp_is_cdrom(bi);
+    g_autoptr(GError) gerr = NULL;
+    g_autofree char *size = NULL;
+    McpImageInfo info;
+    char *path = NULL;
+    int fd;
+    bool ok;
+
+    fd = g_file_open_tmp(disc ? "lemu-XXXXXX.iso" : "lemu-XXXXXX.img", &path,
+                         &gerr);
+    if (fd < 0) {
+        error_setg(errp, "cannot make an image file: %s", gerr->message);
+        return NULL;
+    }
+    mcp_image_info_init(&info);
+    ok = mcp_image_make(fd, disc, files, &info, errp);
+    qemu_close(fd);
+    if (!ok) {
+        unlink(path);
+        g_free(path);
+        mcp_image_info_free(&info);
+        return NULL;
+    }
+    size = size_to_str(info.bytes);
+    if (!files) {
+        g_string_printf(what, "a blank floppy (FAT12, 1.44 MB)");
+    } else {
+        g_string_printf(what, "a %s lemu made from %d file%s",
+                        disc ? "disc" : "floppy", info.files,
+                        info.files == 1 ? "" : "s");
+        if (info.folders) {
+            g_string_append_printf(what, " and %d folder%s", info.folders,
+                                   info.folders == 1 ? "" : "s");
+        }
+        g_string_append_printf(what, " (%s)", size);
+    }
+    if (info.renamed->len) {
+        g_string_append_printf(notes, "; %s 8.3 names: %s",
+                               disc ? "guests that do not read Rock Ridge see"
+                                    : "the guest sees", info.renamed->str);
+    }
+    if (info.skipped->len) {
+        g_string_append_printf(notes, "; left out: %s", info.skipped->str);
+    }
+    mcp_image_info_free(&info);
+    return path;
+}
+
+static bool mcp_blk_read(void *opaque, uint64_t offset, void *buf,
+                         size_t len, Error **errp)
+{
+    int ret = blk_pread(opaque, offset, len, buf, 0);
+
+    if (ret < 0) {
+        error_setg_errno(errp, -ret, "cannot read the medium");
+        return false;
+    }
+    return true;
+}
+
+/* Copy the files on the floppy in drive @bi into the host folder @to */
+static bool mcp_media_copy_out(BlockInfo *bi, const char *device,
+                               const char *to, GString *s, Error **errp)
+{
+    BlockBackend *blk;
+    McpImageInfo info;
+    int64_t len;
+    bool ok;
+
+    if (!to) {
+        error_setg(errp, "'to' is needed: the host folder to copy to");
+        return false;
+    }
+    if (mcp_is_cdrom(bi)) {
+        error_setg(errp, "copy-out reads a floppy the guest wrote; %s is a "
+                   "CD-ROM drive", device);
+        return false;
+    }
+    for (blk = blk_all_next(NULL); blk; blk = blk_all_next(blk)) {
+        g_autofree char *qdev = blk_get_attached_dev_id(blk);
+
+        if (*bi->device ? !strcmp(blk_name(blk), bi->device)
+                        : bi->qdev && !strcmp(qdev, bi->qdev)) {
+            break;
+        }
+    }
+    if (!blk || !blk_is_inserted(blk)) {
+        error_setg(errp, "there is no medium in %s", device);
+        return false;
+    }
+    len = blk_getlength(blk);
+    if (len < 0) {
+        error_setg_errno(errp, -len, "cannot read the medium in %s", device);
+        return false;
+    }
+    mcp_image_info_init(&info);
+    ok = mcp_image_copy_out(mcp_blk_read, blk, len, to, &info, errp);
+    if (ok) {
+        g_autofree char *size = size_to_str(info.bytes);
+
+        g_string_printf(s, "copied %d file%s", info.files,
+                        info.files == 1 ? "" : "s");
+        if (info.folders) {
+            g_string_append_printf(s, " and %d folder%s", info.folders,
+                                   info.folders == 1 ? "" : "s");
+        }
+        g_string_append_printf(s, " (%s) from %s into %s", size, device, to);
+        if (info.skipped->len) {
+            g_string_append_printf(s, "; left out: %s", info.skipped->str);
+        }
+    }
+    mcp_image_info_free(&info);
+    return ok;
+}
+
 McpMediaResult *qmp_media(McpMediaAction action, const char *device,
-                          const char *file, const char *format,
-                          bool has_read_only, bool read_only,
-                          bool has_force, bool force, Error **errp)
+                          const char *file, bool has_files, strList *files,
+                          const char *to, const char *format,
+                          bool has_read_only, bool read_only, bool has_force,
+                          bool force, Error **errp)
 {
     ERRP_GUARD();
     g_autoptr(BlockInfoList) blocks = NULL;
@@ -351,7 +532,7 @@ McpMediaResult *qmp_media(McpMediaAction action, const char *device,
     int n;
 
     if (action != MCP_MEDIA_ACTION_LIST) {
-        const char *dev, *id;
+        const char *dev, *id, *drive;
 
         if (!device) {
             error_setg(errp, "'device' is needed; use action \"list\" "
@@ -365,34 +546,72 @@ McpMediaResult *qmp_media(McpMediaAction action, const char *device,
         /* a -device drive has no backend name; use its qdev id */
         dev = *bi->device ? bi->device : NULL;
         id = dev ? NULL : bi->qdev;
+        drive = dev ? dev : id;
 
         if (action == MCP_MEDIA_ACTION_INSERT) {
-            bool ro = has_read_only ? read_only : mcp_is_cdrom(bi);
+            bool disc = mcp_is_cdrom(bi);
+            bool ro = has_read_only ? read_only : disc;
             BlockdevChangeReadOnlyMode mode =
                 ro ? BLOCKDEV_CHANGE_READ_ONLY_MODE_READ_ONLY
                    : BLOCKDEV_CHANGE_READ_ONLY_MODE_READ_WRITE;
+            g_autoptr(GString) what = g_string_new(NULL);
+            g_autoptr(GString) notes = g_string_new(NULL);
+            g_autofree char *made = NULL;
 
-            if (!file) {
-                error_setg(errp, "'file' is needed to insert a medium");
+            if (file && has_files) {
+                error_setg(errp, "give 'file' or 'files', not both");
                 return NULL;
             }
-            if (!g_file_test(file, G_FILE_TEST_EXISTS)) {
-                error_setg(errp, "file '%s' does not exist", file);
+            if (file) {
+                if (!g_file_test(file, G_FILE_TEST_EXISTS)) {
+                    error_setg(errp, "file '%s' does not exist", file);
+                    return NULL;
+                }
+            } else if (!has_files) {
+                error_setg(errp, "'file' or 'files' is needed to insert a "
+                           "medium");
                 return NULL;
+            } else if (!files && disc) {
+                error_setg(errp, "'files' is empty; a disc needs something "
+                           "on it");
+                return NULL;
+            } else {
+                made = mcp_media_make(bi, files, what, notes, errp);
+                if (!made) {
+                    return NULL;
+                }
+                format = "raw";
             }
-            qmp_blockdev_change_medium(dev, id, file, format, has_force,
-                                       force, true, mode, errp);
+            qmp_blockdev_change_medium(dev, id, made ? made : file, format,
+                                       has_force, force, true, mode, errp);
             if (*errp) {
+                if (made) {
+                    unlink(made);
+                }
                 return NULL;
             }
-            g_string_printf(s, "inserted %s into %s%s", file, device,
-                            ro ? " (read-only)" : "");
-        } else {
+            mcp_made_drop(drive);
+            if (made) {
+                mcp_made_add(drive, made);
+                g_string_printf(s, "inserted %s into %s%s%s", what->str,
+                                device, ro ? " (read-only)" : "", notes->str);
+                if (!disc && !ro) {
+                    g_string_append(s, "; once the guest has written to it, "
+                                    "copy-out reads the files back");
+                }
+            } else {
+                g_string_printf(s, "inserted %s into %s%s", file, device,
+                                ro ? " (read-only)" : "");
+            }
+        } else if (action == MCP_MEDIA_ACTION_EJECT) {
             qmp_eject(dev, id, has_force, force, errp);
             if (*errp) {
                 return NULL;
             }
+            mcp_made_drop(drive);
             g_string_printf(s, "ejected %s", device);
+        } else if (!mcp_media_copy_out(bi, device, to, s, errp)) {
+            return NULL;
         }
     }
 

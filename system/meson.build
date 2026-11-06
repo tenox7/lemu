@@ -15,6 +15,7 @@ system_ss.add(files(
   'ioport.c',
   'mcp-cmds.c',
   'mcp-debug.c',
+  'mcp-image.c',
   'mcp-serial.c',
   'ram-block-attributes.c',
   'ram-discard-manager.c',

@@ -19,6 +19,10 @@
  * The debug tests run a BIOS of two instructions under TCG, step it,
  * stop it at an address and patch it while it runs.
  *
+ * The media tests make a disc and a floppy from host files, read the
+ * disc the way guests do, with and without Rock Ridge, and copy the
+ * floppy's files out again, also a long name the "guest" wrote.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -31,6 +35,7 @@
 #include "qapi/error.h"
 #include "qobject/qdict.h"
 #include "qobject/qjson.h"
+#include "qobject/qlist.h"
 #include "qemu/bswap.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
@@ -1157,6 +1162,480 @@ static void test_debug_memory(void)
     unlink(bios);
 }
 
+#define MEDIA_ARGS  "-machine pc -display none -nodefaults" \
+                    " -drive if=ide,index=2,media=cdrom" \
+                    " -drive if=floppy,index=0"
+#define ISO_SECTOR  2048
+
+static const char *const media_names[] = {
+    "readme.txt", "Long File Name.data", "run.sh", "docs", NULL
+};
+
+static void media_put(const char *dir, const char *name, const void *data,
+                      size_t len)
+{
+    g_autofree char *path = g_build_filename(dir, name, NULL);
+
+    g_assert(g_file_set_contents(path, data, len, NULL));
+}
+
+static uint8_t media_byte(int i)
+{
+    return i * 7 + 3;
+}
+
+/* A host folder with media_names in it */
+static char *media_tree(void)
+{
+    char *dir = g_dir_make_tmp("mcp-media-XXXXXX", NULL);
+    g_autofree char *docs = g_build_filename(dir, "docs", NULL);
+    g_autofree char *deep = g_build_filename(docs, "deep", NULL);
+    g_autofree char *run = g_build_filename(dir, "run.sh", NULL);
+    uint8_t big[5000];
+    int i;
+
+    g_assert(dir);
+    for (i = 0; i < sizeof(big); i++) {
+        big[i] = media_byte(i);
+    }
+    g_assert(g_mkdir_with_parents(deep, 0755) == 0);
+    media_put(dir, "readme.txt", "hello\n", 6);
+    media_put(dir, "Long File Name.data", big, sizeof(big));
+    media_put(dir, "run.sh", "#!/bin/sh\n", 10);
+    g_assert(chmod(run, 0755) == 0);
+    media_put(docs, "a.txt", "a\n", 2);
+    media_put(docs, "empty", "", 0);
+    media_put(deep, "x.c", "int x;\n", 7);
+    return dir;
+}
+
+static void media_rmtree(const char *path)
+{
+    GDir *d = g_dir_open(path, 0, NULL);
+    const char *e;
+
+    if (!d) {
+        g_assert(unlink(path) == 0);
+        return;
+    }
+    while ((e = g_dir_read_name(d))) {
+        g_autofree char *p = g_build_filename(path, e, NULL);
+
+        media_rmtree(p);
+    }
+    g_dir_close(d);
+    g_assert(rmdir(path) == 0);
+}
+
+/* @name is in @dir as it is, even on a host that ignores case */
+static void media_check(const char *dir, const char *name, const void *want,
+                        size_t len)
+{
+    g_autofree char *path = g_build_filename(dir, name, NULL);
+    g_autofree char *base = g_path_get_basename(path);
+    g_autofree char *up = g_path_get_dirname(path);
+    g_autofree char *data = NULL;
+    GDir *d = g_dir_open(up, 0, NULL);
+    const char *e;
+    bool found = false;
+    gsize n;
+
+    g_assert(d);
+    while ((e = g_dir_read_name(d))) {
+        found |= !strcmp(e, base);
+    }
+    g_dir_close(d);
+    if (!found || !g_file_get_contents(path, &data, &n, NULL)) {
+        g_test_message("copy-out did not make %s", path);
+        g_assert_not_reached();
+    }
+    g_assert_cmpint(n, ==, len);
+    g_assert(!memcmp(data, want, len));
+}
+
+/* Run "media" with @args; its return, or NULL and the error in @error */
+static QDict *media(QTestState *qts, QDict *args, char **error)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute': 'media', 'arguments': %p}",
+                           args);
+    QDict *ret = qdict_get_qdict(rsp, "return");
+    QDict *err = qdict_get_qdict(rsp, "error");
+
+    if (error) {
+        *error = err ? g_strdup(qdict_get_str(err, "desc")) : NULL;
+    } else if (err) {
+        g_test_message("media: %s", qdict_get_str(err, "desc"));
+        g_assert_not_reached();
+    }
+    if (ret) {
+        g_test_message("media: %s", qdict_get_str(ret, "summary"));
+        qobject_ref(ret);
+    }
+    qobject_unref(rsp);
+    return ret;
+}
+
+static QDict *media_args(const char *action, const char *device)
+{
+    QDict *args = qdict_new();
+
+    qdict_put_str(args, "action", action);
+    if (device) {
+        qdict_put_str(args, "device", device);
+    }
+    return args;
+}
+
+static void media_error(QTestState *qts, QDict *args, const char *want)
+{
+    g_autofree char *err = NULL;
+
+    g_assert(!media(qts, args, &err));
+    if (!strstr(err, want)) {
+        g_test_message("media: '%s' lacks '%s'", err, want);
+        g_assert_not_reached();
+    }
+}
+
+static void media_summary(QDict *ret, const char *want)
+{
+    if (!strstr(qdict_get_str(ret, "summary"), want)) {
+        g_test_message("media: no '%s' in the summary", want);
+        g_assert_not_reached();
+    }
+}
+
+/* Insert a medium made from media_names in @dir */
+static QDict *media_insert(QTestState *qts, const char *device,
+                           const char *dir)
+{
+    QDict *args = media_args("insert", device);
+    QList *files = qlist_new();
+    const char *const *n;
+
+    for (n = media_names; *n; n++) {
+        g_autofree char *p = g_build_filename(dir, *n, NULL);
+
+        qlist_append_str(files, p);
+    }
+    qdict_put(args, "files", files);
+    return media(qts, args, NULL);
+}
+
+static QDict *media_copy_out(QTestState *qts, const char *to, char **error)
+{
+    QDict *args = media_args("copy-out", "floppy0");
+
+    qdict_put_str(args, "to", to);
+    return media(qts, args, error);
+}
+
+/* The image file in @device */
+static char *media_file(QTestState *qts, const char *device)
+{
+    QDict *ret = media(qts, media_args("list", NULL), NULL);
+    QListEntry *e;
+    char *file = NULL;
+
+    QLIST_FOREACH_ENTRY(qdict_get_qlist(ret, "drives"), e) {
+        QDict *d = qobject_to(QDict, qlist_entry_obj(e));
+
+        if (!strcmp(qdict_get_str(d, "device"), device)) {
+            file = g_strdup(qdict_get_try_str(d, "file"));
+        }
+    }
+    qobject_unref(ret);
+    g_assert(file);
+    return file;
+}
+
+/* The System Use entry @sig (Rock Ridge) of the disc record @r */
+static const uint8_t *iso_su(const uint8_t *r, const char *sig)
+{
+    int i = 33 + r[32] + !(r[32] & 1);
+
+    while (i + 4 <= r[0] && r[i + 2] >= 4) {
+        if (!memcmp(r + i, sig, 2)) {
+            return r + i;
+        }
+        i += r[i + 2];
+    }
+    return NULL;
+}
+
+/*
+ * The record of @name in the folder of record @dir: by its Rock Ridge
+ * name if @rr, else by its ISO 9660 name without ";1", as guests do
+ */
+static const uint8_t *iso_find(const uint8_t *iso, const uint8_t *dir,
+                               const char *name, bool rr)
+{
+    uint32_t lba = ldl_le_p(dir + 2), size = ldl_le_p(dir + 10), off = 0;
+
+    while (off < size) {
+        const uint8_t *r = iso + lba * ISO_SECTOR + off;
+        const uint8_t *nm = rr ? iso_su(r, "NM") : NULL;
+        char id[256];
+        char *end;
+
+        if (!r[0]) {
+            off = ROUND_UP(off + 1, ISO_SECTOR);
+            continue;
+        }
+        if (rr) {
+            snprintf(id, sizeof(id), "%.*s", nm ? nm[2] - 5 : 0,
+                     nm ? (const char *)nm + 5 : "");
+        } else {
+            snprintf(id, sizeof(id), "%.*s", r[32], r + 33);
+            end = strstr(id, ";1");
+            if (end) {
+                *end = 0;
+                if (end > id && end[-1] == '.') {
+                    end[-1] = 0;
+                }
+            }
+        }
+        if (!strcmp(id, name)) {
+            return r;
+        }
+        off += r[0];
+    }
+    return NULL;
+}
+
+/* The disc names every guest reads, and the real names for Rock Ridge */
+static void test_media_disc(void)
+{
+    g_autofree char *dir = media_tree();
+    QTestState *qts = qtest_init(MEDIA_ARGS);
+    g_autofree char *file = NULL;
+    g_autofree uint8_t *iso = NULL;
+    const uint8_t *pvd, *root, *r, *docs, *deep, *e, *pt;
+    uint32_t off;
+    gsize len;
+    QDict *ret;
+    int i, n;
+
+    ret = media_insert(qts, "ide1-cd0", dir);
+    media_summary(ret, "a disc lemu made from 6 files and 2 folders");
+    media_summary(ret, "(read-only)");
+    media_summary(ret, "LONG_FIL.DAT (Long File Name.data)");
+    qobject_unref(ret);
+    file = media_file(qts, "ide1-cd0");
+    g_assert(g_file_get_contents(file, (char **)&iso, &len, NULL));
+    g_assert_cmpint(len % ISO_SECTOR, ==, 0);
+
+    pvd = iso + 16 * ISO_SECTOR;
+    g_assert(pvd[0] == 1 && !memcmp(pvd + 1, "CD001", 5));
+    g_assert_cmpint(ldl_le_p(pvd + 80), ==, len / ISO_SECTOR);
+    g_assert_cmpint(ldl_be_p(pvd + 84), ==, len / ISO_SECTOR);
+    g_assert_cmpint(iso[17 * ISO_SECTOR], ==, 255);
+    root = pvd + 156;
+
+    /* Rock Ridge says it is there in the "." record of the top folder */
+    r = iso + ldl_le_p(root + 2) * ISO_SECTOR;
+    g_assert(r[32] == 1 && r[33] == 0);
+    e = iso_su(r, "SP");
+    g_assert(e && e[4] == 0xbe && e[5] == 0xef);
+
+    r = iso_find(iso, root, "readme.txt", true);
+    g_assert(r && r == iso_find(iso, root, "README.TXT", false));
+    g_assert_cmpint(ldl_le_p(r + 10), ==, 6);
+    g_assert(!memcmp(iso + ldl_le_p(r + 2) * ISO_SECTOR, "hello\n", 6));
+
+    r = iso_find(iso, root, "Long File Name.data", true);
+    g_assert(r && r == iso_find(iso, root, "LONG_FIL.DAT", false));
+    g_assert_cmpint(ldl_le_p(r + 10), ==, 5000);
+    for (i = 0; i < 5000; i++) {
+        g_assert(iso[ldl_le_p(r + 2) * ISO_SECTOR + i] == media_byte(i));
+    }
+
+    r = iso_find(iso, root, "run.sh", true);
+    e = r ? iso_su(r, "PX") : NULL;
+    g_assert(e && ldl_le_p(e + 4) == 0100755);
+
+    docs = iso_find(iso, root, "docs", true);
+    g_assert(docs && (docs[25] & 2) && docs == iso_find(iso, root, "DOCS",
+                                                         false));
+    deep = iso_find(iso, docs, "deep", true);
+    g_assert(deep && (deep[25] & 2));
+    r = iso_find(iso, deep, "x.c", true);
+    g_assert(r && r == iso_find(iso, deep, "X.C", false));
+    g_assert(!memcmp(iso + ldl_le_p(r + 2) * ISO_SECTOR, "int x;\n", 7));
+    /* an empty file has a sector of its own, or AIX hides it */
+    r = iso_find(iso, docs, "empty", true);
+    g_assert(r && r == iso_find(iso, docs, "EMPTY", false));
+    g_assert_cmpint(ldl_le_p(r + 10), ==, 0);
+    g_assert_cmpint(ldl_le_p(r + 2), !=, 0);
+    g_assert_cmpint(ldl_le_p(r + 2), !=,
+                    ldl_le_p(iso_find(iso, docs, "a.txt", true) + 2));
+
+    /* the path table has the 3 folders, the top one first */
+    pt = iso + ldl_le_p(pvd + 140) * ISO_SECTOR;
+    for (off = 0, n = 0; off < ldl_le_p(pvd + 132); n++) {
+        off += 8 + pt[off] + (pt[off] & 1);
+    }
+    g_assert_cmpint(n, ==, 3);
+    g_assert_cmpint(ldl_le_p(pt + 2), ==, ldl_le_p(root + 2));
+
+    media_error(qts, media_args("insert", "ide1-cd0"), "'file' or 'files'");
+    ret = media_args("insert", "ide1-cd0");
+    qdict_put(ret, "files", qlist_new());
+    media_error(qts, ret, "a disc needs something");
+    ret = media_args("copy-out", "ide1-cd0");
+    qdict_put_str(ret, "to", dir);
+    media_error(qts, ret, "is a CD-ROM drive");
+
+    /* lemu deletes the disc when the drive is emptied */
+    qobject_unref(media(qts, media_args("eject", "ide1-cd0"), NULL));
+    g_assert(!g_file_test(file, G_FILE_TEST_EXISTS));
+    qtest_quit(qts);
+    media_rmtree(dir);
+}
+
+static uint8_t media_lfn_sum(const char *name83)
+{
+    uint8_t s = 0;
+    int i;
+
+    for (i = 0; i < 11; i++) {
+        s = ((s & 1) << 7) + (s >> 1) + name83[i];
+    }
+    return s;
+}
+
+/* Part @seq of the long name @name, the way Windows writes it */
+static void media_lfn(uint8_t *e, int seq, bool last, const char *name,
+                      uint8_t sum)
+{
+    static const uint8_t at[13] = {
+        1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30
+    };
+    size_t len = strlen(name), i;
+    int k;
+
+    memset(e, 0, 32);
+    e[0] = seq | (last ? 0x40 : 0);
+    e[11] = 0x0f;
+    e[13] = sum;
+    for (k = 0; k < 13; k++) {
+        i = (seq - 1) * 13 + k;
+        stw_le_p(e + at[k], i < len ? name[i] : i == len ? 0 : 0xffff);
+    }
+}
+
+/* Set FAT12 entry @n of the first FAT to @v */
+static void media_fat12(int fd, uint32_t n, uint16_t v)
+{
+    uint8_t p[2];
+    off_t off = 512 + n * 3 / 2;
+
+    g_assert(pread(fd, p, 2, off) == 2);
+    if (n & 1) {
+        p[0] = (p[0] & 0x0f) | (v << 4);
+        p[1] = v >> 4;
+    } else {
+        p[0] = v;
+        p[1] = (p[1] & 0xf0) | ((v >> 8) & 0x0f);
+    }
+    g_assert(pwrite(fd, p, 2, off) == 2);
+}
+
+/*
+ * A floppy from host files, its files back from copy-out, also a file
+ * the "guest" (this test) wrote with a long name, and a damaged FAT
+ */
+static void test_media_floppy(void)
+{
+    static const char sname[] = "LONGNA~1TXT";
+    g_autofree char *dir = media_tree();
+    g_autofree char *out = g_dir_make_tmp("mcp-media-XXXXXX", NULL);
+    g_autofree char *out2 = g_dir_make_tmp("mcp-media-XXXXXX", NULL);
+    g_autofree char *out3 = g_dir_make_tmp("mcp-media-XXXXXX", NULL);
+    QTestState *qts = qtest_init(MEDIA_ARGS);
+    g_autofree char *file = NULL;
+    g_autofree char *err = NULL;
+    uint8_t b[512], top[224 * 32], big[5000], *e;
+    int fd, i, docs = -1, free_slot = -1;
+    QDict *ret;
+
+    ret = media_insert(qts, "floppy0", dir);
+    media_summary(ret, "a floppy lemu made from 6 files and 2 folders");
+    media_summary(ret, "LONG_FIL.DAT (Long File Name.data)");
+    media_summary(ret, "copy-out");
+    qobject_unref(ret);
+    file = media_file(qts, "floppy0");
+
+    /* a DOS 1.44 MB floppy */
+    fd = open(file, O_RDWR);
+    g_assert(fd >= 0);
+    g_assert(pread(fd, b, sizeof(b), 0) == sizeof(b));
+    g_assert(b[510] == 0x55 && b[511] == 0xaa);
+    g_assert_cmpint(lduw_le_p(b + 11), ==, 512);
+    g_assert_cmpint(lduw_le_p(b + 19), ==, 2880);
+    g_assert_cmpint(b[21], ==, 0xf0);
+
+    /* copy-out gives the files back, in lower case where NT shows that */
+    ret = media_copy_out(qts, out, NULL);
+    media_summary(ret, "copied 6 files and 2 folders");
+    qobject_unref(ret);
+    for (i = 0; i < sizeof(big); i++) {
+        big[i] = media_byte(i);
+    }
+    media_check(out, "readme.txt", "hello\n", 6);
+    media_check(out, "LONG_FIL.DAT", big, sizeof(big));
+    media_check(out, "run.sh", "#!/bin/sh\n", 10);
+    media_check(out, "docs/a.txt", "a\n", 2);
+    media_check(out, "docs/empty", "", 0);
+    media_check(out, "docs/deep/x.c", "int x;\n", 7);
+
+    /* the guest writes "A long name.txt" into cluster 2000 */
+    g_assert(pread(fd, top, sizeof(top), 19 * 512) == sizeof(top));
+    for (i = 0; i < 224 && free_slot < 0; i++) {
+        if (!memcmp(top + i * 32, "DOCS       ", 11)) {
+            docs = lduw_le_p(top + i * 32 + 26);
+        }
+        if (!top[i * 32]) {
+            free_slot = i;
+        }
+    }
+    g_assert(docs >= 2 && free_slot >= 0);
+    e = top + free_slot * 32;
+    media_lfn(e, 2, true, "A long name.txt", media_lfn_sum(sname));
+    media_lfn(e + 32, 1, false, "A long name.txt", media_lfn_sum(sname));
+    memset(e + 64, 0, 32);
+    memcpy(e + 64, sname, 11);
+    e[64 + 11] = 0x20;
+    stw_le_p(e + 64 + 26, 2000);
+    stl_le_p(e + 64 + 28, 5);
+    g_assert(pwrite(fd, e, 96, 19 * 512 + free_slot * 32) == 96);
+    g_assert(pwrite(fd, "long\n", 5, (33 + 2000 - 2) * 512) == 5);
+    media_fat12(fd, 2000, 0xfff);
+    qobject_unref(media_copy_out(qts, out2, NULL));
+    media_check(out2, "A long name.txt", "long\n", 5);
+    media_check(out2, "readme.txt", "hello\n", 6);
+
+    /* a FAT that loops a folder onto itself stops copy-out */
+    media_fat12(fd, docs, docs);
+    g_assert(!media_copy_out(qts, out3, &err));
+    g_assert(strstr(err, "damaged"));
+    close(fd);
+
+    media_error(qts, media_args("copy-out", "floppy0"), "'to' is needed");
+    ret = media_args("insert", "floppy0");
+    qdict_put_str(ret, "file", file);
+    qdict_put(ret, "files", qlist_new());
+    media_error(qts, ret, "not both");
+
+    /* and at exit */
+    qtest_quit(qts);
+    g_assert(!g_file_test(file, G_FILE_TEST_EXISTS));
+    media_rmtree(dir);
+    media_rmtree(out);
+    media_rmtree(out2);
+    media_rmtree(out3);
+}
+
 /* Run the emulator as the bridge, with @input on stdin; returns stdout */
 static char *bridge_run(const char *arg, const char *input)
 {
@@ -1225,6 +1704,8 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);
     qtest_add_func("/mcp/serial/run-cancel", test_serial_run_cancel);
+    qtest_add_func("/mcp/media/disc", test_media_disc);
+    qtest_add_func("/mcp/media/floppy", test_media_floppy);
     if (qtest_has_accel("tcg")) {
         qtest_add_func("/mcp/debug/run", test_debug_run);
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
