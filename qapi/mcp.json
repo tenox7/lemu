@@ -1444,14 +1444,16 @@
 #     Where a debug tool left the CPU.  The summary shows the next
 #     instruction, the registers and the memory asked for.
 #
-# @reached: a CPU got to the address (debug-run), or the CPU did all
-#     its steps (debug-step)
+# @reached: a CPU got to an address or touched watched memory as
+#     often as asked (debug-run), or the CPU did all its steps
+#     (debug-step)
 #
 # @cpu: the CPU, when one stopped
 #
 # @pc: its program counter, in hex
 #
-# @hits: how often a CPU got to the address (debug-run)
+# @hits: how often a CPU got to an address or touched watched memory
+#     (debug-run)
 #
 # @steps: instructions done (debug-step)
 #
@@ -1516,6 +1518,34 @@
   'if': 'CONFIG_TCG' }
 
 ##
+# @McpAddresses:
+#     One code address, or several.
+#
+# @one: an address
+#
+# @several: a list of addresses
+#
+# Since: 11.2
+##
+{ 'alternate': 'McpAddresses',
+  'data': { 'one': 'str', 'several': [ 'str' ] },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpWatches:
+#     Memory to watch: one area, or several.
+#
+# @one: an area
+#
+# @several: a list of areas
+#
+# Since: 11.2
+##
+{ 'alternate': 'McpWatches',
+  'data': { 'one': 'McpWatch', 'several': [ 'McpWatch' ] },
+  'if': 'CONFIG_TCG' }
+
+##
 # @McpWatchHit:
 #     What a CPU did to watched memory.
 #
@@ -1538,24 +1568,26 @@
 #     is, the registers and any @memory.  Use it instead of a GDB
 #     script.  The VM stays stopped: look around with hmp, go on with
 #     debug-step or another debug-run, or resume it with vm-power.  A
-#     CPU that is stopped at @address when the call begins first steps
-#     past it, so the call stops at the next arrival.
+#     CPU that is stopped at one of the addresses when the call begins
+#     first steps past it, so the call stops at the next arrival.
 #
-# @address: where to stop: hex with 0x, or decimal.  A virtual
-#     address as the CPU sees it (on x86 the linear address: CS base
-#     plus EIP).  Give it, @watch, or both.
+# @address: where to stop: hex with 0x, or decimal, or a list of up
+#     to 64 of them, to stop at whichever a CPU gets to first.  A
+#     virtual address as the CPU sees it (on x86 the linear address:
+#     CS base plus EIP).  Give it, @watch, or both.
 #
-# @address-mask: compare only the bits of @address that are set in
-#     this number, written as @address: a CPU stops at any address
-#     with the same bits there.  Where the top bits of an address name
-#     a space, as on PA-RISC, 0xffffffff stops in every space, so in
-#     every process.  The guest runs one instruction at a time in each
-#     page that matches, so a mask with few bits slows it down
-#     (default: all bits)
+# @address-mask: compare only the bits of each address that are set
+#     in this number, written as an address: a CPU stops at any
+#     address with the same bits there.  Where the top bits of an
+#     address name a space, as on PA-RISC, 0xffffffff stops in every
+#     space, so in every process.  The guest runs one instruction at a
+#     time in each page that matches, so a mask with few bits slows it
+#     down (default: all bits)
 #
 # @watch: stop after a CPU writes or reads this memory, with the
-#     instruction that did it.  Only CPUs are watched, not devices
-#     that write memory themselves (DMA).
+#     instruction that did it; or a list of up to 16 such areas.  Only
+#     CPUs are watched, not devices that write memory themselves
+#     (DMA).
 #
 # @hits: stop at this arrival or watched access, counting from 1
 #     (default: 1)
@@ -1579,8 +1611,8 @@
 # Since: 11.2
 ##
 { 'command': 'debug-run',
-  'data': { '*address': 'str', '*address-mask': 'str',
-            '*watch': 'McpWatch', '*hits': 'int',
+  'data': { '*address': 'McpAddresses', '*address-mask': 'str',
+            '*watch': 'McpWatches', '*hits': 'int',
             '*cpu': 'int', '*memory': [ 'McpDebugMemory' ],
             '*history': 'int', '*timeout-ms': 'int' },
   'returns': 'McpDebugStop',
@@ -1618,8 +1650,9 @@
 
 ##
 # @McpTraceInstruction:
-#     An instruction that touched the watched memory, or, with an
-#     address mask, one that CPUs got to (@debug-trace).
+#     An instruction that touched the watched memory, or, with several
+#     addresses or an address mask, one that CPUs got to
+#     (@debug-trace).
 #
 # @pc: its address, in hex
 #
@@ -1645,8 +1678,8 @@
 # @running: the VM is running
 #
 # @instructions: when memory was watched, the instructions that
-#     touched it, most first; with an address mask, also each address
-#     the CPUs got to
+#     touched it, most first; with several addresses or an address
+#     mask, also each address the CPUs got to
 #
 # @entries: the hits it lists
 #
@@ -1669,21 +1702,21 @@
 #     address slows the guest down while it traces.  It ends after
 #     @count hits or @duration-ms, and the guest keeps running.
 #
-# @address: log arrivals here, written as for debug-run.  Give it,
-#     @watch, or both.
+# @address: log arrivals here, or at each address of a list, written
+#     as for debug-run.  Give it, @watch, or both.
 #
-# @address-mask: compare only these bits of @address, as for
-#     debug-run; the arrivals are then counted by address too
+# @address-mask: compare only these bits of each address, as for
+#     debug-run
 #
-# @watch: log the accesses to this memory, with the instruction that
-#     did each one
+# @watch: log the accesses to this memory, or to each area of a list,
+#     with the instruction that did each one
 #
 # @count: stop after this many hits, up to 100000 (default: 1000)
 #
 # @list: list this many hits in full, up to 500; after them, only the
 #     first access to the watched memory by each new instruction, and
-#     with @address-mask the first arrival at each new address
-#     (default: 20)
+#     with several addresses or @address-mask the first arrival at
+#     each new address (default: 20)
 #
 # @cpu: trace only this CPU (default: all)
 #
@@ -1702,8 +1735,8 @@
 # Since: 11.2
 ##
 { 'command': 'debug-trace',
-  'data': { '*address': 'str', '*address-mask': 'str',
-            '*watch': 'McpWatch', '*count': 'int',
+  'data': { '*address': 'McpAddresses', '*address-mask': 'str',
+            '*watch': 'McpWatches', '*count': 'int',
             '*list': 'int', '*cpu': 'int', '*registers': [ 'str' ],
             '*memory': [ 'McpDebugMemory' ], '*duration-ms': 'int' },
   'returns': 'McpTrace',

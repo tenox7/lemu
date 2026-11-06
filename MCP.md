@@ -125,6 +125,7 @@ Use these:
 | Disassemble guest code | `hmp` `x /10i ADDR` |
 | Save memory to a file | `hmp` `pmemsave ADDR SIZE FILE` |
 | Stop when the guest gets to an address (a breakpoint) | `debug-run` |
+| Stop at whichever of several addresses comes first | `debug-run` with a list in `address` |
 | Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
 | See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
 | See how the CPU got to where it stopped | `debug-run` with `history` |
@@ -199,6 +200,10 @@ Use these:
   `address` too, whichever comes first stops it. Only CPUs are
   watched, not devices that write memory themselves (DMA). On hppa,
   give the whole address, space and offset, as for other memory.
+- **Several at once:** `address` takes a list of up to 64 addresses,
+  and `watch` a list of up to 16 areas. `debug-run` stops at whichever
+  a CPU gets to or touches first; `debug-trace` logs them all and
+  counts the arrivals by address.
 - **How did it get here?** `debug-run` with `history: 16` notes the
   last 16 blocks of code each CPU runs, and shows them when it stops,
   oldest first, as start-end ranges. A block runs from where a jump
@@ -230,10 +235,10 @@ Use these:
   `retry: true`. Run `debug-run` again to get to the next real
   arrival. `debug-profile` gives each hot spot's `physical` address
   too, so the same address in two processes is two entries.
-- **When you need GDB after all,** for example to trace many addresses
-  at once: `hmp` `gdbserver tcp:127.0.0.1:1234` turns the GDB stub on in
-  a running VM, with no restart. Don't use the debug tools while a GDB
-  client is attached.
+- **When you need GDB after all,** for example to stop only when a
+  register holds some value: `hmp` `gdbserver tcp:127.0.0.1:1234`
+  turns the GDB stub on in a running VM, with no restart. Don't use
+  the debug tools while a GDB client is attached.
 
 - **Copying files** needs nothing in the guest. `media` `insert` with
   `files` makes a disc for a CD-ROM drive, or a 1.44 MB floppy for

@@ -265,6 +265,9 @@ McpMemoryWriteResult *qmp_memory_write(const char *address,
 
 #define RUN_DEFAULT_MS          30000
 #define RUN_HITS_MAX            1000000
+#define RUN_ADDRS_MAX           64
+#define RUN_WATCHES_MAX         16
+#define RUN_LISTED              8       /* addresses a summary names */
 #define STEP_MAX                10000
 #define STEP_SHOWN              200
 #define STEP_WAIT_MS            1000
@@ -482,43 +485,101 @@ typedef struct McpWatchSeen {
     bool write;
 } McpWatchSeen;
 
+/* Memory that a debug tool watches */
+typedef struct McpWatchArea {
+    uint64_t addr;
+    uint64_t len;
+    int flags;                  /* BP_MEM_READ, BP_MEM_WRITE or both */
+} McpWatchArea;
+
 typedef struct McpBreak {
     CPUState *only;
-    bool has_addr;
-    uint64_t addr;
+    int n_addrs;                /* the addresses to stop at */
+    uint64_t addrs[RUN_ADDRS_MAX];
     bool has_mask;
-    uint64_t mask;              /* the bits of addr compared */
+    uint64_t mask;              /* the bits of each address compared */
     int hits;                   /* CPUs there as the time ran out */
-    bool has_watch;             /* the watched memory */
-    uint64_t waddr;
-    uint64_t wlen;
-    int wflags;                 /* BP_MEM_READ, BP_MEM_WRITE or both */
+    int n_watches;              /* the watched memory */
+    McpWatchArea watches[RUN_WATCHES_MAX];
     int whits;                  /* CPUs that touched it as the time ran out */
     McpWatchSeen seen;
 } McpBreak;
 
 /*
- * Whether @cpu is watched and stands at the address, about to run the
- * instruction there.  A halted CPU there has not got there yet: it goes
- * on with an interrupt.
+ * Which address of @b @cpu stands at, about to run the instruction
+ * there, or -1 when none or the CPU is not watched.  A halted CPU there
+ * has not got there yet: it goes on with an interrupt.
  */
+static int mcp_debug_addr_index(McpBreak *b, CPUState *cpu)
+{
+    vaddr pc;
+    int i;
+
+    if (!b->n_addrs || (b->only && cpu != b->only) || cpu->halted) {
+        return -1;
+    }
+    pc = cpu->cc->get_pc(cpu);
+    for (i = 0; i < b->n_addrs; i++) {
+        if (((pc ^ mcp_debug_bp_pc(cpu, b->addrs[i])) & b->mask) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static bool mcp_debug_is_at(McpBreak *b, CPUState *cpu)
 {
-    return b->has_addr && (!b->only || cpu == b->only) && !cpu->halted &&
-           ((cpu->cc->get_pc(cpu) ^ mcp_debug_bp_pc(cpu, b->addr)) &
-            b->mask) == 0;
+    return mcp_debug_addr_index(b, cpu) >= 0;
 }
 
 /* The address a CPU of @b stopped at, as the summary shows it */
 static uint64_t mcp_debug_reached(McpBreak *b, CPUState *cpu)
 {
-    return b->has_mask ? cpu->cc->get_pc(cpu) : b->addr;
+    int i = mcp_debug_addr_index(b, cpu);
+
+    return b->has_mask || i < 0 ? cpu->cc->get_pc(cpu) : b->addrs[i];
 }
 
-/* "0x1000", or "0x1000 (mask 0xffff)" */
-static void mcp_debug_append_addr(GString *s, McpBreak *b)
+/* Whether debug-trace counts the arrivals by address */
+static bool mcp_debug_by_addr(McpBreak *b)
 {
-    g_string_append_printf(s, "0x%" PRIx64, b->addr);
+    return b->has_mask || b->n_addrs > 1;
+}
+
+/*
+ * "a", "a or b", "a, b or c"; past RUN_LISTED of them, the first ones
+ * and "or 9 more".  @items are freed.
+ */
+static void mcp_append_list(GString *s, GPtrArray *items, const char *conj)
+{
+    guint n = items->len;
+    guint shown = n > RUN_LISTED ? RUN_LISTED - 1 : n;
+    guint i;
+
+    for (i = 0; i < shown; i++) {
+        if (i && i == n - 1) {
+            g_string_append_printf(s, " %s ", conj);
+        } else if (i) {
+            g_string_append(s, ", ");
+        }
+        g_string_append(s, g_ptr_array_index(items, i));
+    }
+    if (shown < n) {
+        g_string_append_printf(s, " %s %u more", conj, n - shown);
+    }
+    g_ptr_array_free(items, true);
+}
+
+/* "0x1000", "0x1000 or 0x2000", then " (mask 0xffff)" */
+static void mcp_debug_append_addrs(GString *s, McpBreak *b, const char *conj)
+{
+    GPtrArray *items = g_ptr_array_new_with_free_func(g_free);
+    int i;
+
+    for (i = 0; i < b->n_addrs; i++) {
+        g_ptr_array_add(items, g_strdup_printf("0x%" PRIx64, b->addrs[i]));
+    }
+    mcp_append_list(s, items, conj);
     if (b->has_mask) {
         g_string_append_printf(s, " (mask 0x%" PRIx64 ")", b->mask);
     }
@@ -527,29 +588,32 @@ static void mcp_debug_append_addr(GString *s, McpBreak *b)
 /*
  * Breakpoints are checked when a CPU looks for the next block of
  * translated code, and chained blocks don't look: flush them all, so
- * that every way to the address looks again.  Watchpoints flush the
+ * that every way to the addresses looks again.  Watchpoints flush the
  * TLB for their pages themselves.  The VM is stopped.
  */
 static void mcp_debug_insert(McpBreak *b)
 {
     CPUState *cpu;
+    int i;
 
     CPU_FOREACH(cpu) {
         if (b->only && cpu != b->only) {
             continue;
         }
-        if (b->has_addr) {
+        for (i = 0; i < b->n_addrs; i++) {
             CPUBreakpoint *bp;
 
-            cpu_breakpoint_insert(cpu, b->addr, BP_GDB, &bp);
+            cpu_breakpoint_insert(cpu, b->addrs[i], BP_GDB, &bp);
             bp->mask = b->mask;
         }
-        if (b->has_watch) {
-            cpu_watchpoint_insert(cpu, b->waddr, b->wlen,
-                                  BP_GDB | b->wflags, NULL);
+        for (i = 0; i < b->n_watches; i++) {
+            McpWatchArea *w = &b->watches[i];
+
+            cpu_watchpoint_insert(cpu, w->addr, w->len, BP_GDB | w->flags,
+                                  NULL);
         }
     }
-    if (b->has_addr) {
+    if (b->n_addrs) {
         tb_flush__exclusive_or_serial();
     }
 }
@@ -558,17 +622,30 @@ static void mcp_debug_insert(McpBreak *b)
  * Our watchpoint on @cpu, found again by what it watches: a GDB client
  * that detaches removes all BP_GDB watchpoints, ours too
  */
-static CPUWatchpoint *mcp_watch_find(McpBreak *b, CPUState *cpu)
+static CPUWatchpoint *mcp_watch_find(McpWatchArea *w, CPUState *cpu)
 {
     CPUWatchpoint *wp;
 
     QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
-        if (wp->vaddr == b->waddr && wp->len == b->wlen &&
-            (wp->flags & ~BP_WATCHPOINT_HIT) == (BP_GDB | b->wflags)) {
+        if (wp->vaddr == w->addr && wp->len == w->len &&
+            (wp->flags & ~BP_WATCHPOINT_HIT) == (BP_GDB | w->flags)) {
             return wp;
         }
     }
     return NULL;
+}
+
+/* Whether @wp on @cpu is one of the watchpoints of @b */
+static bool mcp_watch_ours(McpBreak *b, CPUState *cpu, CPUWatchpoint *wp)
+{
+    int i;
+
+    for (i = 0; i < b->n_watches; i++) {
+        if (mcp_watch_find(&b->watches[i], cpu) == wp) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* A CPU's hit is dealt with: it must not stop the VM again */
@@ -588,7 +665,7 @@ static bool mcp_watch_take(McpBreak *b, CPUState *cpu, McpWatchSeen *seen)
 {
     CPUWatchpoint *wp = cpu->watchpoint_hit;
 
-    if (!b->has_watch || !wp || wp != mcp_watch_find(b, cpu)) {
+    if (!wp || !mcp_watch_ours(b, cpu, wp)) {
         return false;
     }
     seen->cpu = cpu;
@@ -614,10 +691,10 @@ static int mcp_watch_hits(McpBreak *b, McpWatchSeen *seen)
     return n;
 }
 
-/* Our breakpoint on @cpu, found again by what it compares, as above */
-static CPUBreakpoint *mcp_bp_find(McpBreak *b, CPUState *cpu)
+/* Our breakpoint at @addr on @cpu, found again by what it compares */
+static CPUBreakpoint *mcp_bp_find(McpBreak *b, uint64_t addr, CPUState *cpu)
 {
-    vaddr pc = mcp_debug_bp_pc(cpu, b->addr);
+    vaddr pc = mcp_debug_bp_pc(cpu, addr);
     CPUBreakpoint *bp;
 
     QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
@@ -631,25 +708,29 @@ static CPUBreakpoint *mcp_bp_find(McpBreak *b, CPUState *cpu)
 static void mcp_debug_remove(McpBreak *b)
 {
     CPUState *cpu;
+    int i;
 
     CPU_FOREACH(cpu) {
-        CPUBreakpoint *bp;
-        CPUWatchpoint *wp;
-
         if (b->only && cpu != b->only) {
             continue;
         }
-        bp = b->has_addr ? mcp_bp_find(b, cpu) : NULL;
-        if (bp) {
-            cpu_breakpoint_remove_by_ref(cpu, bp);
-        }
-        wp = b->has_watch ? mcp_watch_find(b, cpu) : NULL;
-        if (wp) {
-            /* a hit that has not stopped the VM yet never will */
-            if (cpu->watchpoint_hit == wp) {
-                mcp_watch_clear_hit(cpu, wp);
+        for (i = 0; i < b->n_addrs; i++) {
+            CPUBreakpoint *bp = mcp_bp_find(b, b->addrs[i], cpu);
+
+            if (bp) {
+                cpu_breakpoint_remove_by_ref(cpu, bp);
             }
-            cpu_watchpoint_remove_by_ref(cpu, wp);
+        }
+        for (i = 0; i < b->n_watches; i++) {
+            CPUWatchpoint *wp = mcp_watch_find(&b->watches[i], cpu);
+
+            if (wp) {
+                /* a hit that has not stopped the VM yet never will */
+                if (cpu->watchpoint_hit == wp) {
+                    mcp_watch_clear_hit(cpu, wp);
+                }
+                cpu_watchpoint_remove_by_ref(cpu, wp);
+            }
         }
     }
 }
@@ -897,8 +978,8 @@ static McpMem *mcp_parse_memory(CPUState *cpu, McpDebugMemoryList *list,
                    MEMORY_RANGES_MAX);
         return NULL;
     }
-    /* one more, for the watched memory */
-    mem = g_new0(McpMem, n + 1);
+    /* and the watched memory */
+    mem = g_new0(McpMem, n + RUN_WATCHES_MAX);
     for (l = list, n = 0; l; l = l->next, n++) {
         McpDebugMemory *d = l->value;
 
@@ -920,13 +1001,13 @@ static McpMem *mcp_parse_memory(CPUState *cpu, McpDebugMemoryList *list,
 #define WATCH_LEN               4
 #define WATCH_LEN_MAX           4096
 #define WATCH_WORDS_SHOWN       16
+#define WATCH_WORDS_EACH        4       /* shown of each of several */
 
 /*
- * The memory to watch into @b, and into @shown the memory to show when
- * the VM stops.  Registers are read now, from the CPU the tool shows.
+ * One area of memory to watch into @b.  Registers are read now, from
+ * the CPU the tool shows.
  */
-static bool mcp_parse_watch(McpWatch *w, McpBreak *b, McpMem *shown,
-                            Error **errp)
+static bool mcp_parse_watch(McpWatch *w, McpBreak *b, Error **errp)
 {
     static const int flags[] = {
         [MCP_WATCH_ACCESS_WRITE] = BP_MEM_WRITE,
@@ -934,8 +1015,10 @@ static bool mcp_parse_watch(McpWatch *w, McpBreak *b, McpMem *shown,
         [MCP_WATCH_ACCESS_ACCESS] = BP_MEM_ACCESS,
     };
     CPUState *cpu = b->only ? b->only : mcp_debug_cpu(false, 0, errp);
+    McpWatchArea a;
     McpMem m = { 0 };
     const char *bad = NULL;
+    int i;
 
     if (!cpu) {
         return false;
@@ -949,29 +1032,76 @@ static bool mcp_parse_watch(McpWatch *w, McpBreak *b, McpMem *shown,
                    w->address);
         return false;
     }
-    if (!mcp_mem_address(cpu, &m, &b->waddr, &bad)) {
+    if (!mcp_mem_address(cpu, &m, &a.addr, &bad)) {
         error_setg(errp, "watch address '%s': CPU %d has no integer"
                    " register %s", w->address, cpu->cpu_index, bad);
         return false;
     }
-    b->wlen = w->has_length ? w->length : WATCH_LEN;
-    if (b->wlen < 1 || b->wlen > WATCH_LEN_MAX) {
+    a.len = w->has_length ? w->length : WATCH_LEN;
+    if (a.len < 1 || a.len > WATCH_LEN_MAX) {
         error_setg(errp, "watch length must be 1 to %d", WATCH_LEN_MAX);
         return false;
     }
-    if (b->waddr + b->wlen - 1 < b->waddr) {
+    if (a.addr + a.len - 1 < a.addr) {
         error_setg(errp, "watched memory runs past the end of the address"
                    " space");
         return false;
     }
-    b->wflags = flags[w->has_access ? w->access : MCP_WATCH_ACCESS_WRITE];
-    b->has_watch = true;
+    a.flags = flags[w->has_access ? w->access : MCP_WATCH_ACCESS_WRITE];
 
-    shown->n_terms = 1;
-    shown->term[0].num = b->waddr;
-    shown->words = MIN(DIV_ROUND_UP(b->wlen + (b->waddr & 3), 4),
-                       WATCH_WORDS_SHOWN);
-    shown->term[0].num &= ~3ULL;
+    /* the same area twice is one watchpoint */
+    for (i = 0; i < b->n_watches; i++) {
+        McpWatchArea *o = &b->watches[i];
+
+        if (o->addr == a.addr && o->len == a.len && o->flags == a.flags) {
+            return true;
+        }
+    }
+    if (b->n_watches == RUN_WATCHES_MAX) {
+        error_setg(errp, "watch at most %d areas", RUN_WATCHES_MAX);
+        return false;
+    }
+    b->watches[b->n_watches++] = a;
+    return true;
+}
+
+/*
+ * The memory to watch, one area or several, into @b; into @shown, if
+ * given, the memory to show when the VM stops, one McpMem per area
+ */
+static bool mcp_parse_watches(McpWatches *w, McpBreak *b, McpMem *shown,
+                              Error **errp)
+{
+    McpWatchList one = { 0 };
+    McpWatchList *l;
+    int i, most;
+
+    if (w->type == QTYPE_QDICT) {
+        one.value = &w->u.one;
+        l = &one;
+    } else {
+        l = w->u.several;
+        if (!l) {
+            error_setg(errp, "give at least one area to watch");
+            return false;
+        }
+    }
+    for (; l; l = l->next) {
+        if (!mcp_parse_watch(l->value, b, errp)) {
+            return false;
+        }
+    }
+    if (!shown) {
+        return true;
+    }
+    most = b->n_watches > 1 ? WATCH_WORDS_EACH : WATCH_WORDS_SHOWN;
+    for (i = 0; i < b->n_watches; i++) {
+        McpWatchArea *a = &b->watches[i];
+
+        shown[i].n_terms = 1;
+        shown[i].term[0].num = a->addr & ~3ULL;
+        shown[i].words = MIN(DIV_ROUND_UP(a->len + (a->addr & 3), 4), most);
+    }
     return true;
 }
 
@@ -1203,6 +1333,30 @@ typedef enum {
     RUN_CANCELLED,
 } McpRunResult;
 
+/*
+ * The watched areas: "wrote to 0x2000", "writes to 0x2000 (4 bytes)",
+ * each with the word from @verb for its access
+ */
+static void mcp_debug_append_watches(GString *s, McpBreak *b,
+                                     const char *const verb[],
+                                     bool with_len, const char *conj)
+{
+    GPtrArray *items = g_ptr_array_new_with_free_func(g_free);
+    int i;
+
+    for (i = 0; i < b->n_watches; i++) {
+        McpWatchArea *a = &b->watches[i];
+        g_autofree char *len = with_len ?
+            g_strdup_printf(" (%" PRIu64 " byte%s)", a->len,
+                            a->len == 1 ? "" : "s") : NULL;
+
+        g_ptr_array_add(items, g_strdup_printf("%s 0x%" PRIx64 "%s",
+                                               verb[a->flags], a->addr,
+                                               len ? len : ""));
+    }
+    mcp_append_list(s, items, conj);
+}
+
 /* "reached 0x1000", "wrote to 0x2000", or both, for the summary */
 static void mcp_debug_what(GString *s, McpBreak *b)
 {
@@ -1212,16 +1366,15 @@ static void mcp_debug_what(GString *s, McpBreak *b)
         [BP_MEM_ACCESS] = "touched",
     };
 
-    if (b->has_addr) {
+    if (b->n_addrs) {
         g_string_append(s, "reached ");
-        mcp_debug_append_addr(s, b);
+        mcp_debug_append_addrs(s, b, "or");
     }
-    if (b->has_addr && b->has_watch) {
+    if (b->n_addrs && b->n_watches) {
         g_string_append(s, " or ");
     }
-    if (b->has_watch) {
-        g_string_append_printf(s, "%s 0x%" PRIx64, verb[b->wflags],
-                               b->waddr);
+    if (b->n_watches) {
+        mcp_debug_append_watches(s, b, verb, false, "or");
     }
 }
 
@@ -1457,16 +1610,55 @@ static void coroutine_fn mcp_run(McpRun *r)
     }
 }
 
-/* Where to stop or what to log: an address, watched memory, a CPU */
-static bool mcp_run_parse(McpRun *r, const char *address,
+/* The addresses to stop at, one or several, into @b */
+static bool mcp_parse_addrs(McpAddresses *address, McpBreak *b, Error **errp)
+{
+    strList one = { 0 };
+    strList *l;
+
+    if (address->type == QTYPE_QSTRING) {
+        one.value = address->u.one;
+        l = &one;
+    } else {
+        l = address->u.several;
+        if (!l) {
+            error_setg(errp, "give at least one address");
+            return false;
+        }
+    }
+    for (; l; l = l->next) {
+        uint64_t a;
+        int i;
+
+        if (!mcp_parse_address(l->value, "address", &a, errp)) {
+            return false;
+        }
+        /* the same address twice is one breakpoint */
+        for (i = 0; i < b->n_addrs; i++) {
+            if (b->addrs[i] == a) {
+                break;
+            }
+        }
+        if (i < b->n_addrs) {
+            continue;
+        }
+        if (b->n_addrs == RUN_ADDRS_MAX) {
+            error_setg(errp, "give at most %d addresses", RUN_ADDRS_MAX);
+            return false;
+        }
+        b->addrs[b->n_addrs++] = a;
+    }
+    return true;
+}
+
+/* Where to stop or what to log: addresses, watched memory, a CPU */
+static bool mcp_run_parse(McpRun *r, McpAddresses *address,
                           const char *address_mask, bool has_cpu,
                           int64_t cpu_index, Error **errp)
 {
-    if (address && !mcp_parse_address(address, "address", &r->b.addr,
-                                      errp)) {
+    if (address && !mcp_parse_addrs(address, &r->b, errp)) {
         return false;
     }
-    r->b.has_addr = address;
     r->b.mask = UINT64_MAX;
     if (address_mask) {
         if (!address) {
@@ -1492,9 +1684,9 @@ static bool mcp_run_parse(McpRun *r, const char *address,
     return true;
 }
 
-McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
+McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
                                          const char *address_mask,
-                                         McpWatch *watch,
+                                         McpWatches *watch,
                                          bool has_hits, int64_t hits,
                                          bool has_cpu, int64_t cpu_index,
                                          bool has_memory,
@@ -1545,7 +1737,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     if (!mem) {
         return NULL;
     }
-    if (watch && !mcp_parse_watch(watch, b, &mem[n_mem], errp)) {
+    if (watch && !mcp_parse_watches(watch, b, &mem[n_mem], errp)) {
         return NULL;
     }
     if (!mcp_debug_begin(r.ctx, errp)) {
@@ -1553,7 +1745,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     }
     r.end = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + timeout_ms;
     r.limit = hits;
-    hit_word = !b->has_watch ? "arrival" : b->has_addr ? "hit" : "access";
+    hit_word = !b->n_watches ? "arrival" : b->n_addrs ? "hit" : "access";
 
     mcp_run(&r);
     at = r.at;
@@ -1683,7 +1875,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
             res->history = g_steal_pointer(&hist);
         }
         /* and the watched memory, after the memory asked for */
-        mcp_debug_show(s, cpu, mem, n_mem + b->has_watch);
+        mcp_debug_show(s, cpu, mem, n_mem + b->n_watches);
     }
     qapi_free_strList(hist);
     res->summary = g_strdup(s->str);
@@ -1800,7 +1992,7 @@ static void mcp_trace_log(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
     int i;
 
     /* which instructions touch the watched memory, or are got to */
-    if (seen || r->b.has_mask) {
+    if (seen || mcp_debug_by_addr(&r->b)) {
         c = g_hash_table_lookup(t->insns, &pc);
         if (!c && g_hash_table_size(t->insns) < TRACE_INSNS_MAX) {
             c = g_new0(McpTraceCount, 1);
@@ -1888,23 +2080,21 @@ static void mcp_trace_what(GString *s, McpBreak *b)
         [BP_MEM_ACCESS] = "accesses to",
     };
 
-    if (b->has_addr) {
+    if (b->n_addrs) {
         g_string_append(s, "arrivals at ");
-        mcp_debug_append_addr(s, b);
+        mcp_debug_append_addrs(s, b, "and");
     }
-    if (b->has_addr && b->has_watch) {
+    if (b->n_addrs && b->n_watches) {
         g_string_append(s, " and ");
     }
-    if (b->has_watch) {
-        g_string_append_printf(s, "%s 0x%" PRIx64 " (%" PRIu64 " byte%s)",
-                               what[b->wflags], b->waddr, b->wlen,
-                               b->wlen == 1 ? "" : "s");
+    if (b->n_watches) {
+        mcp_debug_append_watches(s, b, what, true, "and");
     }
 }
 
-McpTrace *coroutine_fn qmp_debug_trace(const char *address,
+McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
                                        const char *address_mask,
-                                       McpWatch *watch,
+                                       McpWatches *watch,
                                        bool has_count, int64_t count,
                                        bool has_list, int64_t list,
                                        bool has_cpu, int64_t cpu_index,
@@ -1930,7 +2120,6 @@ McpTrace *coroutine_fn qmp_debug_trace(const char *address,
         .insns = insns,
     };
     McpBreak *b = &t.r.b;
-    McpMem shown = { 0 };       /* each line shows the watched word */
     McpTraceInstructionList **itail;
     McpDebugMemoryList *ml;
     McpTrace *res;
@@ -1994,7 +2183,8 @@ McpTrace *coroutine_fn qmp_debug_trace(const char *address,
             mem[n].words = 1;
         }
     }
-    if (watch && !mcp_parse_watch(watch, b, &shown, errp)) {
+    /* each line shows the watched word */
+    if (watch && !mcp_parse_watches(watch, b, NULL, errp)) {
         return NULL;
     }
     t.mem = mem;
@@ -2050,7 +2240,7 @@ McpTrace *coroutine_fn qmp_debug_trace(const char *address,
                                " stopped.", RunState_str(runstate_get()));
     }
 
-    if (b->has_watch || b->has_mask) {
+    if (b->n_watches || mcp_debug_by_addr(b)) {
         GHashTableIter it;
         gpointer v;
 
@@ -2086,11 +2276,11 @@ McpTrace *coroutine_fn qmp_debug_trace(const char *address,
         g_string_append(s, s->str[s->len - 1] == '\n' ? "\n" : "\n\n");
         if (t.n_listed == t.r.n_hits) {
             g_string_append(s, "Hits:\n");
-        } else if (b->has_watch || b->has_mask) {
+        } else if (b->n_watches || mcp_debug_by_addr(b)) {
             /* "the first access by each instruction" */
-            const char *what = !b->has_mask ? "access by" :
-                               !b->has_watch ? "arrival at" : "hit at";
-            const char *where = b->has_watch ? "instruction" : "address";
+            const char *what = !mcp_debug_by_addr(b) ? "access by" :
+                               !b->n_watches ? "arrival at" : "hit at";
+            const char *where = b->n_watches ? "instruction" : "address";
 
             if (list) {
                 g_string_append_printf(s, "Hits (the first %" PRId64 ", then"

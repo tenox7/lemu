@@ -2182,6 +2182,118 @@ static void test_debug_mask(void)
     unlink(bios);
 }
 
+/* debug-run and debug-trace take several addresses and watched areas */
+static void test_debug_several(void)
+{
+    g_autofree char *bios = debug_bios_mask();
+    g_autofree char *bios_watch = debug_bios_watch();
+    g_autoptr(GString) many = g_string_new("{'address': [");
+    QTestState *qts;
+    QDict *ret;
+    int i;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* each loop calls the first once and the second twice */
+    ret = debug_ok(qts, "debug-run", "{'address': ['0x10008', '0x20008'],"
+                   " 'hits': 3}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 3);
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0x20008");
+    debug_summary_has(ret, "CPU 0 reached 0x20008 (arrival 3); the VM is"
+                      " stopped");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'address': ['0x20008', '0x10008']}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0x10008");
+    qobject_unref(ret);
+
+    /* the trace counts them by address */
+    ret = debug_ok(qts, "debug-trace", "{'address': ['0x10008', '0x20008'],"
+                   " 'count': 9, 'list': 3}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 9);
+    g_assert_cmpint(debug_trace_count(ret, "0x20008"), ==, 6);
+    g_assert_cmpint(debug_trace_count(ret, "0x10008"), ==, 3);
+    debug_summary_has(ret, "Traced arrivals at 0x10008 and 0x20008 for ");
+    debug_summary_has(ret, "\n\nHits (the first 3, then the first arrival"
+                      " at each new address):\n#1 CPU 0 at 0x20008\n"
+                      "#2 CPU 0 at 0x20008\n#3 CPU 0 at 0x10008");
+    qobject_unref(ret);
+
+    /* the same address twice is one */
+    ret = debug_ok(qts, "debug-trace", "{'address': ['0x10008', '0x10008'],"
+                   " 'count': 2}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 2);
+    g_assert(!qdict_haskey(ret, "instructions"));
+    debug_summary_has(ret, "Traced arrivals at 0x10008 for ");
+    qobject_unref(ret);
+
+    /* nothing gets there: the summary names the first ones */
+    ret = debug_ok(qts, "debug-run", "{'address': ['0x1', '0x2', '0x3',"
+                   " '0x4', '0x5', '0x6', '0x7', '0x8', '0x9'],"
+                   " 'timeout-ms': 100}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    debug_summary_has(ret, "no CPU reached 0x1, 0x2, 0x3, 0x4, 0x5, 0x6,"
+                      " 0x7 or 2 more in 0.1 s;");
+    qobject_unref(ret);
+
+    for (i = 0; i < 65; i++) {
+        g_string_append_printf(many, "%s'0x%x'", i ? ", " : "", 0x100 + i);
+    }
+    g_string_append(many, "]}");
+    debug_check_error(qts, "debug-run", many->str,
+                      "give at most 64 addresses");
+    debug_check_error(qts, "debug-run", "{'address': []}",
+                      "give at least one address");
+    debug_check_error(qts, "debug-trace", "{'address': ['0x1000', 'zz']}",
+                      "address 'zz' is not a number");
+    qtest_quit(qts);
+
+    /* the guest at 0xf0008 writes 0x1000 and at 0xf000a reads it */
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios_watch);
+    ret = debug_ok(qts, "debug-run", "{'watch': [{'address': '0x2000'},"
+                   " {'address': '0x1000', 'access': 'read'}]}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(qdict_get_str(qdict_get_qdict(ret, "watch"), "access"),
+                    ==, "read");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf000c");
+    debug_summary_has(ret, "CPU 0 read 0x1000;");
+    debug_summary_has(ret, "Memory at 0x2000:\n00002000: 0x00000000\n");
+    debug_summary_has(ret, "Memory at 0x1000:\n00001000: 0x00000001\n");
+    qobject_unref(ret);
+
+    ret = debug_ok(qts, "debug-trace", "{'watch': [{'address': '0x1000',"
+                   " 'length': 2}, {'address': '0x1000', 'length': 2,"
+                   " 'access': 'read'}], 'count': 6, 'list': 0}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 6);
+    g_assert_cmpint(debug_trace_count(ret, "0xf0008"), ==, 3);
+    g_assert_cmpint(debug_trace_count(ret, "0xf000a"), ==, 3);
+    debug_summary_has(ret, "Traced writes to 0x1000 (2 bytes) and reads of"
+                      " 0x1000 (2 bytes) for ");
+    qobject_unref(ret);
+
+    ret = debug_ok(qts, "debug-run", "{'watch': [{'address': '0x2000'},"
+                   " {'address': '0x3000', 'access': 'read'}],"
+                   " 'timeout-ms': 100}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    debug_summary_has(ret, "no CPU wrote to 0x2000 or read 0x3000 in 0.1 s;");
+    qobject_unref(ret);
+
+    g_string_assign(many, "{'watch': [");
+    for (i = 0; i < 17; i++) {
+        g_string_append_printf(many, "%s{'address': '0x%x'}", i ? ", " : "",
+                               0x2000 + 4 * i);
+    }
+    g_string_append(many, "]}");
+    debug_check_error(qts, "debug-run", many->str, "watch at most 16 areas");
+    debug_check_error(qts, "debug-run", "{'watch': []}",
+                      "give at least one area to watch");
+    qtest_quit(qts);
+    unlink(bios);
+    unlink(bios_watch);
+}
+
 /* debug-trace logs the hits and lets the guest go on */
 static void test_debug_trace(void)
 {
@@ -2945,6 +3057,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/trace", test_debug_trace);
         qtest_add_func("/mcp/debug/history", test_debug_history);
         qtest_add_func("/mcp/debug/mask", test_debug_mask);
+        qtest_add_func("/mcp/debug/several", test_debug_several);
     }
     return g_test_run();
 }
