@@ -4968,10 +4968,30 @@ static const HpuxInsnWord hpux9_x11_calibrate[] = {
 };
 
 /*
+ * The X server that patch PHSS_8883 (DLD X server, November 1996) puts on
+ * HP-UX 9.05 counts like the one of 10.20, in memory at -34(sp), but the
+ * compiler gave it other registers: the bound 200000 is in r6 and the loop
+ * has a different shape. The first word is the same as in the 10.20 server.
+ * The X server of 9.07 (X11-SERV A.B9.07.1P, October 1996, which the C
+ * SoftBench CD installs) has the same loop.
+ */
+static const HpuxInsnWord hpux9_x11_calibrate_dld[] = {
+    { 0x00, 0x6bc03f99 },       /* stw   r0,-34(sp)           count = 0 */
+    { 0x04, 0x4bc93f99 },       /* ldw   -34(sp),r9 */
+    { 0x08, 0x88c9402a },       /* cmpb,>=,n r9,r6,done */
+    { 0x0c, 0x4bdc3f99 },       /* ldw   -34(sp),ret0 */
+    { 0x10, 0x37810002 },       /* ldo   1(ret0),r1 */
+    { 0x14, 0x6bc13f99 },       /* stw   r1,-34(sp)           count++ */
+    { 0x18, 0x4bd63f99 },       /* ldw   -34(sp),r22 */
+    { 0x1c, 0x80d65fdf },       /* cmpb,<,n r22,r6,loop */
+};
+
+/*
  * At the first insn of a TB: if it starts that counting, let
  * helper_hpux_x11_pace() make the round last long enough to count.
+ * Returns true if the words matched.
  */
-static void gen_hpux_x11_pace(DisasContext *ctx, CPUHPPAState *env,
+static bool gen_hpux_x11_pace(DisasContext *ctx, CPUHPPAState *env,
                               const HpuxInsnWord *words, int n)
 {
     vaddr pc = ctx->base.pc_next;
@@ -4982,12 +5002,13 @@ static void gen_hpux_x11_pace(DisasContext *ctx, CPUHPPAState *env,
         if (!translator_is_same_page(&ctx->base, addr) ||
             translator_ldl_end(env, &ctx->base, addr, mo_endian(ctx))
             != words[i].insn) {
-            return;
+            return false;
         }
     }
 
     trace_hppa_hpux_match("x11 calibration", pc);
     gen_helper_hpux_x11_pace(tcg_env);
+    return true;
 }
 
 /*
@@ -5117,8 +5138,12 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         }
         if (ctx->hpux_x11_pace && ctx->base.num_insns == 1) {
             if (insn == hpux_x11_calibrate[0].insn) {
-                gen_hpux_x11_pace(ctx, env, hpux_x11_calibrate,
-                                  ARRAY_SIZE(hpux_x11_calibrate));
+                /* the servers of 10.20 and of 9.05 with PHSS_8883 start alike */
+                if (!gen_hpux_x11_pace(ctx, env, hpux_x11_calibrate,
+                                       ARRAY_SIZE(hpux_x11_calibrate))) {
+                    gen_hpux_x11_pace(ctx, env, hpux9_x11_calibrate_dld,
+                                      ARRAY_SIZE(hpux9_x11_calibrate_dld));
+                }
             } else if (insn == hpux9_x11_calibrate[0].insn) {
                 gen_hpux_x11_pace(ctx, env, hpux9_x11_calibrate,
                                   ARRAY_SIZE(hpux9_x11_calibrate));
