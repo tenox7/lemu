@@ -1967,6 +1967,85 @@ static void test_debug_watch(void)
     unlink(bios);
 }
 
+/* debug-trace logs the hits and lets the guest go on */
+static void test_debug_trace(void)
+{
+    g_autofree char *bios = debug_bios_watch();
+    QTestState *qts;
+    QDict *ret, *e;
+    QList *list;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* arrivals at the write: ax counts up, the word follows it */
+    ret = debug_ok(qts, "debug-trace", "{'address': '0xf0008', 'count': 3,"
+                   " 'registers': ['eax'], 'memory': [{'address': 'ebx'}]}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 3);
+    g_assert(qdict_get_bool(ret, "running"));
+    g_assert(!qdict_haskey(ret, "instructions"));
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "entries")), ==, 3);
+    debug_summary_has(ret, "Traced arrivals at 0xf0008 for ");
+    debug_summary_has(ret, ": 3 hits, as many as asked for; the guest runs"
+                      " on.\n\nHits:\n"
+                      "#1 CPU 0 at 0xf0008: eax=0x1 [ebx]=0x00000000\n"
+                      "#2 CPU 0 at 0xf0008: eax=0x2 [ebx]=0x00000001\n"
+                      "#3 CPU 0 at 0xf0008: eax=0x3 [ebx]=0x00000002");
+    qobject_unref(ret);
+
+    /* what touches 0x1000: each instruction three times, listed once */
+    ret = debug_ok(qts, "debug-trace", "{'watch': {'address': '0x1000',"
+                   " 'length': 2, 'access': 'access'}, 'count': 6,"
+                   " 'list': 0}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 6);
+    g_assert(qdict_get_bool(ret, "running"));
+    list = qdict_get_qlist(ret, "instructions");
+    g_assert_cmpint(qlist_size(list), ==, 2);
+    e = qobject_to(QDict, qlist_peek(list));
+    g_assert_cmpstr(qdict_get_str(e, "pc"), ==, "0xf0008");
+    g_assert_cmpint(qdict_get_int(e, "count"), ==, 3);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "entries")), ==, 2);
+    debug_summary_has(ret, "Traced accesses to 0x1000 (2 bytes) for ");
+    debug_summary_has(ret, "\n\nBy instruction:\n"
+                      "       3 x 0x000f0008:");
+    debug_summary_has(ret, "\n       3 x 0x000f000a:");
+    debug_summary_has(ret, "\n\nHits (the first access by each"
+                      " instruction):\n#");
+    debug_summary_has(ret, " CPU 0 at 0xf0008 wrote to 0x1000 (now 0x");
+    debug_summary_has(ret, " CPU 0 at 0xf000a read 0x1000 (now 0x");
+    qobject_unref(ret);
+
+    /* an address and a watch: arrivals are not accesses */
+    ret = debug_ok(qts, "debug-trace", "{'address': '0xf000c',"
+                   " 'watch': {'address': '0x1000'}, 'count': 4}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 4);
+    list = qdict_get_qlist(ret, "instructions");
+    g_assert_cmpint(qlist_size(list), ==, 1);
+    e = qobject_to(QDict, qlist_peek(list));
+    g_assert_cmpint(qdict_get_int(e, "count"), ==, 2);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "entries")), ==, 4);
+    qobject_unref(ret);
+
+    /* nobody touches 0x2000 */
+    ret = debug_ok(qts, "debug-trace", "{'watch': {'address': '0x2000'},"
+                   " 'duration-ms': 200}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 0);
+    g_assert(qdict_get_bool(ret, "running"));
+    debug_summary_has(ret, " for 0.2 s: no hits; the guest runs on.");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-trace", "{}", "or both");
+    debug_check_error(qts, "debug-trace", "{'address': '0xf0008',"
+                      " 'registers': ['nope']}",
+                      "'nope' is not a register; the registers are pc,");
+    debug_check_error(qts, "debug-trace", "{'address': '0xf0008',"
+                      " 'count': 0}", "count must be 1 to 100000");
+    debug_check_error(qts, "debug-trace", "{'address': '0xf0008',"
+                      " 'list': 501}", "list must be 0 to 500");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 /*
  * A debug-run step that does not get to its address stops the steps,
  * and a debug-step that does all its steps lets them go on
@@ -2648,6 +2727,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/retry", test_debug_retry);
         qtest_add_func("/mcp/debug/registers", test_debug_registers);
         qtest_add_func("/mcp/debug/watch", test_debug_watch);
+        qtest_add_func("/mcp/debug/trace", test_debug_trace);
     }
     return g_test_run();
 }

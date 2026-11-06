@@ -1570,6 +1570,121 @@
   'if': 'CONFIG_TCG' }
 
 ##
+# @McpTraceEntry:
+#     One hit that @debug-trace lists.
+#
+# @hit: its number, counting from 1
+#
+# @cpu: the CPU
+#
+# @pc: the address it got to, or the instruction that touched the
+#     watched memory, in hex
+#
+# @watch: what it did to the watched memory, when that was the hit
+#
+# @value: the watched word after that, in hex
+#
+# @retry: true when the CPU may be back to run the instruction again,
+#     after it took an interruption there (see @McpDebugStop)
+#
+# @values: the registers and memory asked for, as text, in order
+#
+# Since: 11.2
+##
+{ 'struct': 'McpTraceEntry',
+  'data': { 'hit': 'int', 'cpu': 'int', 'pc': 'str',
+            '*watch': 'McpWatchHit', '*value': 'str', '*retry': 'bool',
+            '*values': [ 'str' ] },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpTraceInstruction:
+#     An instruction that touched the watched memory (@debug-trace).
+#
+# @pc: its address, in hex
+#
+# @count: how often it did
+#
+# @instruction: the instruction, as it was the first time
+#
+# Since: 11.2
+##
+{ 'struct': 'McpTraceInstruction',
+  'data': { 'pc': 'str', 'count': 'int', '*instruction': 'str' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpTrace:
+#     What @debug-trace returns.
+#
+# @hits: the hits it saw
+#
+# @ms: how long it traced, in milliseconds
+#
+# @running: the VM is running
+#
+# @instructions: when memory was watched, the instructions that
+#     touched it, most first
+#
+# @entries: the hits it lists
+#
+# Since: 11.2
+##
+{ 'struct': 'McpTrace',
+  'base': 'McpResult',
+  'data': { 'hits': 'int', 'ms': 'int', 'running': 'bool',
+            '*instructions': [ 'McpTraceInstruction' ],
+            'entries': [ 'McpTraceEntry' ] },
+  'if': 'CONFIG_TCG' }
+
+##
+# @debug-trace:
+#     Log each time a CPU gets to an address (a breakpoint) or touches
+#     watched memory, with the registers and memory asked for, and let
+#     the guest go on.  For watched memory it also counts which
+#     instructions touched it: use it to find what overwrites
+#     something.  Each hit stops the VM for a moment, so a busy
+#     address slows the guest down while it traces.  It ends after
+#     @count hits or @duration-ms, and the guest keeps running.
+#
+# @address: log arrivals here, written as for debug-run.  Give it,
+#     @watch, or both.
+#
+# @watch: log the accesses to this memory, with the instruction that
+#     did each one
+#
+# @count: stop after this many hits, up to 100000 (default: 1000)
+#
+# @list: list this many hits in full, up to 500; after them, only the
+#     first access to the watched memory by each new instruction
+#     (default: 20)
+#
+# @cpu: trace only this CPU (default: all)
+#
+# @registers: registers to log at each hit listed, up to 16, named as
+#     in a @McpDebugMemory address
+#
+# @memory: memory to log at each hit listed; @words is 1 unless given
+#
+# @duration-ms: trace for at most this long, at most 1500000, 25
+#     minutes (default: 10000)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# Since: 11.2
+##
+{ 'command': 'debug-trace',
+  'data': { '*address': 'str', '*watch': 'McpWatch', '*count': 'int',
+            '*list': 'int', '*cpu': 'int', '*registers': [ 'str' ],
+            '*memory': [ 'McpDebugMemory' ], '*duration-ms': 'int' },
+  'returns': 'McpTrace',
+  'features': [ 'mcp' ],
+  'coroutine': true,
+  'if': 'CONFIG_TCG' }
+
+##
 # @debug-step:
 #     Run one CPU for some instructions, one at a time, and show each
 #     one, then the next instruction and the registers.  The other

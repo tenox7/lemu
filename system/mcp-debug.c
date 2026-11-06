@@ -18,7 +18,9 @@
 #include "qemu/ctype.h"
 #include "qemu/cutils.h"
 #include "qemu/main-loop.h"
+#include "qemu/bswap.h"
 #include "qemu/rcu.h"
+#include "qemu/target-info.h"
 #include "qemu/timer.h"
 #include "system/address-spaces.h"
 #include "system/cpus.h"
@@ -505,7 +507,6 @@ typedef struct McpBreak {
     bool has_addr;
     uint64_t addr;
     int hits;                   /* CPUs there as the time ran out */
-    CPUState *at;
     bool has_watch;             /* the watched memory */
     uint64_t waddr;
     uint64_t wlen;
@@ -568,30 +569,35 @@ static void mcp_watch_clear_hit(CPUState *cpu, CPUWatchpoint *wp)
 }
 
 /*
- * How many CPUs touched the watched memory, with what the first of
- * them did in *@seen.  Their hits are cleared, as gdbstub does.
+ * Whether @cpu touched the watched memory, and what it did in *@seen.
+ * Its hit is cleared, as gdbstub does.
  */
+static bool mcp_watch_take(McpBreak *b, CPUState *cpu, McpWatchSeen *seen)
+{
+    CPUWatchpoint *wp = cpu->watchpoint_hit;
+
+    if (!b->has_watch || !wp || wp != mcp_watch_find(b, cpu)) {
+        return false;
+    }
+    seen->cpu = cpu;
+    seen->addr = wp->hitaddr;
+    seen->pc = wp->hitpc;
+    seen->write = wp->flags & BP_WATCHPOINT_HIT_WRITE;
+    mcp_watch_clear_hit(cpu, wp);
+    return true;
+}
+
+/* How many CPUs touched it, with what the first of them did */
 static int mcp_watch_hits(McpBreak *b, McpWatchSeen *seen)
 {
+    McpWatchSeen s;
     CPUState *cpu;
     int n = 0;
 
-    if (!b->has_watch) {
-        return 0;
-    }
     CPU_FOREACH(cpu) {
-        CPUWatchpoint *wp = cpu->watchpoint_hit;
-
-        if (!wp || wp != mcp_watch_find(b, cpu)) {
-            continue;
+        if (mcp_watch_take(b, cpu, &s) && !n++) {
+            *seen = s;
         }
-        if (!n++) {
-            seen->cpu = cpu;
-            seen->addr = wp->hitaddr;
-            seen->pc = wp->hitpc;
-            seen->write = wp->flags & BP_WATCHPOINT_HIT_WRITE;
-        }
-        mcp_watch_clear_hit(cpu, wp);
     }
     return n;
 }
@@ -624,8 +630,10 @@ static void mcp_debug_remove(McpBreak *b)
 /* CPUs at the address, or that touched the watched memory */
 static void mcp_debug_late_hits(McpBreak *b)
 {
+    CPUState *dummy;
+
     b->whits = mcp_watch_hits(b, &b->seen);
-    b->hits = b->has_addr ? mcp_debug_count_at(b->only, b->addr, &b->at) : 0;
+    b->hits = b->has_addr ? mcp_debug_count_at(b->only, b->addr, &dummy) : 0;
 }
 
 /*
@@ -1150,27 +1158,6 @@ static bool mcp_debug_retry(CPUState *cpu, uint64_t pc)
     return since <= RETRY_SOON;
 }
 
-/*
- * How many of the CPUs at the address may be back to run its
- * instruction again; *@retry tells whether @at is one of them.
- */
-static int mcp_debug_retries(McpBreak *b, CPUState *at, bool *retry)
-{
-    CPUState *cpu, *dummy;
-    int n = 0;
-
-    *retry = false;
-    CPU_FOREACH(cpu) {
-        if ((!b->only || cpu == b->only) &&
-            mcp_debug_count_at(cpu, b->addr, &dummy) &&
-            mcp_debug_retry(cpu, b->addr)) {
-            *retry |= cpu == at;
-            n++;
-        }
-    }
-    return n;
-}
-
 static void mcp_debug_set_cpu(McpDebugStop *res, CPUState *cpu)
 {
     res->has_cpu = true;
@@ -1207,6 +1194,186 @@ static void mcp_debug_what(GString *s, McpBreak *b)
     }
 }
 
+/* A debug-run or a debug-trace: what it waits for, and what it saw */
+typedef struct McpRun McpRun;
+struct McpRun {
+    McpBreak b;
+    QemuInputCtx *ctx;
+    int64_t limit;              /* the hits to wait for */
+    int64_t end;                /* QEMU_CLOCK_REALTIME, ms */
+    /* debug-trace: each hit, with the VM stopped there */
+    void (*log)(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
+                bool retry);
+    int64_t n_hits;
+    int64_t n_retries;
+    CPUState *at;               /* the last hit */
+    bool by_watch;
+    bool retry;
+    McpWatchSeen seen;
+    bool late;                  /* hits as the time ran out */
+    McpRunResult result;
+};
+
+static void mcp_run_hit(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
+                        bool retry)
+{
+    r->n_hits++;
+    r->n_retries += retry;
+    r->at = cpu;
+    r->by_watch = seen;
+    r->retry = retry;
+    if (seen) {
+        r->seen = *seen;
+    }
+    if (r->log) {
+        r->log(r, cpu, seen, retry);
+    }
+}
+
+/* The CPUs stopped at the address have got there */
+static void mcp_run_arrivals(McpRun *r)
+{
+    CPUState *cpu, *dummy;
+
+    if (!r->b.has_addr) {
+        return;
+    }
+    CPU_FOREACH(cpu) {
+        if ((!r->b.only || cpu == r->b.only) &&
+            mcp_debug_count_at(cpu, r->b.addr, &dummy)) {
+            mcp_run_hit(r, cpu, NULL, mcp_debug_retry(cpu, r->b.addr));
+        }
+    }
+}
+
+static void mcp_run_access(McpRun *r, CPUState *cpu)
+{
+    McpWatchSeen seen;
+
+    if (mcp_watch_take(&r->b, cpu, &seen)) {
+        mcp_run_hit(r, cpu, &seen, false);
+    }
+}
+
+/*
+ * Let the guest run until @r has seen its hits, the time runs out, or
+ * the VM stops for another reason.  The breakpoint and the watchpoint
+ * are taken away at the end, and the VM is left as it is.
+ */
+static void coroutine_fn mcp_run(McpRun *r)
+{
+    McpBreak *b = &r->b;
+    QemuInputCtx *ctx = r->ctx;
+    RunState paused = RUN_STATE_PAUSED;
+    McpStepResult step;
+    CPUState *cpu;
+    int64_t before;
+    bool inserted = false, interrupted;
+
+    r->result = RUN_TIMEOUT;
+    /* a CPU there when the running VM stops has got there */
+    if (runstate_is_running()) {
+        mcp_debug_outside(mcp_debug_stop, &paused);
+        if (!runstate_is_running()) {
+            mcp_run_arrivals(r);
+        }
+    }
+    while (r->n_hits < r->limit) {
+        if (runstate_is_running()) {
+            r->result = RUN_STOPPED;    /* someone else started it */
+            break;
+        }
+        if (!inserted) {
+            mcp_debug_insert(b);
+            inserted = true;
+        }
+        /* a CPU stopped at the address goes on to the next arrival */
+        step = STEP_DONE;
+        CPU_FOREACH(cpu) {
+            CPUState *dummy;
+
+            if (b->has_addr && (!b->only || cpu == b->only) &&
+                mcp_debug_count_at(cpu, b->addr, &dummy)) {
+                step = mcp_debug_step_one(ctx, cpu, &interrupted);
+                /* that instruction may touch the watched memory */
+                mcp_run_access(r, cpu);
+                if (step != STEP_DONE && step != STEP_HALTED) {
+                    break;
+                }
+            }
+        }
+        if (r->n_hits >= r->limit) {
+            break;
+        }
+        if (step == STEP_STOPPED || step == STEP_NOT_STARTED) {
+            r->result = RUN_STOPPED;
+            break;
+        }
+        if (ctx->cancelled) {
+            r->result = RUN_CANCELLED;
+            break;
+        }
+        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) >= r->end) {
+            break;
+        }
+
+        mcp_debug_outside(mcp_debug_start, NULL);
+        if (!mcp_debug_wait_stop(ctx, r->end, NULL)) {
+            r->result = ctx->cancelled ? RUN_CANCELLED : RUN_TIMEOUT;
+            mcp_debug_outside(mcp_debug_remove_running, b);
+            inserted = false;
+            if (b->hits || b->whits) {
+                /* got there as the time ran out; its stop comes next */
+                mcp_debug_wait_stop(ctx, qemu_clock_get_ms(QEMU_CLOCK_REALTIME)
+                                    + STEP_WAIT_MS, NULL);
+                r->late = true;
+                mcp_run_arrivals(r);
+                if (b->whits) {
+                    mcp_run_hit(r, b->seen.cpu, &b->seen, false);
+                }
+                r->result = r->n_hits >= r->limit ? RUN_REACHED : RUN_STOPPED;
+            }
+            break;
+        }
+        before = r->n_hits;
+        if (runstate_check(RUN_STATE_DEBUG)) {
+            mcp_run_arrivals(r);
+            CPU_FOREACH(cpu) {
+                mcp_run_access(r, cpu);
+            }
+        }
+        if (r->n_hits == before) {
+            r->at = NULL;
+            r->result = RUN_STOPPED;
+            break;
+        }
+    }
+    if (r->n_hits >= r->limit) {
+        r->result = RUN_REACHED;
+    }
+    if (inserted) {
+        mcp_debug_remove(b);
+    }
+}
+
+/* Where to stop or what to log: an address, watched memory, a CPU */
+static bool mcp_run_parse(McpRun *r, const char *address, bool has_cpu,
+                          int64_t cpu_index, Error **errp)
+{
+    if (address && !mcp_parse_address(address, "address", &r->b.addr,
+                                      errp)) {
+        return false;
+    }
+    r->b.has_addr = address;
+    if (has_cpu) {
+        r->b.only = mcp_debug_cpu(true, cpu_index, errp);
+        if (!r->b.only) {
+            return false;
+        }
+    }
+    return true;
+}
+
 McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
                                          McpWatch *watch,
                                          bool has_hits, int64_t hits,
@@ -1217,24 +1384,19 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
                                          int64_t timeout_ms, Error **errp)
 {
     g_auto(QemuInputCtx) local = { 0 };
-    QemuInputCtx *ctx = mcp_current_input_ctx();
     g_autoptr(GString) s = g_string_new(NULL);
     g_autofree McpMem *mem = NULL;
-    McpBreak b = { 0 };
-    McpWatchSeen seen = { 0 };
-    RunState paused = RUN_STATE_PAUSED;
-    McpRunResult result = RUN_TIMEOUT;
-    McpStepResult step;
+    McpRun r = { .ctx = mcp_current_input_ctx() };
+    McpBreak *b = &r.b;
+    McpWatchSeen *seen = &r.seen;
     McpDebugStop *res;
-    CPUState *at = NULL, *cpu;
-    int64_t end, n_hits = 0, n_retries = 0;
-    int n_mem = 0, k, w;
-    bool inserted = false, retry = false, interrupted, by_watch = false;
+    CPUState *at, *cpu;
+    int n_mem = 0;
     const char *hit_word;
 
-    if (!ctx) {
+    if (!r.ctx) {
         qemu_input_ctx_init(&local, NULL);
-        ctx = &local;
+        r.ctx = &local;
     }
     if (!address && !watch) {
         error_setg(errp, "give an address to stop at, memory to watch, or"
@@ -1248,173 +1410,65 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     }
     timeout_ms = has_timeout_ms ? timeout_ms : RUN_DEFAULT_MS;
     timeout_ms = MIN(MAX(timeout_ms, 0), mcp_wait_max_ms());
-    if (address && !mcp_parse_address(address, "address", &b.addr, errp)) {
+    if (!mcp_run_parse(&r, address, has_cpu, cpu_index, errp)) {
         return NULL;
     }
-    b.has_addr = address;
-    if (has_cpu) {
-        b.only = mcp_debug_cpu(true, cpu_index, errp);
-        if (!b.only) {
-            return NULL;
-        }
-    }
-    mem = mcp_parse_memory(b.only ? b.only : first_cpu, memory, &n_mem, errp);
+    mem = mcp_parse_memory(b->only ? b->only : first_cpu, memory, &n_mem,
+                           errp);
     if (!mem) {
         return NULL;
     }
-    if (watch && !mcp_parse_watch(watch, &b, &mem[n_mem], errp)) {
+    if (watch && !mcp_parse_watch(watch, b, &mem[n_mem], errp)) {
         return NULL;
     }
-    if (!mcp_debug_begin(ctx, errp)) {
+    if (!mcp_debug_begin(r.ctx, errp)) {
         return NULL;
     }
-    end = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + timeout_ms;
-    hit_word = !b.has_watch ? "arrival" : b.has_addr ? "hit" : "access";
+    r.end = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + timeout_ms;
+    r.limit = hits;
+    hit_word = !b->has_watch ? "arrival" : b->has_addr ? "hit" : "access";
 
-    /* a CPU there when the running VM stops has got there */
-    if (runstate_is_running()) {
-        mcp_debug_outside(mcp_debug_stop, &paused);
-        if (!runstate_is_running() && b.has_addr) {
-            n_hits = mcp_debug_count_at(b.only, b.addr, &at);
-            if (n_hits) {
-                n_retries += mcp_debug_retries(&b, at, &retry);
-            }
-        }
-    }
-    while (n_hits < hits) {
-        if (runstate_is_running()) {
-            result = RUN_STOPPED;       /* someone else started it */
-            break;
-        }
-        if (!inserted) {
-            mcp_debug_insert(&b);
-            inserted = true;
-        }
-        /* a CPU stopped at the address goes on to the next arrival */
-        step = STEP_DONE;
-        w = 0;
-        CPU_FOREACH(cpu) {
-            CPUState *dummy;
-
-            if (b.has_addr && (!b.only || cpu == b.only) &&
-                mcp_debug_count_at(cpu, b.addr, &dummy)) {
-                step = mcp_debug_step_one(ctx, cpu, &interrupted);
-                /* that instruction may touch the watched memory */
-                w += mcp_watch_hits(&b, &seen);
-                if (step != STEP_DONE && step != STEP_HALTED) {
-                    break;
-                }
-            }
-        }
-        if (w) {
-            n_hits += w;
-            at = seen.cpu;
-            by_watch = true;
-            retry = false;
-            if (n_hits >= hits) {
-                break;
-            }
-        }
-        if (step == STEP_STOPPED || step == STEP_NOT_STARTED) {
-            result = RUN_STOPPED;
-            break;
-        }
-        if (ctx->cancelled) {
-            result = RUN_CANCELLED;
-            break;
-        }
-        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) >= end) {
-            break;
-        }
-
-        mcp_debug_outside(mcp_debug_start, NULL);
-        if (!mcp_debug_wait_stop(ctx, end, NULL)) {
-            result = ctx->cancelled ? RUN_CANCELLED : RUN_TIMEOUT;
-            mcp_debug_outside(mcp_debug_remove_running, &b);
-            inserted = false;
-            if (b.hits || b.whits) {
-                /* got there as the time ran out; its stop comes next */
-                n_hits += b.hits + b.whits;
-                by_watch = b.whits;
-                if (by_watch) {
-                    at = b.seen.cpu;
-                    seen = b.seen;
-                    retry = false;
-                } else {
-                    at = b.at;
-                    retry = mcp_debug_retry(at, b.addr);
-                    n_retries += retry;
-                }
-                result = n_hits >= hits ? RUN_REACHED : RUN_STOPPED;
-                mcp_debug_wait_stop(ctx, qemu_clock_get_ms(QEMU_CLOCK_REALTIME)
-                                    + STEP_WAIT_MS, NULL);
-            }
-            break;
-        }
-        k = b.has_addr && runstate_check(RUN_STATE_DEBUG) ?
-            mcp_debug_count_at(b.only, b.addr, &at) : 0;
-        w = runstate_check(RUN_STATE_DEBUG) ? mcp_watch_hits(&b, &seen) : 0;
-        if (!k && !w) {
-            at = NULL;
-            result = RUN_STOPPED;
-            break;
-        }
-        retry = false;
-        if (k) {
-            n_retries += mcp_debug_retries(&b, at, &retry);
-        }
-        by_watch = w;
-        if (by_watch) {
-            at = seen.cpu;
-            retry = false;
-        }
-        n_hits += k + w;
-    }
-    if (n_hits >= hits) {
-        result = RUN_REACHED;
-    }
-    if (inserted) {
-        mcp_debug_remove(&b);
-    }
+    mcp_run(&r);
+    at = r.at;
     /* the time ran out or the call was cancelled: the guest goes on */
-    if ((result == RUN_TIMEOUT || result == RUN_CANCELLED) &&
+    if ((r.result == RUN_TIMEOUT || r.result == RUN_CANCELLED) &&
         !runstate_is_running()) {
         mcp_debug_outside(mcp_debug_start, NULL);
     }
     mcp_debug_end();
-    if (result == RUN_CANCELLED) {
+    if (r.result == RUN_CANCELLED) {
         error_setg(errp, "cancelled");
         return NULL;
     }
 
     res = g_new0(McpDebugStop, 1);
-    res->reached = result == RUN_REACHED;
+    res->reached = r.result == RUN_REACHED;
     res->has_hits = true;
-    res->hits = n_hits;
+    res->hits = r.n_hits;
     if (at) {
         mcp_debug_set_cpu(res, at);
     }
     res->running = runstate_is_running();
-    if (at && retry) {
+    if (at && r.retry) {
         res->has_retry = true;
         res->retry = true;
     }
-    if (at && by_watch) {
+    if (at && r.by_watch) {
         res->watch = g_new0(McpWatchHit, 1);
-        res->watch->address = g_strdup_printf("0x%" PRIx64, seen.addr);
-        res->watch->access = g_strdup(seen.write ? "write" : "read");
-        res->watch->pc = g_strdup_printf("0x%" PRIx64, seen.pc);
+        res->watch->address = g_strdup_printf("0x%" PRIx64, seen->addr);
+        res->watch->access = g_strdup(seen->write ? "write" : "read");
+        res->watch->pc = g_strdup_printf("0x%" PRIx64, seen->pc);
     }
-    switch (result) {
+    switch (r.result) {
     case RUN_REACHED:
-        if (by_watch) {
-            g_autofree char *insn = mcp_debug_insn(at, seen.pc);
+        if (r.by_watch) {
+            g_autofree char *insn = mcp_debug_insn(at, seen->pc);
 
             g_string_printf(s, "CPU %d %s 0x%" PRIx64, at->cpu_index,
-                            seen.write ? "wrote to" : "read", seen.addr);
+                            seen->write ? "wrote to" : "read", seen->addr);
             if (hits > 1) {
                 g_string_append_printf(s, " (%s %" PRId64 ")", hit_word,
-                                       n_hits);
+                                       r.n_hits);
             }
             g_string_append_printf(s, "; the VM is stopped after the"
                                    " instruction that did it:\n%s",
@@ -1422,31 +1476,32 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
             break;
         }
         g_string_printf(s, "CPU %d reached 0x%" PRIx64, at->cpu_index,
-                        b.addr);
+                        b->addr);
         if (hits > 1) {
-            g_string_append_printf(s, " (%s %" PRId64 ")", hit_word, n_hits);
+            g_string_append_printf(s, " (%s %" PRId64 ")", hit_word,
+                                   r.n_hits);
         }
         g_string_append(s, "; the VM is stopped");
-        if (retry) {
+        if (r.retry) {
             g_string_append(s, ". This may be the CPU coming back to run"
                             " the instruction again: when it went on from"
                             " here, the instruction took an interruption"
                             " first (such as a TLB miss). Run debug-run"
                             " again to go on");
         }
-        if (hits > 1 && n_retries) {
+        if (hits > 1 && r.n_retries) {
             g_string_append_printf(s, " (%" PRId64 " of the arrivals came"
                                    " right after an interruption there)",
-                                   n_retries);
+                                   r.n_retries);
         }
         break;
     case RUN_TIMEOUT:
         g_string_assign(s, "no CPU ");
-        mcp_debug_what(s, &b);
+        mcp_debug_what(s, b);
         g_string_append_printf(s, " in %.1f s", timeout_ms / 1000.0);
         if (hits > 1) {
             g_string_append_printf(s, " (%" PRId64 " of %" PRId64 " %ss)",
-                                   n_hits, hits, hit_word);
+                                   r.n_hits, hits, hit_word);
         }
         g_string_append(s, "; the VM keeps running");
         break;
@@ -1455,9 +1510,9 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
             g_string_printf(s, "CPU %d %s 0x%" PRIx64 " as the time ran out"
                             " (%s %" PRId64 " of %" PRId64 "); the VM is"
                             " stopped", at->cpu_index,
-                            by_watch ? (seen.write ? "wrote to" : "read") :
-                            "reached", by_watch ? seen.addr : b.addr,
-                            hit_word, n_hits, hits);
+                            r.by_watch ? (seen->write ? "wrote to" : "read") :
+                            "reached", r.by_watch ? seen->addr : b->addr,
+                            hit_word, r.n_hits, hits);
         } else {
             if (res->running) {
                 g_string_assign(s, "something else started the VM");
@@ -1466,21 +1521,417 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
                                 RunState_str(runstate_get()));
             }
             g_string_append(s, " before a CPU ");
-            mcp_debug_what(s, &b);
+            mcp_debug_what(s, b);
         }
         break;
     default:
         g_assert_not_reached();
     }
     if (!res->running) {
-        cpu = at ? at : b.only ? b.only : first_cpu;
+        cpu = at ? at : b->only ? b->only : first_cpu;
         if (!at) {
             g_string_append_printf(s, "; CPU %d:", cpu->cpu_index);
         }
         /* and the watched memory, after the memory asked for */
-        mcp_debug_show(s, cpu, mem, n_mem + b.has_watch);
+        mcp_debug_show(s, cpu, mem, n_mem + b->has_watch);
     }
     res->summary = g_strdup(s->str);
+    return res;
+}
+
+#define TRACE_COUNT             1000
+#define TRACE_COUNT_MAX         100000
+#define TRACE_LIST              20
+#define TRACE_LIST_MAX          500
+#define TRACE_INSNS_MAX         100
+#define TRACE_REGS_MAX          16
+#define TRACE_DEFAULT_MS        10000
+
+/* @words 32-bit words at @addr, in hex, in the order hmp's x shows */
+static char *mcp_read_words(CPUState *cpu, uint64_t addr, int words,
+                            bool physical)
+{
+    g_autofree uint8_t *buf = g_malloc(words * 4);
+    GString *s;
+    bool ok;
+    int i;
+
+    if (physical) {
+        ok = address_space_read(cpu->as, addr, MEMTXATTRS_UNSPECIFIED, buf,
+                                words * 4) == MEMTX_OK;
+    } else {
+        ok = cpu_memory_rw_debug(cpu, addr, buf, words * 4, false) == 0;
+    }
+    if (!ok) {
+        return NULL;
+    }
+    s = g_string_new(NULL);
+    for (i = 0; i < words; i++) {
+        uint32_t v = target_big_endian() ? ldl_be_p(buf + 4 * i)
+                                         : ldl_le_p(buf + 4 * i);
+
+        g_string_append_printf(s, "%s0x%08" PRIx32, i ? " " : "", v);
+    }
+    return g_string_free(s, false);
+}
+
+/* Memory for a trace line: [sp+4]=0x00001000, or [r26]="text" */
+static char *mcp_trace_memory(CPUState *cpu, McpMem *m)
+{
+    g_autofree char *v = NULL;
+    const char *bad = NULL;
+    const char *phys = m->physical ? ", physical" : "";
+    uint64_t addr;
+
+    if (!mcp_mem_address(cpu, m, &addr, &bad)) {
+        return g_strdup_printf("[%s%s]=? (CPU %d has no integer register"
+                               " %s)", m->text, phys, cpu->cpu_index, bad);
+    }
+    if (!m->physical && !mcp_debug_mapped(cpu, addr)) {
+        return g_strdup_printf("[%s]=not mapped", m->text);
+    }
+    v = m->string ? mcp_read_string(cpu, addr, m->physical)
+                  : mcp_read_words(cpu, addr, m->words, m->physical);
+    return g_strdup_printf("[%s%s]=%s", m->text, phys,
+                           v ? v : "? (no RAM or ROM there)");
+}
+
+/* An instruction that touched the watched memory, and how often */
+typedef struct McpTraceCount {
+    uint64_t pc;
+    int64_t count;
+    char *insn;                 /* as it was the first time */
+} McpTraceCount;
+
+static void mcp_trace_count_free(gpointer p)
+{
+    McpTraceCount *c = p;
+
+    g_free(c->insn);
+    g_free(c);
+}
+
+static gint mcp_trace_count_cmp(gconstpointer a, gconstpointer b)
+{
+    const McpTraceCount *x = *(McpTraceCount *const *)a;
+    const McpTraceCount *y = *(McpTraceCount *const *)b;
+
+    if (x->count != y->count) {
+        return x->count > y->count ? -1 : 1;
+    }
+    return x->pc < y->pc ? -1 : x->pc > y->pc;
+}
+
+typedef struct McpTracer {
+    McpRun r;
+    McpMem *mem;
+    int n_mem;
+    strList *regs;
+    int64_t list;               /* hits to list in full */
+    GString *text;              /* the hits listed */
+    McpTraceEntryList *entries;
+    McpTraceEntryList **tail;
+    int64_t n_listed;
+    GHashTable *insns;          /* McpTraceCount by pc */
+    int64_t n_other;            /* by instructions past TRACE_INSNS_MAX */
+} McpTracer;
+
+static void mcp_trace_log(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
+                          bool retry)
+{
+    McpTracer *t = container_of(r, McpTracer, r);
+    uint64_t pc = seen ? seen->pc : r->b.addr;
+    McpTraceCount *c = NULL;
+    McpTraceEntry *e;
+    strList **vtail, *l;
+    bool first = false;
+    int i;
+
+    /* which instructions touch the watched memory */
+    if (seen) {
+        c = g_hash_table_lookup(t->insns, &pc);
+        if (!c && g_hash_table_size(t->insns) < TRACE_INSNS_MAX) {
+            c = g_new0(McpTraceCount, 1);
+            c->pc = pc;
+            c->insn = mcp_debug_insn(cpu, pc);
+            if (c->insn) {
+                g_strchomp(c->insn);
+            }
+            g_hash_table_insert(t->insns, &c->pc, c);
+            first = true;
+        }
+        if (c) {
+            c->count++;
+        } else {
+            t->n_other++;
+        }
+    }
+    if (t->n_listed >= t->list && !first) {
+        return;
+    }
+    t->n_listed++;
+
+    e = g_new0(McpTraceEntry, 1);
+    e->hit = r->n_hits;
+    e->cpu = cpu->cpu_index;
+    e->pc = g_strdup_printf("0x%" PRIx64, pc);
+    g_string_append_printf(t->text, "#%" PRId64 " CPU %d at %s", e->hit,
+                           cpu->cpu_index, e->pc);
+    if (seen) {
+        e->watch = g_new0(McpWatchHit, 1);
+        e->watch->address = g_strdup_printf("0x%" PRIx64, seen->addr);
+        e->watch->access = g_strdup(seen->write ? "write" : "read");
+        e->watch->pc = g_strdup(e->pc);
+        e->value = mcp_read_words(cpu, seen->addr & ~3ULL, 1, false);
+        g_string_append_printf(t->text, " %s %s",
+                               seen->write ? "wrote to" : "read",
+                               e->watch->address);
+        if (e->value) {
+            g_string_append_printf(t->text, " (now %s)", e->value);
+        }
+    }
+    if (retry) {
+        e->has_retry = true;
+        e->retry = true;
+        g_string_append(t->text, " (again, after an interruption)");
+    }
+    vtail = &e->values;
+    for (l = t->regs; l; l = l->next) {
+        uint64_t v;
+
+        QAPI_LIST_APPEND(vtail, mcp_reg_value(cpu, l->value, &v)
+                         ? g_strdup_printf("%s=0x%" PRIx64, l->value, v)
+                         : g_strdup_printf("%s=?", l->value));
+    }
+    for (i = 0; i < t->n_mem; i++) {
+        QAPI_LIST_APPEND(vtail, mcp_trace_memory(cpu, &t->mem[i]));
+    }
+    e->has_values = e->values;
+    for (l = e->values; l; l = l->next) {
+        g_string_append_printf(t->text, "%s %s", l == e->values ? ":" : "",
+                               l->value);
+    }
+    g_string_append_c(t->text, '\n');
+    QAPI_LIST_APPEND(t->tail, e);
+}
+
+/* "arrivals at 0x1000 and writes to 0x2000 (4 bytes)" */
+static void mcp_trace_what(GString *s, McpBreak *b)
+{
+    static const char *const what[] = {
+        [BP_MEM_WRITE] = "writes to",
+        [BP_MEM_READ] = "reads of",
+        [BP_MEM_ACCESS] = "accesses to",
+    };
+
+    if (b->has_addr) {
+        g_string_append_printf(s, "arrivals at 0x%" PRIx64, b->addr);
+    }
+    if (b->has_addr && b->has_watch) {
+        g_string_append(s, " and ");
+    }
+    if (b->has_watch) {
+        g_string_append_printf(s, "%s 0x%" PRIx64 " (%" PRIu64 " byte%s)",
+                               what[b->wflags], b->waddr, b->wlen,
+                               b->wlen == 1 ? "" : "s");
+    }
+}
+
+McpTrace *coroutine_fn qmp_debug_trace(const char *address, McpWatch *watch,
+                                       bool has_count, int64_t count,
+                                       bool has_list, int64_t list,
+                                       bool has_cpu, int64_t cpu_index,
+                                       bool has_registers,
+                                       strList *registers,
+                                       bool has_memory,
+                                       McpDebugMemoryList *memory,
+                                       bool has_duration_ms,
+                                       int64_t duration_ms, Error **errp)
+{
+    g_auto(QemuInputCtx) local = { 0 };
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GString) text = g_string_new(NULL);
+    g_autoptr(GHashTable) insns = g_hash_table_new_full(g_int64_hash,
+                                                        g_int64_equal, NULL,
+                                                        mcp_trace_count_free);
+    g_autoptr(GPtrArray) sorted = NULL;
+    g_autofree McpMem *mem = NULL;
+    McpTracer t = {
+        .r.ctx = mcp_current_input_ctx(),
+        .r.log = mcp_trace_log,
+        .text = text,
+        .insns = insns,
+    };
+    McpBreak *b = &t.r.b;
+    McpMem shown = { 0 };       /* each line shows the watched word */
+    McpTraceInstructionList **itail;
+    McpDebugMemoryList *ml;
+    McpTrace *res;
+    CPUState *cpu;
+    strList *rl;
+    int64_t start, ms;
+    unsigned int i;
+    int n;
+
+    if (!t.r.ctx) {
+        qemu_input_ctx_init(&local, NULL);
+        t.r.ctx = &local;
+    }
+    if (!address && !watch) {
+        error_setg(errp, "give an address to trace, memory to watch, or"
+                   " both");
+        return NULL;
+    }
+    count = has_count ? count : TRACE_COUNT;
+    if (count < 1 || count > TRACE_COUNT_MAX) {
+        error_setg(errp, "count must be 1 to %d", TRACE_COUNT_MAX);
+        return NULL;
+    }
+    list = has_list ? list : TRACE_LIST;
+    if (list < 0 || list > TRACE_LIST_MAX) {
+        error_setg(errp, "list must be 0 to %d", TRACE_LIST_MAX);
+        return NULL;
+    }
+    duration_ms = has_duration_ms ? duration_ms : TRACE_DEFAULT_MS;
+    duration_ms = MIN(MAX(duration_ms, 0), mcp_wait_max_ms());
+    if (!mcp_run_parse(&t.r, address, has_cpu, cpu_index, errp)) {
+        return NULL;
+    }
+    cpu = b->only ? b->only : first_cpu;
+    if (!cpu) {
+        error_setg(errp, "this VM has no CPU");
+        return NULL;
+    }
+    for (rl = registers, n = 0; rl; rl = rl->next) {
+        if (++n > TRACE_REGS_MAX) {
+            error_setg(errp, "ask for at most %d registers", TRACE_REGS_MAX);
+            return NULL;
+        }
+        if (g_ascii_strcasecmp(rl->value, "pc") &&
+            mcp_reg_number(cpu, rl->value) < 0) {
+            g_autofree char *names = mcp_reg_names(cpu);
+
+            error_setg(errp, "'%s' is not a register; the registers are %s",
+                       rl->value, names);
+            return NULL;
+        }
+    }
+    mem = mcp_parse_memory(cpu, memory, &t.n_mem, errp);
+    if (!mem) {
+        return NULL;
+    }
+    /* one word each, unless asked */
+    for (ml = memory, n = 0; ml; ml = ml->next, n++) {
+        if (!ml->value->has_words) {
+            mem[n].words = 1;
+        }
+    }
+    if (watch && !mcp_parse_watch(watch, b, &shown, errp)) {
+        return NULL;
+    }
+    t.mem = mem;
+    t.regs = registers;
+    t.list = list;
+    t.tail = &t.entries;
+    t.r.limit = count;
+    if (!mcp_debug_begin(t.r.ctx, errp)) {
+        return NULL;
+    }
+    start = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    t.r.end = start + duration_ms;
+
+    mcp_run(&t.r);
+    ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - start;
+    /* the guest goes on, unless something else stopped it */
+    if (!runstate_is_running() &&
+        (t.r.result != RUN_STOPPED || t.r.late)) {
+        mcp_debug_outside(mcp_debug_start, NULL);
+    }
+    mcp_debug_end();
+    if (t.r.result == RUN_CANCELLED) {
+        qapi_free_McpTraceEntryList(t.entries);
+        error_setg(errp, "cancelled");
+        return NULL;
+    }
+
+    res = g_new0(McpTrace, 1);
+    res->hits = t.r.n_hits;
+    res->ms = ms;
+    res->running = runstate_is_running();
+    res->entries = t.entries;
+    g_string_assign(s, "Traced ");
+    mcp_trace_what(s, b);
+    g_string_append_printf(s, " for %.1f s: ", ms / 1000.0);
+    if (t.r.n_hits) {
+        g_string_append_printf(s, "%" PRId64 " hit%s", t.r.n_hits,
+                               t.r.n_hits == 1 ? "" : "s");
+    } else {
+        g_string_append(s, "no hits");
+    }
+    if (t.r.result == RUN_REACHED) {
+        g_string_append(s, ", as many as asked for");
+    }
+    if (t.r.n_retries) {
+        g_string_append_printf(s, " (%" PRId64 " right after an interruption"
+                               " there)", t.r.n_retries);
+    }
+    if (res->running) {
+        g_string_append(s, "; the guest runs on.");
+    } else {
+        g_string_append_printf(s, "; then the VM stopped (%s), and it stays"
+                               " stopped.", RunState_str(runstate_get()));
+    }
+
+    if (b->has_watch) {
+        GHashTableIter it;
+        gpointer v;
+
+        sorted = g_ptr_array_new();
+        g_hash_table_iter_init(&it, insns);
+        while (g_hash_table_iter_next(&it, NULL, &v)) {
+            g_ptr_array_add(sorted, v);
+        }
+        g_ptr_array_sort(sorted, mcp_trace_count_cmp);
+        res->has_instructions = true;
+        itail = &res->instructions;
+        if (sorted->len) {
+            g_string_append(s, "\n\nBy instruction:\n");
+        }
+        for (i = 0; i < sorted->len; i++) {
+            McpTraceCount *c = g_ptr_array_index(sorted, i);
+            McpTraceInstruction *in = g_new0(McpTraceInstruction, 1);
+
+            in->pc = g_strdup_printf("0x%" PRIx64, c->pc);
+            in->count = c->count;
+            in->instruction = g_strdup(c->insn);
+            QAPI_LIST_APPEND(itail, in);
+            g_string_append_printf(s, "%8" PRId64 " x %s\n", c->count,
+                                   c->insn ? c->insn : in->pc);
+        }
+        if (t.n_other) {
+            g_string_append_printf(s, "%8" PRId64 " x other instructions"
+                                   " (only %d are told apart)\n", t.n_other,
+                                   TRACE_INSNS_MAX);
+        }
+    }
+    if (t.n_listed) {
+        g_string_append(s, s->str[s->len - 1] == '\n' ? "\n" : "\n\n");
+        if (t.n_listed == t.r.n_hits) {
+            g_string_append(s, "Hits:\n");
+        } else if (b->has_watch && !list) {
+            g_string_append(s, "Hits (the first access by each"
+                            " instruction):\n");
+        } else if (b->has_watch) {
+            g_string_append_printf(s, "Hits (the first %" PRId64 ", then the"
+                                   " first access by each new"
+                                   " instruction):\n", list);
+        } else {
+            g_string_append_printf(s, "Hits (the first %" PRId64 "):\n",
+                                   list);
+        }
+        g_string_append(s, text->str);
+    }
+    res->summary = g_strdup(g_strchomp(s->str));
     return res;
 }
 

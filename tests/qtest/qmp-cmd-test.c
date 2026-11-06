@@ -66,6 +66,7 @@ static int query_error_class(const char *cmd)
         /* need TCG and a CPU, and the test runs with -accel qtest */
         { "debug-run", ERROR_CLASS_GENERIC_ERROR },
         { "debug-step", ERROR_CLASS_GENERIC_ERROR },
+        { "debug-trace", ERROR_CLASS_GENERIC_ERROR },
         { "debug-profile", ERROR_CLASS_GENERIC_ERROR },
         { NULL, -1 }
     };

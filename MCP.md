@@ -64,6 +64,7 @@ only when exactly one VM is running and you started it.
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
 | `debug-run` | Run until a CPU gets to an address (a breakpoint) or touches watched memory, then show the instruction, the registers and memory |
+| `debug-trace` | Log each arrival at an address or access to watched memory, with registers and memory, while the guest runs on |
 | `debug-step` | Run one CPU an instruction at a time, and show each one |
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
@@ -125,6 +126,7 @@ Use these:
 | Save memory to a file | `hmp` `pmemsave ADDR SIZE FILE` |
 | Stop when the guest gets to an address (a breakpoint) | `debug-run` |
 | Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
+| See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |
@@ -193,7 +195,15 @@ Use these:
   `length`, and `write`, `read` or `access`) stops right after a CPU
   touches it, and shows the instruction that did it. With an
   `address` too, whichever comes first stops it. Only CPUs are
-  watched, not devices that write memory themselves (DMA).
+  watched, not devices that write memory themselves (DMA). On hppa,
+  give the whole address, space and offset, as for other memory.
+- **Every hit, with the guest running on:** `debug-trace` logs each
+  arrival at `address`, or each access to `watch`, with the
+  `registers` and `memory` you ask for, until `count` hits or
+  `duration-ms`. For watched memory it counts which instructions
+  touched it, and lists the first access by each one, so a rare
+  writer behind a busy loop still shows. Each hit stops the VM for a
+  moment: a busy address slows the guest while it traces.
 - **TLB misses and page faults:** when the CPU has no mapping for an
   address right now, the debug tools say so instead of showing the
   instruction or the memory there. Kernels are often mapped 1:1: ask
@@ -206,8 +216,8 @@ Use these:
   too, so the same address in two processes is two entries.
 - **When you need GDB after all,** for example to trace many addresses
   at once: `hmp` `gdbserver tcp:127.0.0.1:1234` turns the GDB stub on in
-  a running VM, with no restart. Don't use `debug-run` or `debug-step`
-  while a GDB client is attached.
+  a running VM, with no restart. Don't use the debug tools while a GDB
+  client is attached.
 
 - **Copying files** needs nothing in the guest. `media` `insert` with
   `files` makes a disc for a CD-ROM drive, or a 1.44 MB floppy for
