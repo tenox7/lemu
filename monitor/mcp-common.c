@@ -46,6 +46,35 @@ const char mcp_instructions[] =
     "- VMs not started by you belong to the user. Touch them only when"
     " the user asked. Never stop or reset them.\n";
 
+const char mcp_tool_hmp[] =
+    "{\"name\":\"hmp\","
+    "\"description\":\"Run one HMP (human monitor) command line and return"
+    " its text output. Use it instead of a script on the monitor socket."
+    " Examples: 'info registers'; 'xp /16wx 0x1000' reads physical memory,"
+    " 'x /16wx ADDR' virtual memory; 'x /10i ADDR' disassembles; 'stop'"
+    " and 'cont' pause and resume the CPUs; 'pmemsave ADDR SIZE FILE'"
+    " saves memory to a file; 'help' lists the rest. A VM built without"
+    " HMP answers with an error.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"command\":{\"type\":\"string\","
+    "\"description\":\"the command line, for example 'info registers'\"}},"
+    "\"required\":[\"command\"]},"
+    "\"annotations\":{\"destructiveHint\":true,\"idempotentHint\":false,"
+    "\"openWorldHint\":false}}";
+
+const char mcp_tool_qmp[] =
+    "{\"name\":\"qmp\","
+    "\"description\":\"Run any QMP command and return its JSON result, for"
+    " example query-status or query-block. For memory, registers and"
+    " disassembly the hmp tool is simpler.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"execute\":{\"type\":\"string\",\"description\":\"the QMP command\"},"
+    "\"arguments\":{\"type\":\"object\","
+    "\"description\":\"its arguments\"}},"
+    "\"required\":[\"execute\"]},"
+    "\"annotations\":{\"destructiveHint\":true,\"idempotentHint\":false,"
+    "\"openWorldHint\":false}}";
+
 bool mcp_protocol_supported(const char *v)
 {
     int i;

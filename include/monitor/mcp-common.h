@@ -22,6 +22,13 @@
 /* The server instructions sent with the initialize reply */
 extern const char mcp_instructions[];
 
+/*
+ * The hand-written 'hmp' and 'qmp' tools.  The bridge lists them too,
+ * so that an agent has them even when no VM was up when it started.
+ */
+extern const char mcp_tool_hmp[];
+extern const char mcp_tool_qmp[];
+
 bool mcp_protocol_supported(const char *v);
 QList *mcp_protocol_list(void);
 

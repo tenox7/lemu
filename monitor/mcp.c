@@ -4,7 +4,8 @@
  * The third monitor type, next to HMP and QMP.  It speaks JSON-RPC 2.0,
  * one message per line, as MCP's stdio transport does.  Tools are QAPI
  * commands with the feature 'mcp' (see qapi/mcp.json and the generated
- * qapi-mcp-tools.c), plus the hand-written 'hmp' and 'qmp' tools.
+ * qapi-mcp-tools.c), plus the hand-written 'hmp' and 'qmp' tools (in
+ * mcp-common.c, which the lemu-mcp bridge shares).
  *
  * Each tools/call runs in its own coroutine, so a call that waits for
  * the screen does not block the guest or other calls.  Cancelling a
@@ -38,30 +39,6 @@
 
 #define MCP_EVENTS_MAX          32
 #define MCP_PROGRESS_MS         5000
-
-static const char mcp_tool_qmp[] =
-    "{\"name\":\"qmp\","
-    "\"description\":\"Run any QMP command and return its JSON result.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-    "\"execute\":{\"type\":\"string\",\"description\":\"the QMP command\"},"
-    "\"arguments\":{\"type\":\"object\","
-    "\"description\":\"its arguments\"}},"
-    "\"required\":[\"execute\"]},"
-    "\"annotations\":{\"destructiveHint\":true,\"idempotentHint\":false,"
-    "\"openWorldHint\":false}}";
-
-#ifdef CONFIG_HMP
-static const char mcp_tool_hmp[] =
-    "{\"name\":\"hmp\","
-    "\"description\":\"Run one HMP (human monitor) command line and return"
-    " its text output, for example 'info registers'.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-    "\"command\":{\"type\":\"string\","
-    "\"description\":\"the command line\"}},"
-    "\"required\":[\"command\"]},"
-    "\"annotations\":{\"destructiveHint\":true,\"idempotentHint\":false,"
-    "\"openWorldHint\":false}}";
-#endif
 
 typedef struct McpCall {
     MonitorMCP *mon;

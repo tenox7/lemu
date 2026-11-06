@@ -613,10 +613,34 @@ static void tool_add_vm_arg(QDict *tool)
     }
 }
 
+static bool tools_have(QList *list, const char *name)
+{
+    const QListEntry *e;
+
+    QLIST_FOREACH_ENTRY(list, e) {
+        QDict *tool = qobject_to(QDict, qlist_entry_obj(e));
+
+        if (tool && !g_strcmp0(qdict_get_try_str(tool, "name"), name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static QList *tools_finish(QList *list)
 {
     const QListEntry *e;
 
+    /*
+     * The VMs add hmp and qmp themselves, but the list must have them
+     * also when no VM was up yet, or when the first VM has no HMP.
+     */
+    if (!tools_have(list, "hmp")) {
+        qlist_append_obj(list, qobject_from_json(mcp_tool_hmp, &error_abort));
+    }
+    if (!tools_have(list, "qmp")) {
+        qlist_append_obj(list, qobject_from_json(mcp_tool_qmp, &error_abort));
+    }
     QLIST_FOREACH_ENTRY(list, e) {
         QDict *tool = qobject_to(QDict, qlist_entry_obj(e));
 
