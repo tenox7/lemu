@@ -54,6 +54,7 @@ only when exactly one VM is running and you started it.
 | `mouse-move`, `mouse-click`, `mouse-drag`, `mouse-button`, `mouse-wheel` | Use the mouse, also in guests with a relative mouse |
 | `pointer-locate` | Find where the guest's mouse pointer really is |
 | `serial-read`, `serial-write`, `serial-expect` | Read, write and wait for serial port text |
+| `serial-run` | Run a command in a shell on a serial port: get its output and exit status in one call |
 | `media` | List, insert or eject CDs and floppies |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
@@ -70,9 +71,9 @@ The server sends these rules to every agent that connects:
   text. For long installs, call it in a loop.
 - **No scripts.** Don't write Python or socket scripts to drive a VM.
   The tools do it; see [Without Python](#without-python).
-- **Graphics console:** to read text from a Unix guest whose console is
-  a graphics screen, log in on a serial port (start a getty there) and
-  use `serial-expect`.
+- **Commands in a Unix guest:** log in on a serial port and use
+  `serial-run`. It returns the output and the exit status. If the
+  console is a graphics screen, start a getty on a serial port first.
 - **Check the focus before typing.** Keys go to the focused window.
 - **Old dialogs:** use Tab and Shift+Tab, then Space or Enter.
 - **Mouse:** most old guests have a relative mouse. If a click misses,
@@ -97,6 +98,7 @@ Use these:
 | Save memory to a file | `hmp` `pmemsave ADDR SIZE FILE` |
 | Pause and go on | `vm-power` `pause` and `resume`, or `hmp` `stop` and `cont` |
 | Any other monitor command | `hmp` (`help` lists them) or `qmp` |
+| Run a command in the guest, get its output and exit status | `serial-run` (log in on a serial port first) |
 | Type into a serial console | `serial-write` (old Unix wants `\r`) |
 | Wait for serial text | `serial-expect` |
 | Read what a serial port printed | `serial-read` |
@@ -115,9 +117,8 @@ Use these:
 - **Files and logs on the host:** `xxd`, `od`, `grep`, `jq` and `cmp` do
   the job.
 
-Not covered yet: breakpoints, single steps, memory writes, running a
-command in the guest with its exit status, and copying files. For guests
-that run `rshd`, an rsh MCP server such as
+Not covered yet: breakpoints, single steps, memory writes and copying
+files. For guests that run `rshd`, an rsh MCP server such as
 [rsh-mcp](https://github.com/tenox7/rsh-mcp) runs commands and copies
 files.
 

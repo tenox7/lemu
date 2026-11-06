@@ -941,6 +941,100 @@
   'coroutine': true }
 
 ##
+# @McpShell:
+#     What reads the line that serial-run types.
+#
+# @sh: the Bourne shell or one of its kin (ksh, bash, POSIX sh); the
+#     exit status is in $?
+#
+# @csh: csh or tcsh; the exit status is in $status
+#
+# @none: anything else, such as a ROM monitor, DOS or VMS: there is no
+#     exit status, and the prompt marks the end of the output
+#
+# Since: 11.2
+##
+{ 'enum': 'McpShell', 'data': [ 'sh', 'csh', 'none' ] }
+
+##
+# @McpSerialRunResult:
+#     What serial-run returns.  The output itself is in the summary.
+#
+# @port: the port
+#
+# @done: the command finished; false if it was still running at the
+#     timeout
+#
+# @exit-status: the command's exit status, if the shell gave one
+#
+# @lines: lines of output, also those not shown
+#
+# @start: offset where the output starts; serial-read from here gets
+#     all of it
+#
+# @cursor: offset after the output and the end marker
+#
+# @end-pattern: while not @done, the regular expression that marks the
+#     end; wait for it with serial-expect
+#
+# Since: 11.2
+##
+{ 'struct': 'McpSerialRunResult',
+  'base': 'McpResult',
+  'data': { 'port': 'str', 'done': 'bool', '*exit-status': 'int',
+            'lines': 'int', 'start': 'int', 'cursor': 'int',
+            '*end-pattern': 'str' } }
+
+##
+# @serial-run:
+#     Run one command line in a shell that waits at its prompt on a
+#     serial port, and return the output and the exit status.  lemu
+#     types the line with an end marker after it, waits for the marker
+#     and cuts off the echo.  Log in first with serial-write and
+#     serial-expect.  To stop a command that hangs, send "\x03"
+#     (Ctrl-C) with serial-write.  Calls on one port take turns, and
+#     wait for the end of a command that an earlier call left running
+#     (after its timeout or a cancel), unless serial-write was used
+#     since.
+#
+# @port: "serial0", "serial1", ... or a chardev id (default: serial0)
+#
+# @command: one line, without "\r" at the end
+#
+# @shell: what reads the line (default: sh)
+#
+# @prompt: for shell "none" only: a regular expression for the prompt
+#     that follows the output
+#
+# @timeout-ms: give up waiting after this long, at most 110000
+#     (default: 30000)
+#
+# @max-lines: show at most this many lines of output (default: 200)
+#
+# @tail: show the last lines instead of the first (default: false)
+#
+# @line-limit: the longest line the guest takes, end marker included;
+#     many old Unix terminals cut lines at 255 bytes (default: 255)
+#
+# @char-delay-ms: pause after each character, for slow guests
+#     (default: 0)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# Since: 11.2
+##
+{ 'command': 'serial-run',
+  'data': { '*port': 'str', 'command': 'str', '*shell': 'McpShell',
+            '*prompt': 'str', '*timeout-ms': 'int', '*max-lines': 'int',
+            '*tail': 'bool', '*line-limit': 'int',
+            '*char-delay-ms': 'int' },
+  'returns': 'McpSerialRunResult',
+  'features': [ 'mcp' ],
+  'coroutine': true }
+
+##
 # @McpTextHighlight:
 #     A run of text in a different background colour from most of the
 #     screen, such as a selected menu item.
