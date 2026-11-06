@@ -214,17 +214,23 @@ static void screen_free(Screen *s)
     qtest_quit(s->qts);
 }
 
+/*
+ * Draw a box on the black screen in one write of whole rows, so that it
+ * appears at once.  Drawn row by row, a screen check that runs between
+ * two rows sees only part of the box, which made the tests flaky on a
+ * busy host.  The rest of the rows stays black.
+ */
 static void screen_fill(Screen *s, int x, int y, int w, int h, uint32_t rgb)
 {
-    g_autofree uint32_t *row = g_new(uint32_t, w);
-    int i;
+    g_autofree uint32_t *rows = g_new0(uint32_t, SCR_W * h);
+    int i, j;
 
-    for (i = 0; i < w; i++) {
-        row[i] = cpu_to_le32(rgb);
-    }
     for (i = 0; i < h; i++) {
-        qpci_memwrite(s->dev, s->lfb, ((y + i) * SCR_W + x) * 4, row, w * 4);
+        for (j = 0; j < w; j++) {
+            rows[i * SCR_W + x + j] = cpu_to_le32(rgb);
+        }
     }
+    qpci_memwrite(s->dev, s->lfb, y * SCR_W * 4, rows, SCR_W * h * 4);
 }
 
 /* The reply to a command sent with qtest_qmp_send(), skipping events */
