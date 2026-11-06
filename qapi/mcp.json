@@ -193,10 +193,11 @@
 #
 # @steps: mouse move packets sent
 #
-# @step-px: open loop: the largest step sent
+# @step-px: open loop: the largest step sent, in mouse counts
 #
-# @calibrated: this call first measured the largest step that the
-#     guest does not speed up; later calls use it
+# @calibrated: this call first measured how the guest moves the
+#     pointer: the largest step it does not speed up, and how many
+#     pixels a count moves; later calls use both
 #
 # @wait: the outcome of the wait in @then
 #
@@ -636,9 +637,10 @@
 #
 # @home: when to home the pointer first (default: auto)
 #
-# @step-px: open loop: largest step, keep it below guest acceleration
-#     (default: 4, or less if the guest speeds up 4-pixel moves; lemu
-#     measures that on the first open loop move)
+# @step-px: open loop: largest step in mouse counts, keep it below
+#     guest acceleration (default: 4, or less if the guest speeds up
+#     steps of 4; lemu measures that, and how far a count moves the
+#     pointer, on the first open loop move)
 #
 # @step-delay-ms: open loop: pause between steps (default: 20)
 #

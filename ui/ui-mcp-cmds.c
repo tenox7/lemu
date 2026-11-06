@@ -1082,11 +1082,28 @@ static void mcp_pointer_result(McpInputResult *res, QemuConsole *con,
         res->has_step_px = true;
         res->step_px = pr->step_px;
     }
-    if (pr->calibrated) {
+    if (pr->calibrated && pr->cal_error[0]) {
         res->has_calibrated = true;
         res->calibrated = true;
-        g_string_append_printf(summary, " (calibrated first: the guest does "
-                               "not speed up steps of %d px)", pr->step_px);
+        g_string_append_printf(summary, " (could not measure how the guest"
+                               " moves the pointer: %s; so a count is taken"
+                               " as a pixel)", pr->cal_error);
+    } else if (pr->calibrated) {
+        g_autofree char *gx = g_strdup_printf("%.2f", pr->gain_x);
+        g_autofree char *gy = g_strdup_printf("%.2f", pr->gain_y);
+
+        res->has_calibrated = true;
+        res->calibrated = true;
+        g_string_append_printf(summary, " (calibrated first: the guest does"
+                               " not speed up steps of %d count%s, and a"
+                               " count moves ", pr->step_px,
+                               pr->step_px == 1 ? "" : "s");
+        if (!strcmp(gx, gy)) {
+            g_string_append_printf(summary, "%s px)", gx);
+        } else {
+            g_string_append_printf(summary, "%s px across, %s px down)",
+                                   gx, gy);
+        }
     } else if (pr->homed) {
         g_string_append(summary, " (homed first)");
     }

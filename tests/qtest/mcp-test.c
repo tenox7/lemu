@@ -9,6 +9,10 @@
  * "wait-screen" sees the change, and that a blinking box does not stop
  * the screen from counting as stable.
  *
+ * The pointer tests play a guest that draws its own pointer and moves
+ * it 0.35 or 2 pixels per mouse count, or faster for bigger moves:
+ * "mouse-move" must measure that and land on the pixel.
+ *
  * The serial tests play the guest on COM1: a terminal that echoes what
  * "serial-run" types, and a shell that answers it.
  *
@@ -19,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include <math.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "libqtest.h"
@@ -189,9 +194,9 @@ static void vbe_write(QTestState *qts, uint16_t index, uint16_t val)
     qtest_outw(qts, VBE_DATA, val);
 }
 
-static void screen_init(Screen *s)
+static void screen_init_machine(Screen *s, const char *machine)
 {
-    s->qts = qtest_init("-machine pc -display none -vga std");
+    s->qts = qtest_initf("-machine %s -display none -vga std", machine);
     s->bus = qpci_new_pc(s->qts, NULL);
     s->dev = qpci_device_find(s->bus, QPCI_DEVFN(2, 0));
     g_assert(s->dev);
@@ -205,6 +210,11 @@ static void screen_init(Screen *s)
     /* attribute controller: palette address source, so not blanked */
     qtest_inb(s->qts, 0x3da);
     qtest_outb(s->qts, 0x3c0, 0x20);
+}
+
+static void screen_init(Screen *s)
+{
+    screen_init_machine(s, "pc");
 }
 
 static void screen_free(Screen *s)
@@ -347,6 +357,232 @@ static void test_input_quit(gconstpointer cmd)
     /* the clock does not move, so the input stays queued */
     g_usleep(300 * 1000);
     qtest_quit(qts);
+}
+
+/*
+ * Pointer: the test plays a guest with a PS/2 mouse that has no hardware
+ * cursor.  It reads the mouse packets from the i8042, moves its pointer
+ * @gain pixels per count (twice as far for a packet of @accel counts or
+ * more, as X does), and draws the pointer, a square with the hotspot in
+ * the middle.  mouse-move must find out how the guest moves the pointer
+ * and land on the pixel.
+ */
+
+#define I8042_AUX_OBF   0x20
+#define PTR_SIZE        9
+#define PTR_HOT         4
+#define CARET_X         600     /* a text cursor, far from the pointer */
+#define CARET_Y         40
+#define CARET_H         16
+
+typedef struct FakeGuest {
+    Screen s;
+    double gain;
+    int accel;
+    bool caret;                 /* it blinks with every mouse packet */
+    bool caret_on;
+    double fx, fy;              /* the hotspot */
+    int x, y;                   /* the hotspot as drawn */
+    uint8_t pkt[3];
+    int npkt;
+    QDict *reply;
+} FakeGuest;
+
+static void fake_blink(FakeGuest *g)
+{
+    uint32_t c = cpu_to_le32(g->caret_on ? 0 : 0xffffff);
+    uint32_t px[2] = { c, c };
+    int i;
+
+    g->caret_on = !g->caret_on;
+    for (i = 0; i < CARET_H; i++) {
+        qpci_memwrite(g->s.dev, g->s.lfb, ((CARET_Y + i) * SCR_W + CARET_X) * 4,
+                      px, sizeof(px));
+    }
+}
+
+/* Move the pointer to @nx, @ny in one write, as screen_fill() does */
+static void fake_draw(FakeGuest *g, int nx, int ny)
+{
+    int top = MAX(0, MIN(g->y, ny) - PTR_HOT);
+    int bottom = MIN(SCR_H, MAX(g->y, ny) - PTR_HOT + PTR_SIZE);
+    g_autofree uint32_t *rows = g_new0(uint32_t, SCR_W * (bottom - top));
+    int i, j;
+
+    for (i = 0; i < PTR_SIZE; i++) {
+        int y = ny - PTR_HOT + i;
+
+        for (j = 0; j < PTR_SIZE; j++) {
+            int x = nx - PTR_HOT + j;
+
+            if (x >= 0 && x < SCR_W && y >= top && y < bottom) {
+                rows[(y - top) * SCR_W + x] = cpu_to_le32(0xffffff);
+            }
+        }
+    }
+    qpci_memwrite(g->s.dev, g->s.lfb, top * SCR_W * 4, rows,
+                  SCR_W * (bottom - top) * 4);
+    g->x = nx;
+    g->y = ny;
+}
+
+static void fake_packet(FakeGuest *g, const uint8_t *p)
+{
+    int dx = p[1] - (p[0] & 0x10 ? 256 : 0);
+    int dy = p[2] - (p[0] & 0x20 ? 256 : 0);
+    double k = g->gain * (g->accel && abs(dx) + abs(dy) >= g->accel ? 2 : 1);
+
+    g->fx = MAX(0, MIN(SCR_W - 1, g->fx + dx * k));
+    g->fy = MAX(0, MIN(SCR_H - 1, g->fy - dy * k));     /* PS/2 y is up */
+    if (lround(g->fx) != g->x || lround(g->fy) != g->y) {
+        fake_draw(g, lround(g->fx), lround(g->fy));
+    }
+    if (g->caret) {
+        fake_blink(g);
+    }
+}
+
+/* Take what the mouse sent; true if there was something */
+static bool fake_poll(FakeGuest *g)
+{
+    bool any = false;
+    uint8_t st;
+
+    while ((st = qtest_inb(g->s.qts, I8042_STATUS)) & I8042_OBF) {
+        uint8_t b = qtest_inb(g->s.qts, I8042_DATA);
+
+        any = true;
+        if (!(st & I8042_AUX_OBF) || (!g->npkt && !(b & 0x08))) {
+            continue;           /* a key, or not the start of a packet */
+        }
+        g->pkt[g->npkt++] = b;
+        if (g->npkt == 3) {
+            fake_packet(g, g->pkt);
+            g->npkt = 0;
+        }
+    }
+    return any;
+}
+
+static void fake_init(FakeGuest *g, double gain, int accel)
+{
+    uint8_t st;
+
+    memset(g, 0, sizeof(*g));
+    g->gain = gain;
+    g->accel = accel;
+    screen_init_machine(&g->s, "pc,vmport=off");
+    g->x = g->y = -PTR_SIZE;
+    g->fx = SCR_W / 2.0;
+    g->fy = SCR_H / 2.0;
+    fake_draw(g, SCR_W / 2, SCR_H / 2);
+
+    /* enable the mouse port, then the mouse, and take its ACK */
+    qtest_outb(g->s.qts, I8042_CMD, 0xa8);
+    qtest_outb(g->s.qts, I8042_CMD, 0xd4);
+    qtest_outb(g->s.qts, I8042_DATA, 0xf4);
+    for (;;) {
+        st = qtest_inb(g->s.qts, I8042_STATUS);
+        if (st & I8042_OBF) {
+            uint8_t b = qtest_inb(g->s.qts, I8042_DATA);
+
+            if (st & I8042_AUX_OBF) {
+                g_assert_cmphex(b, ==, 0xfa);
+                break;
+            }
+        }
+    }
+}
+
+static gpointer fake_reply(gpointer opaque)
+{
+    FakeGuest *g = opaque;
+
+    g_atomic_pointer_set(&g->reply, wait_reply(g->s.qts));
+    return NULL;
+}
+
+/*
+ * Send @cmd and play the guest until the reply comes; it is read on
+ * another thread, from the QMP socket, while this one talks qtest.
+ * lemu paces input on the guest's clock, which moves only when the
+ * test steps it.
+ */
+static QDict *fake_run(FakeGuest *g, const char *cmd)
+{
+    GThread *t;
+    QDict *rsp;
+
+    qtest_qmp_send_raw(g->s.qts, "%s", cmd);
+    t = g_thread_new("mcp-reply", fake_reply, g);
+    while (!g_atomic_pointer_get(&g->reply)) {
+        if (!fake_poll(g)) {
+            qtest_clock_step(g->s.qts, SCALE_MS);
+        }
+    }
+    g_thread_join(t);
+    rsp = g->reply;
+    g->reply = NULL;
+    fake_poll(g);
+    return rsp;
+}
+
+/* mouse-move to @x, @y must land within @slack px; @want in the summary */
+static void fake_move(FakeGuest *g, int x, int y, int slack, const char *want)
+{
+    g_autofree char *cmd = g_strdup_printf("{'execute': 'mouse-move',"
+                                           " 'arguments': {'x': %d, 'y': %d}}",
+                                           x, y);
+    QDict *rsp = fake_run(g, cmd);
+    QDict *ret = qdict_get_qdict(rsp, "return");
+    const char *summary;
+
+    g_assert(ret);
+    summary = qdict_get_str(ret, "summary");
+    g_test_message("to %d,%d, the guest has %d,%d: %s", x, y, g->x, g->y,
+                   summary);
+    g_assert(!want || strstr(summary, want));
+    g_assert_cmpint(abs(g->x - x), <=, slack);
+    g_assert_cmpint(abs(g->y - y), <=, slack);
+    qobject_unref(rsp);
+}
+
+/*
+ * A guest that scales mouse motion down, with a blinking text cursor
+ * that must not be taken for part of the pointer
+ */
+static void test_pointer_slow(void)
+{
+    FakeGuest g;
+
+    fake_init(&g, 0.35, 0);
+    g.caret = true;
+    fake_move(&g, 300, 200, 1, "a count moves 0.35 px");
+    fake_move(&g, 500, 420, 2, NULL);
+    fake_move(&g, 40, 30, 2, NULL);
+    screen_free(&g.s);
+}
+
+/* A guest that moves the pointer 2 px per count */
+static void test_pointer_fast(void)
+{
+    FakeGuest g;
+
+    fake_init(&g, 2, 0);
+    fake_move(&g, 301, 201, 1, "a count moves 2.00 px");
+    fake_move(&g, 100, 400, 1, NULL);
+    screen_free(&g.s);
+}
+
+/* A guest that speeds up moves of 4 counts or more, as X does */
+static void test_pointer_accel(void)
+{
+    FakeGuest g;
+
+    fake_init(&g, 1, 4);
+    fake_move(&g, 150, 100, 0, "steps of 1 count, and a count moves 1.00");
+    fake_move(&g, 90, 160, 0, NULL);
+    screen_free(&g.s);
 }
 
 /* Serial */
@@ -970,6 +1206,9 @@ int main(int argc, char **argv)
                         "{\"execute\": \"mouse-move\", \"arguments\":"
                         " {\"x\": 100, \"y\": 100}}",
                         test_input_quit);
+    qtest_add_func("/mcp/pointer/slow", test_pointer_slow);
+    qtest_add_func("/mcp/pointer/fast", test_pointer_fast);
+    qtest_add_func("/mcp/pointer/accel", test_pointer_accel);
     qtest_add_func("/mcp/vm-stats", test_vm_stats);
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);

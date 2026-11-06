@@ -36,7 +36,9 @@ typedef struct QemuPointerResult {
     bool homed;
     int steps;
     int step_px;                /* open loop: the largest step it used */
-    bool calibrated;            /* the step was measured in this call */
+    double gain_x, gain_y;      /* open loop: px a count moves */
+    bool calibrated;            /* the step and gain were measured now */
+    char cal_error[192];        /* calibrated: why they could not be */
     bool known;
     int x, y;
 } QemuPointerResult;
