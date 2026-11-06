@@ -60,6 +60,10 @@ only when exactly one VM is running and you started it.
 | `media` | List, insert or eject CDs and floppies |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
+| `debug-run` | Run until a CPU gets to an address (a breakpoint), then show the instruction, the registers and memory |
+| `debug-step` | Run one CPU an instruction at a time, and show each one |
+| `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
+| `memory-write` | Patch guest RAM or ROM: code or data |
 | `hmp`, `qmp` | Run any QEMU monitor command: registers, memory, disassembly, pause and go on |
 
 ## How to drive a VM
@@ -102,6 +106,10 @@ Use these:
 | Read guest memory | `hmp` `xp /16wx 0x1000` (physical) or `x /16wx ADDR` (virtual) |
 | Disassemble guest code | `hmp` `x /10i ADDR` |
 | Save memory to a file | `hmp` `pmemsave ADDR SIZE FILE` |
+| Stop when the guest gets to an address (a breakpoint) | `debug-run` |
+| Single-step | `debug-step` |
+| Patch code or data | `memory-write` |
+| Find the idle loop, or where the guest spends its time | `debug-profile` |
 | Pause and go on | `vm-power` `pause` and `resume`, or `hmp` `stop` and `cont` |
 | Any other monitor command | `hmp` (`help` lists them) or `qmp` |
 | Run a command in the guest, get its output and exit status | `serial-run` (log in on a serial port first) |
@@ -125,11 +133,17 @@ Use these:
   background shell with an `until` loop), not a Python sleep.
 - **Files and logs on the host:** `xxd`, `od`, `grep`, `jq` and `cmp` do
   the job.
+- **Debugging without GDB:** `debug-run` stops the VM when a CPU gets
+  to an address, and shows the next instruction, the registers and the
+  memory you ask for. Look around with `hmp`, go on with `debug-step` or
+  another `debug-run`, and `vm-power` `resume` when you are done.
+  Addresses are virtual, as the CPU sees them (on x86: the CS base plus
+  EIP). These tools need TCG, the default for the old CPUs, and no GDB
+  stub.
 
-Not covered yet: breakpoints, single steps, memory writes and copying
-files. For guests that run `rshd`, an rsh MCP server such as
-[rsh-mcp](https://github.com/tenox7/rsh-mcp) runs commands and copies
-files.
+Not covered yet: copying files. For guests that run `rshd`, an rsh MCP
+server such as [rsh-mcp](https://github.com/tenox7/rsh-mcp) runs
+commands and copies files.
 
 ## Safety
 

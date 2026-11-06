@@ -63,6 +63,9 @@ static int query_error_class(const char *cmd)
         { "frames", ERROR_CLASS_GENERIC_ERROR },
         /* -machine none has no serial ports */
         { "serial-read", ERROR_CLASS_GENERIC_ERROR },
+        /* need TCG and a CPU, and the test runs with -accel qtest */
+        { "debug-step", ERROR_CLASS_GENERIC_ERROR },
+        { "debug-profile", ERROR_CLASS_GENERIC_ERROR },
         { NULL, -1 }
     };
     int i;

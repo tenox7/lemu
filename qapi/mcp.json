@@ -1353,3 +1353,230 @@
   'returns': 'McpFramesResult',
   'features': [ 'mcp', 'mcp-read-only' ],
   'if': 'CONFIG_PIXMAN' }
+
+##
+# @McpDebugMemory:
+#     Guest memory that a debug tool shows when the CPU stops.
+#
+# @address: the first address: hex with 0x, or decimal
+#
+# @words: how many 32-bit words, up to 256 (default: 8)
+#
+# @physical: a physical address; otherwise a virtual one, through the
+#     MMU of the CPU that stopped (default: false)
+#
+# Since: 11.2
+##
+{ 'struct': 'McpDebugMemory',
+  'data': { 'address': 'str', '*words': 'int', '*physical': 'bool' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpDebugStop:
+#     Where a debug tool left the CPU.  The summary shows the next
+#     instruction, the registers and the memory asked for.
+#
+# @reached: a CPU got to the address (debug-run), or the CPU did all
+#     its steps (debug-step)
+#
+# @cpu: the CPU, when one stopped
+#
+# @pc: its program counter, in hex
+#
+# @hits: how often a CPU got to the address (debug-run)
+#
+# @steps: instructions done (debug-step)
+#
+# @running: the VM is still running
+#
+# Since: 11.2
+##
+{ 'struct': 'McpDebugStop',
+  'base': 'McpResult',
+  'data': { 'reached': 'bool', '*cpu': 'int', '*pc': 'str',
+            '*hits': 'int', '*steps': 'int', 'running': 'bool' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @debug-run:
+#     Let the guest run until a CPU gets to an address (a breakpoint),
+#     then stop the VM and show the instruction there, the registers
+#     and any @memory.  Use it instead of a GDB script.  The VM stays
+#     stopped: look around with hmp, go on with debug-step or another
+#     debug-run, or resume it with vm-power.  A CPU that is stopped at
+#     @address when the call begins first steps past it, so the call
+#     stops at the next arrival.
+#
+# @address: where to stop: hex with 0x, or decimal.  A virtual
+#     address as the CPU sees it (on x86 the linear address: CS base
+#     plus EIP)
+#
+# @hits: stop at this arrival, counting from 1 (default: 1)
+#
+# @cpu: watch only this CPU (default: all)
+#
+# @memory: guest memory to show when it stops
+#
+# @timeout-ms: give up after this long, at most 1500000, 25 minutes
+#     (default: 30000); the VM then keeps running
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# Since: 11.2
+##
+{ 'command': 'debug-run',
+  'data': { 'address': 'str', '*hits': 'int', '*cpu': 'int',
+            '*memory': [ 'McpDebugMemory' ], '*timeout-ms': 'int' },
+  'returns': 'McpDebugStop',
+  'features': [ 'mcp' ],
+  'coroutine': true,
+  'if': 'CONFIG_TCG' }
+
+##
+# @debug-step:
+#     Run one CPU for some instructions, one at a time, and show each
+#     one, then the next instruction and the registers.  The other
+#     CPUs stay stopped and interrupts wait.  A running VM is stopped
+#     first.
+#
+# @count: how many instructions, up to 10000; the last 200 are shown
+#     (default: 1)
+#
+# @cpu: the CPU (default: the one that stopped last, else the first)
+#
+# @memory: guest memory to show after the last step
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# Since: 11.2
+##
+{ 'command': 'debug-step',
+  'data': { '*count': 'int', '*cpu': 'int',
+            '*memory': [ 'McpDebugMemory' ] },
+  'returns': 'McpDebugStop',
+  'features': [ 'mcp' ],
+  'coroutine': true,
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpProfileEntry:
+#     One program counter in a profile.
+#
+# @pc: the address, in hex
+#
+# @count: samples at it
+#
+# @percent: its share of the samples in which a CPU ran, rounded
+#
+# @instruction: the instruction there
+#
+# Since: 11.2
+##
+{ 'struct': 'McpProfileEntry',
+  'data': { 'pc': 'str', 'count': 'int', 'percent': 'int',
+            '*instruction': 'str' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpProfile:
+#     What @debug-profile returns.
+#
+# @interval-ms: how long it sampled
+#
+# @samples: samples taken, of all the CPUs sampled
+#
+# @halted-percent: share of the samples in which the CPU was halted
+#
+# @paused-percent: share of the time in which the VM was paused
+#
+# @top: the program counters seen most, most first
+#
+# Since: 11.2
+##
+{ 'struct': 'McpProfile',
+  'base': 'McpResult',
+  'data': { 'interval-ms': 'int', 'samples': 'int',
+            'halted-percent': 'int', 'paused-percent': 'int',
+            'top': [ 'McpProfileEntry' ] },
+  'if': 'CONFIG_TCG' }
+
+##
+# @debug-profile:
+#     Sample for a while where the CPUs run, and list the program
+#     counters seen most, with their instructions.  This finds idle
+#     loops and hot spots.  A sample is the address where a CPU goes
+#     on, which is the start of a block of translated code, so a loop
+#     shows at its start.  The guest keeps running.
+#
+# @interval-ms: how long to sample, from 100 to 1500000 (default:
+#     5000)
+#
+# @cpu: sample only this CPU (default: all)
+#
+# @top: list this many addresses, up to 100 (default: 20)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# @mcp-read-only: does not change the VM
+#
+# Since: 11.2
+##
+{ 'command': 'debug-profile',
+  'data': { '*interval-ms': 'int', '*cpu': 'int', '*top': 'int' },
+  'returns': 'McpProfile',
+  'features': [ 'mcp', 'mcp-read-only' ],
+  'coroutine': true,
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpMemoryWriteResult:
+#     What @memory-write returns.
+#
+# @before: the bytes before, in hex
+#
+# @after: the bytes now, in hex
+#
+# Since: 11.2
+##
+{ 'struct': 'McpMemoryWriteResult',
+  'base': 'McpResult',
+  'data': { 'before': 'str', 'after': 'str' } }
+
+##
+# @memory-write:
+#     Write bytes to guest RAM or ROM, for example to patch code or a
+#     variable.  Devices are never written.  It returns the old bytes,
+#     so you can put them back.  To read memory, use hmp ('x', 'xp').
+#
+# @address: where to write: hex with 0x, or decimal
+#
+# @bytes: the bytes in memory order, in hex, like "08000240" or
+#     "de ad be ef", up to 1024.  A big-endian guest (HP-UX, SunOS,
+#     AIX) stores the word 0x12345678 as "12345678", a little-endian
+#     one (x86, Windows NT) as "78563412".
+#
+# @physical: a physical address; otherwise a virtual one, through the
+#     CPU's MMU (default: false)
+#
+# @cpu: the CPU whose MMU translates a virtual address (default: the
+#     one that stopped last, else the first)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# @mcp-destructive: changes guest memory
+#
+# Since: 11.2
+##
+{ 'command': 'memory-write',
+  'data': { 'address': 'str', 'bytes': 'str', '*physical': 'bool',
+            '*cpu': 'int' },
+  'returns': 'McpMemoryWriteResult',
+  'features': [ 'mcp', 'mcp-destructive' ] }

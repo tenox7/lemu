@@ -2315,8 +2315,16 @@ static int gdb_handle_packet(const char *line_buf)
 
 void gdb_set_stop_cpu(CPUState *cpu)
 {
-    GDBProcess *p = gdb_get_cpu_process(cpu);
+    GDBProcess *p;
 
+    /*
+     * No GDB server was started, so another debugger stopped the CPU:
+     * the MCP debug tools.  There is no process to look up.
+     */
+    if (!gdbserver_state.process_num) {
+        return;
+    }
+    p = gdb_get_cpu_process(cpu);
     if (!p->attached) {
         /*
          * Having a stop CPU corresponding to a process that is not attached

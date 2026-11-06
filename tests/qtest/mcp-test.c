@@ -12,6 +12,9 @@
  * The serial tests play the guest on COM1: a terminal that echoes what
  * "serial-run" types, and a shell that answers it.
  *
+ * The debug tests run a BIOS of two instructions under TCG, step it,
+ * stop it at an address and patch it while it runs.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -25,6 +28,7 @@
 #include "qobject/qjson.h"
 #include "qemu/bswap.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 
 #define NKEYS       5000
 
@@ -641,6 +645,226 @@ static void test_serial_run_cancel(void)
     rmdir(dir);
 }
 
+/*
+ * A BIOS of three bytes at the reset vector: inc ax at 0xfffffff0,
+ * then jmp short back to it at 0xfffffff1.  Halts everywhere else.
+ */
+static char *debug_bios(void)
+{
+    g_autofree uint8_t *rom = g_malloc(64 * KiB);
+    char *path = NULL;
+    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    memset(rom, 0xf4, 64 * KiB);
+    rom[0xfff0] = 0x40;
+    rom[0xfff1] = 0xeb;
+    rom[0xfff2] = 0xfd;
+    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
+    close(fd);
+    return path;
+}
+
+static QDict *debug_ok(QTestState *qts, const char *cmd, const char *args)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute': %s, 'arguments': %p}", cmd,
+                           qobject_from_json(args, &error_abort));
+    QDict *ret = qdict_get_qdict(rsp, "return");
+
+    if (!ret) {
+        g_test_message("%s: %s", cmd,
+                       qdict_get_str(qdict_get_qdict(rsp, "error"), "desc"));
+    }
+    g_assert(ret);
+    qobject_ref(ret);
+    qobject_unref(rsp);
+    return ret;
+}
+
+static char *debug_error(QTestState *qts, const char *cmd, const char *args)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute': %s, 'arguments': %p}", cmd,
+                           qobject_from_json(args, &error_abort));
+    QDict *err = qdict_get_qdict(rsp, "error");
+    char *desc;
+
+    g_assert(err);
+    desc = g_strdup(qdict_get_str(err, "desc"));
+    qobject_unref(rsp);
+    return desc;
+}
+
+/* A register from the summary: "EAX=0000002a" or "RAX=00000000..." */
+static uint64_t debug_reg(QDict *ret, const char *name)
+{
+    const char *summary = qdict_get_str(ret, "summary");
+    g_autofree char *key = g_strdup_printf("%s=", name);
+    const char *p = strstr(summary, key);
+
+    g_assert(p);
+    return g_ascii_strtoull(p + strlen(key), NULL, 16);
+}
+
+static void debug_check_error(QTestState *qts, const char *cmd,
+                              const char *args, const char *want)
+{
+    g_autofree char *desc = debug_error(qts, cmd, args);
+
+    if (!strstr(desc, want)) {
+        g_test_message("%s: '%s' lacks '%s'", cmd, desc, want);
+        g_assert_not_reached();
+    }
+}
+
+/* debug-step and debug-run walk the loop, from the first instruction */
+static void test_debug_run(void)
+{
+    g_autofree char *bios = debug_bios();
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    ret = debug_ok(qts, "debug-step", "{}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xfffffff1");
+    g_assert_cmpint(qdict_get_int(ret, "steps"), ==, 1);
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(!qdict_get_bool(ret, "running"));
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 1);
+    g_assert(strstr(qdict_get_str(ret, "summary"), "inc"));
+    qobject_unref(ret);
+
+    /* jmp, inc, jmp, inc */
+    ret = debug_ok(qts, "debug-step", "{'count': 4}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xfffffff1");
+    g_assert_cmpint(qdict_get_int(ret, "steps"), ==, 4);
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 3);
+    qobject_unref(ret);
+
+    /* the CPU stands at the address: it goes on to the next arrivals */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xfffffff1', 'hits': 3,"
+                   " 'memory': [{'address': '0x1000', 'words': 2,"
+                   " 'physical': true}]}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(!qdict_get_bool(ret, "running"));
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 3);
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xfffffff1");
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 6);
+    g_assert(strstr(qdict_get_str(ret, "summary"),
+                    "Memory at physical 0x1000"));
+    qobject_unref(ret);
+
+    /* nothing gets there: the guest goes on */
+    ret = debug_ok(qts, "debug-run", "{'address': '0x12345678',"
+                   " 'timeout-ms': 200}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    qobject_unref(ret);
+    ret = debug_ok(qts, "query-status", "{}");
+    g_assert(qdict_get_bool(ret, "running"));
+    qobject_unref(ret);
+
+    /* a running VM stops with the CPU at the address */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xfffffff0'}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xfffffff0");
+    g_assert_cmpint(qdict_get_int(ret, "cpu"), ==, 0);
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-run", "{'address': 'fffffff0'}",
+                      "not a number");
+    debug_check_error(qts, "debug-step", "{'count': 0}", "count");
+    debug_check_error(qts, "debug-step", "{'cpu': 5}", "no CPU 5");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
+ * memory-write changes RAM and ROM but no device, and code made from
+ * the old bytes goes away; debug-profile finds the loop
+ */
+static void test_debug_memory(void)
+{
+    g_autofree char *bios = debug_bios();
+    QTestState *qts;
+    QDict *ret, *top;
+    uint64_t ax, cx;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s", bios);
+
+    ret = debug_ok(qts, "memory-write", "{'address': '0x1000',"
+                   " 'bytes': 'de ad be ef', 'physical': true}");
+    g_assert_cmpstr(qdict_get_str(ret, "before"), ==, "00000000");
+    g_assert_cmpstr(qdict_get_str(ret, "after"), ==, "deadbeef");
+    g_assert_cmphex(qtest_readl(qts, 0x1000), ==, 0xefbeadde);
+    qobject_unref(ret);
+
+    /* paging is off, so the virtual address is the physical one */
+    ret = debug_ok(qts, "memory-write", "{'address': '8192',"
+                   " 'bytes': '0x01020304'}");
+    g_assert_cmpstr(qdict_get_str(ret, "after"), ==, "01020304");
+    g_assert_cmphex(qtest_readl(qts, 0x2000), ==, 0x04030201);
+    qobject_unref(ret);
+
+    debug_check_error(qts, "memory-write", "{'address': '0xfec00000',"
+                      " 'bytes': '00', 'physical': true}", "not RAM or ROM");
+    debug_check_error(qts, "memory-write", "{'address': '0x1000',"
+                      " 'bytes': 'abc'}", "whole bytes");
+    debug_check_error(qts, "memory-write", "{'address': '0x1000',"
+                      " 'bytes': 'zz'}", "not hex");
+
+    /* the loop runs in one block at its start */
+    ret = debug_ok(qts, "debug-profile", "{'interval-ms': 300}");
+    g_assert_cmpint(qdict_get_int(ret, "samples"), >, 10);
+    g_assert_cmpint(qdict_get_int(ret, "halted-percent"), ==, 0);
+    top = qobject_to(QDict, qlist_peek(qdict_get_qlist(ret, "top")));
+    g_assert(top);
+    g_assert_cmpstr(qdict_get_str(top, "pc"), ==, "0xfffffff0");
+    g_assert_cmpfloat(qdict_get_double(top, "percent"), >, 50);
+    g_assert(strstr(qdict_get_str(top, "instruction"), "inc"));
+    qobject_unref(ret);
+
+    /* inc cx into the running loop: AX stops, CX counts */
+    ret = debug_ok(qts, "memory-write", "{'address': '0xfffffff0',"
+                   " 'bytes': '41', 'physical': true}");
+    g_assert_cmpstr(qdict_get_str(ret, "before"), ==, "40");
+    qobject_unref(ret);
+    g_usleep(50 * 1000);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xfffffff0'}");
+    ax = debug_reg(ret, "AX") & 0xffff;
+    cx = debug_reg(ret, "CX") & 0xffff;
+    qobject_unref(ret);
+    qtest_qmp_assert_success(qts, "{'execute': 'cont'}");
+    g_usleep(50 * 1000);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xfffffff0'}");
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, ax);
+    g_assert_cmpint(debug_reg(ret, "CX") & 0xffff, !=, cx);
+    qobject_unref(ret);
+
+    /* a step into hlt halts; a halted CPU does not step */
+    ret = debug_ok(qts, "memory-write", "{'address': '0xfffffff0',"
+                   " 'bytes': 'f4', 'physical': true}");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-step", "{}");
+    g_assert_cmpint(qdict_get_int(ret, "steps"), ==, 1);
+    g_assert(strstr(qdict_get_str(ret, "summary"), "it halted"));
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-step", "{}");
+    g_assert_cmpint(qdict_get_int(ret, "steps"), ==, 0);
+    g_assert(!qdict_get_bool(ret, "reached"));
+    qobject_unref(ret);
+
+    /* a paused VM runs no CPU */
+    ret = debug_ok(qts, "debug-profile", "{'interval-ms': 100}");
+    g_assert_cmpint(qdict_get_int(ret, "paused-percent"), ==, 100);
+    g_assert_cmpint(qdict_get_int(ret, "samples"), ==, 0);
+    qobject_unref(ret);
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -652,5 +876,9 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);
     qtest_add_func("/mcp/serial/run-cancel", test_serial_run_cancel);
+    if (qtest_has_accel("tcg")) {
+        qtest_add_func("/mcp/debug/run", test_debug_run);
+        qtest_add_func("/mcp/debug/memory", test_debug_memory);
+    }
     return g_test_run();
 }

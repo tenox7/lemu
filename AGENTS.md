@@ -8,9 +8,10 @@ used by AI agents, so AI-written code is welcome here.
 - **Read [MCP.md](MCP.md).** The MCP server also sends its rules to every
   agent that connects.
 - **No Python to drive VMs.** The MCP tools do it: `hmp` for the monitor,
-  memory and registers, `serial-run` for commands in the guest, the
-  other serial tools for serial consoles, `wait-screen` and `vm-wait`
-  instead of sleeping, `vm-stats` instead of `ps` and `top`. See
+  memory and registers, `debug-run` and `debug-step` instead of GDB
+  scripts, `serial-run` for commands in the guest, the other serial
+  tools for serial consoles, `wait-screen` and `vm-wait` instead of
+  sleeping, `vm-stats` instead of `ps` and `top`. See
   [MCP.md](MCP.md#without-python).
 - **Only touch your own VMs.** Never stop, reset or change a VM you did
   not start, unless the user asks.

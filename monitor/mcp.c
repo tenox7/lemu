@@ -18,6 +18,12 @@
 #include "qemu/osdep.h"
 #include "qemu/aio.h"
 #include "monitor-internal.h"
+#ifdef CONFIG_HMP
+#include "monitor-hmp-internal.h"
+#include "disas/disas.h"
+#include "hw/core/cpu.h"
+#include "qapi/qapi-commands-misc.h"
+#endif
 #include "monitor/mcp.h"
 #include "monitor/mcp-common.h"
 #include "monitor/mcp-tools.h"
@@ -49,6 +55,7 @@ typedef struct McpCall {
     QEMUTimer *progress_timer;
     int64_t start_ms;
     bool discard;               /* cancelled or client gone: no reply */
+    bool quiet_runstate;        /* no STOP or RESUME events meanwhile */
     QemuInputCtx ctx;
     QTAILQ_ENTRY(McpCall) node;
 } McpCall;
@@ -89,6 +96,109 @@ QemuInputCtx *mcp_current_input_ctx(void)
     call = g_hash_table_lookup(mcp_calls_by_co, qemu_coroutine_self());
     return call ? &call->ctx : NULL;
 }
+
+void mcp_quiet_runstate_events(void)
+{
+    McpCall *call;
+
+    if (mcp_calls_by_co && qemu_in_coroutine()) {
+        call = g_hash_table_lookup(mcp_calls_by_co, qemu_coroutine_self());
+        if (call) {
+            call->quiet_runstate = true;
+        }
+    }
+}
+
+#ifdef CONFIG_HMP
+typedef struct McpDisas {
+    CPUState *cpu;
+    uint64_t pc;
+    int count;
+} McpDisas;
+
+/* The monitor writes \r\n line ends; agents read \n */
+static char *mcp_strip_cr(char *s)
+{
+    char *in, *out;
+
+    for (in = out = s; *in; in++) {
+        if (*in != '\r') {
+            *out++ = *in;
+        }
+    }
+    *out = '\0';
+    return s;
+}
+
+static void mcp_print_registers(MonitorHMP *hmp, void *opaque)
+{
+    cpu_dump_state(opaque, NULL, 0);
+}
+
+static void mcp_print_disas(MonitorHMP *hmp, void *opaque)
+{
+    McpDisas *d = opaque;
+
+    monitor_disas(hmp, d->cpu, d->pc, d->count, false);
+}
+
+/*
+ * What @fn prints, with a scratch HMP monitor as the current one, the
+ * way human-monitor-command works; cpu_dump_state() prints there too.
+ */
+static char *mcp_print(void (*fn)(MonitorHMP *hmp, void *opaque),
+                       void *opaque)
+{
+    MonitorHMP *hmp = MONITOR_HMP(object_new(TYPE_MONITOR_HMP));
+    Monitor *old = monitor_set_cur(qemu_coroutine_self(), MONITOR(hmp));
+    char *out;
+
+    fn(hmp, opaque);
+    monitor_set_cur(qemu_coroutine_self(), old);
+    WITH_QEMU_LOCK_GUARD(&hmp->parent_obj.mon_lock) {
+        out = g_strdup(hmp->parent_obj.outbuf->str);
+    }
+    object_unref(hmp);
+    return mcp_strip_cr(out);
+}
+
+char *mcp_cpu_registers(CPUState *cpu)
+{
+    return mcp_print(mcp_print_registers, cpu);
+}
+
+char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count)
+{
+    McpDisas d = { .cpu = cpu, .pc = pc, .count = count };
+
+    return mcp_print(mcp_print_disas, &d);
+}
+
+char *mcp_cpu_memory(CPUState *cpu, uint64_t addr, int words, bool physical)
+{
+    g_autofree char *cmd = g_strdup_printf("%s /%dwx 0x%" PRIx64,
+                                           physical ? "xp" : "x", words,
+                                           addr);
+    char *out = qmp_human_monitor_command(cmd, true, cpu->cpu_index, NULL);
+
+    return out ? mcp_strip_cr(out) : NULL;
+}
+#else
+char *mcp_cpu_registers(CPUState *cpu)
+{
+    return NULL;
+}
+
+char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count)
+{
+    return NULL;
+}
+
+char *mcp_cpu_memory(CPUState *cpu, uint64_t addr, int words, bool physical)
+{
+    return NULL;
+}
+#endif
 
 static void mcp_send(MonitorMCP *mcp, QDict *msg)
 {
@@ -149,6 +259,15 @@ static void monitor_mcp_emit_event(Monitor *mon, QAPIEvent event,
 {
     MonitorMCP *mcp = MONITOR_MCP(mon);
     const char *name = QAPIEvent_str(event);
+    McpCall *call;
+
+    if (event == QAPI_EVENT_STOP || event == QAPI_EVENT_RESUME) {
+        QTAILQ_FOREACH(call, &mcp->calls, node) {
+            if (call->quiet_runstate) {
+                return;
+            }
+        }
+    }
 
     /* a guest that sets its clock every second sends a stream of these */
     if (mcp->n_events &&
