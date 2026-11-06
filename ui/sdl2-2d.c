@@ -51,6 +51,22 @@ void sdl2_2d_update(DisplayChangeListener *dcl,
     SDL_UpdateTexture(scon->texture, &rect,
                       surface_data(surf) + surface_data_offset,
                       surface_stride(surf));
+    /*
+     * Show the new picture at the next refresh, not here.  On macOS a
+     * present waits for the next frame of the display, and a text console
+     * (a serial port shown in a window) comes here once per character, so
+     * the guest could send only one character per frame: about 120 a
+     * second, in the CPU thread.
+     */
+    scon->updates++;
+}
+
+static void sdl2_2d_present(struct sdl2_console *scon)
+{
+    if (!scon->updates || !scon->texture) {
+        return;
+    }
+    scon->updates = 0;
     SDL_RenderClear(scon->real_renderer);
     SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
     SDL_RenderPresent(scon->real_renderer);
@@ -131,6 +147,7 @@ void sdl2_2d_refresh(DisplayChangeListener *dcl)
     assert(!scon->opengl);
     qemu_console_hw_update(dcl->con);
     sdl2_poll_events(scon);
+    sdl2_2d_present(scon);
 }
 
 void sdl2_2d_redraw(struct sdl2_console *scon)
