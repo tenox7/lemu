@@ -316,9 +316,10 @@ static bool check_for_breakpoints_slow(CPUState *cpu, vaddr pc,
     QTAILQ_FOREACH(bp, &cpu->breakpoints, entry) {
         /*
          * If we have an exact pc match, trigger the breakpoint.
-         * Otherwise, note matches within the page.
+         * Otherwise, note matches within the page.  A breakpoint with a
+         * mask (the MCP debug tools) compares only those bits.
          */
-        if (pc == bp->pc) {
+        if (cpu_breakpoint_match(bp, pc)) {
             bool match_bp = false;
 
             if (bp->flags & BP_GDB) {
@@ -337,7 +338,7 @@ static bool check_for_breakpoints_slow(CPUState *cpu, vaddr pc,
                 cpu->exception_index = EXCP_DEBUG;
                 return true;
             }
-        } else if (((pc ^ bp->pc) & TARGET_PAGE_MASK) == 0) {
+        } else if (((pc ^ bp->pc) & bp->mask & TARGET_PAGE_MASK) == 0) {
             match_page = true;
         }
     }

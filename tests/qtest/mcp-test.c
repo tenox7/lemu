@@ -2073,6 +2073,115 @@ static void test_debug_history(void)
     unlink(bios);
 }
 
+/*
+ * A BIOS that puts a far return at 1000:0008 and at 2000:0008, then
+ * calls the first once and the second twice, over and over.  At
+ * f000:0000, after a far jump:
+ *
+ *  0000  xor ax,ax / mov ss,ax / mov sp,7c00
+ *  0007  mov ax,1000 / mov es,ax / mov byte [es:0008],cb
+ *  0012  mov ax,2000 / mov es,ax / mov byte [es:0008],cb
+ *  001d  call 1000:0008
+ *  0022  call 2000:0008
+ *  0027  call 2000:0008
+ *  002c  jmp 001d
+ */
+static char *debug_bios_mask(void)
+{
+    static const uint8_t code[] = {
+        0x31, 0xc0, 0x8e, 0xd0, 0xbc, 0x00, 0x7c,
+        0xb8, 0x00, 0x10, 0x8e, 0xc0, 0x26, 0xc6, 0x06, 0x08, 0x00, 0xcb,
+        0xb8, 0x00, 0x20, 0x8e, 0xc0, 0x26, 0xc6, 0x06, 0x08, 0x00, 0xcb,
+        0x9a, 0x08, 0x00, 0x00, 0x10,
+        0x9a, 0x08, 0x00, 0x00, 0x20,
+        0x9a, 0x08, 0x00, 0x00, 0x20,
+        0xeb, 0xef,
+    };
+
+    return debug_bios_code(code, sizeof(code));
+}
+
+/* How often the trace in @ret counted @pc, 0 if never */
+static int64_t debug_trace_count(QDict *ret, const char *pc)
+{
+    QList *list = qdict_get_qlist(ret, "instructions");
+    QListEntry *e;
+
+    g_assert(list);
+    QLIST_FOREACH_ENTRY(list, e) {
+        QDict *in = qobject_to(QDict, qlist_entry_obj(e));
+
+        if (!strcmp(qdict_get_str(in, "pc"), pc)) {
+            return qdict_get_int(in, "count");
+        }
+    }
+    return 0;
+}
+
+/* A breakpoint with a mask stops at every address with those bits */
+static void test_debug_mask(void)
+{
+    g_autofree char *bios = debug_bios_mask();
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* the low 16 bits: the first call, then the second */
+    ret = debug_ok(qts, "debug-run", "{'address': '0x10008',"
+                   " 'address-mask': '0xffff', 'hits': 2}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0x20008");
+    debug_summary_has(ret, "CPU 0 reached 0x20008 (arrival 2); the VM is"
+                      " stopped");
+    qobject_unref(ret);
+
+    /* all the bits: past the second call of the second, to the first */
+    ret = debug_ok(qts, "debug-run", "{'address': '0x10008'}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0x10008");
+    qobject_unref(ret);
+
+    /* the CPU there steps past it, then goes 10 times round the loop */
+    ret = debug_ok(qts, "debug-trace", "{'address': '0x10008',"
+                   " 'address-mask': '0xffff', 'count': 30}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 30);
+    g_assert_cmpint(debug_trace_count(ret, "0x20008"), ==, 20);
+    g_assert_cmpint(debug_trace_count(ret, "0x10008"), ==, 10);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "entries")), ==, 20);
+    debug_summary_has(ret, "Traced arrivals at 0x10008 (mask 0xffff) for ");
+    debug_summary_has(ret, "\n\nBy instruction:\n      20 x 0x00020008:");
+    debug_summary_has(ret, "\n      10 x 0x00010008:");
+    debug_summary_has(ret, "\n\nHits (the first 20, then the first arrival"
+                      " at each new address):\n#1 CPU 0 at 0x20008\n"
+                      "#2 CPU 0 at 0x20008\n#3 CPU 0 at 0x10008\n");
+    qobject_unref(ret);
+
+    /* the guest runs on; any 6 arrivals in a row are 2 and 4 */
+    ret = debug_ok(qts, "debug-trace", "{'address': '0x10008',"
+                   " 'address-mask': '0xffff', 'count': 6, 'list': 0}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 6);
+    g_assert_cmpint(debug_trace_count(ret, "0x20008"), ==, 4);
+    g_assert_cmpint(debug_trace_count(ret, "0x10008"), ==, 2);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "entries")), ==, 2);
+    debug_summary_has(ret, "\n\nHits (the first arrival at each"
+                      " address):\n#");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-run", "{'watch': {'address': '0x2000'},"
+                      " 'address-mask': '0xffff'}",
+                      "address-mask needs an address");
+    debug_check_error(qts, "debug-run", "{'address': '0x10008',"
+                      " 'address-mask': '0'}",
+                      "address-mask must keep at least one bit");
+    debug_check_error(qts, "debug-trace", "{'address': '0x10008',"
+                      " 'address-mask': 'ffff'}",
+                      "address-mask 'ffff' is not a number");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 /* debug-trace logs the hits and lets the guest go on */
 static void test_debug_trace(void)
 {
@@ -2835,6 +2944,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/watch", test_debug_watch);
         qtest_add_func("/mcp/debug/trace", test_debug_trace);
         qtest_add_func("/mcp/debug/history", test_debug_history);
+        qtest_add_func("/mcp/debug/mask", test_debug_mask);
     }
     return g_test_run();
 }

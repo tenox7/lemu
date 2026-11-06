@@ -128,6 +128,7 @@ Use these:
 | Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
 | See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
 | See how the CPU got to where it stopped | `debug-run` with `history` |
+| Stop at the same code in any process (any space) | `debug-run` with `address-mask` |
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |
@@ -205,6 +206,13 @@ Use these:
   one; a loop of one block shows once, with `xN`. It works the same on
   every CPU, with no stack to unwind. The guest runs slower while the
   blocks are noted.
+- **The same code in any process:** where the top bits of an address
+  name a space (hppa), each process runs in its own space, and a new
+  process gets a new one, so a plain `address` stops in one process
+  only. `address-mask: "0xffffffff"` compares only the low 32 bits:
+  `debug-run` then stops in any space, and `debug-trace` counts the
+  arrivals by address, one line per space. A mask works on every CPU:
+  its bits are the ones that must match.
 - **Every hit, with the guest running on:** `debug-trace` logs each
   arrival at `address`, or each access to `watch`, with the
   `registers` and `memory` you ask for, until `count` hits or

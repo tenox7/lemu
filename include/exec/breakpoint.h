@@ -28,9 +28,16 @@
 
 typedef struct CPUBreakpoint {
     vaddr pc;
+    vaddr mask;         /* the bits of pc compared; all of them by default */
     int flags; /* BP_* */
     QTAILQ_ENTRY(CPUBreakpoint) entry;
 } CPUBreakpoint;
+
+/* Whether a CPU at @pc gets to @bp */
+static inline bool cpu_breakpoint_match(const CPUBreakpoint *bp, vaddr pc)
+{
+    return ((pc ^ bp->pc) & bp->mask) == 0;
+}
 
 typedef struct CPUWatchpoint {
     vaddr vaddr;

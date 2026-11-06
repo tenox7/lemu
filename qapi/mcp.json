@@ -1545,6 +1545,14 @@
 #     address as the CPU sees it (on x86 the linear address: CS base
 #     plus EIP).  Give it, @watch, or both.
 #
+# @address-mask: compare only the bits of @address that are set in
+#     this number, written as @address: a CPU stops at any address
+#     with the same bits there.  Where the top bits of an address name
+#     a space, as on PA-RISC, 0xffffffff stops in every space, so in
+#     every process.  The guest runs one instruction at a time in each
+#     page that matches, so a mask with few bits slows it down
+#     (default: all bits)
+#
 # @watch: stop after a CPU writes or reads this memory, with the
 #     instruction that did it.  Only CPUs are watched, not devices
 #     that write memory themselves (DMA).
@@ -1571,7 +1579,8 @@
 # Since: 11.2
 ##
 { 'command': 'debug-run',
-  'data': { '*address': 'str', '*watch': 'McpWatch', '*hits': 'int',
+  'data': { '*address': 'str', '*address-mask': 'str',
+            '*watch': 'McpWatch', '*hits': 'int',
             '*cpu': 'int', '*memory': [ 'McpDebugMemory' ],
             '*history': 'int', '*timeout-ms': 'int' },
   'returns': 'McpDebugStop',
@@ -1609,13 +1618,15 @@
 
 ##
 # @McpTraceInstruction:
-#     An instruction that touched the watched memory (@debug-trace).
+#     An instruction that touched the watched memory, or, with an
+#     address mask, one that CPUs got to (@debug-trace).
 #
 # @pc: its address, in hex
 #
-# @count: how often it did
+# @count: how often it did, or how often CPUs got there
 #
-# @instruction: the instruction, as it was the first time
+# @instruction: the instruction, as it was the first time it could be
+#     read
 #
 # Since: 11.2
 ##
@@ -1634,7 +1645,8 @@
 # @running: the VM is running
 #
 # @instructions: when memory was watched, the instructions that
-#     touched it, most first
+#     touched it, most first; with an address mask, also each address
+#     the CPUs got to
 #
 # @entries: the hits it lists
 #
@@ -1660,13 +1672,17 @@
 # @address: log arrivals here, written as for debug-run.  Give it,
 #     @watch, or both.
 #
+# @address-mask: compare only these bits of @address, as for
+#     debug-run; the arrivals are then counted by address too
+#
 # @watch: log the accesses to this memory, with the instruction that
 #     did each one
 #
 # @count: stop after this many hits, up to 100000 (default: 1000)
 #
 # @list: list this many hits in full, up to 500; after them, only the
-#     first access to the watched memory by each new instruction
+#     first access to the watched memory by each new instruction, and
+#     with @address-mask the first arrival at each new address
 #     (default: 20)
 #
 # @cpu: trace only this CPU (default: all)
@@ -1686,7 +1702,8 @@
 # Since: 11.2
 ##
 { 'command': 'debug-trace',
-  'data': { '*address': 'str', '*watch': 'McpWatch', '*count': 'int',
+  'data': { '*address': 'str', '*address-mask': 'str',
+            '*watch': 'McpWatch', '*count': 'int',
             '*list': 'int', '*cpu': 'int', '*registers': [ 'str' ],
             '*memory': [ 'McpDebugMemory' ], '*duration-ms': 'int' },
   'returns': 'McpTrace',
