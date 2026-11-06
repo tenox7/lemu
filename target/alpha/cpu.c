@@ -386,7 +386,11 @@ const char *alpha_cpu_exception_name(int excp)
 
 void alpha_cpu_set_pc(CPUState *cs, vaddr value)
 {
-    alpha_env_set_pc(cpu_env(cs), value);
+    CPUAlphaState *env = cpu_env(cs);
+
+    alpha_env_set_pc(env, value);
+    /* the PAL mode bit may have changed, and the hflags hold it */
+    alpha_rebuild_hflags(env);
 }
 
 vaddr alpha_cpu_get_pc(CPUState *cs)
