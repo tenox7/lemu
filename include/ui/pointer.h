@@ -71,4 +71,12 @@ bool qemu_pointer_get(QemuConsole *con, int *x, int *y,
 /* Forget the position, for example after a mode change */
 void qemu_pointer_forget(QemuConsole *con);
 
+/*
+ * True the first time it is asked after the pointer position became
+ * unknown (start, reset, someone else moved the mouse, a new screen
+ * size), so a key tool can warn once that keys may go to the window
+ * under a pointer lemu did not place.
+ */
+bool qemu_pointer_unknown_once(QemuConsole *con);
+
 #endif

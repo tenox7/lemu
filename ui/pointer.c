@@ -57,6 +57,7 @@ typedef struct QemuPointer {
     int fb_w, fb_h;
     uint64_t foreign;
     QemuPointerMethod method;
+    bool unknown_told;          /* qemu_pointer_unknown_once() said so */
     /* closed loop: hotspot minus the cursor image's top-left corner */
     bool has_offset;
     int off_x, off_y;
@@ -80,6 +81,7 @@ static void pointer_reset(void *opaque)
         p->known = false;
         p->has_offset = false;
         p->cal_done = false;    /* another guest may boot */
+        p->unknown_told = false;
     }
 }
 
@@ -114,6 +116,7 @@ static void pointer_set(QemuPointer *p, int x, int y, int w, int h,
                         QemuPointerMethod method)
 {
     p->known = true;
+    p->unknown_told = false;
     p->drift = 0;
     p->x = x;
     p->y = y;
@@ -159,6 +162,22 @@ bool qemu_pointer_get(QemuConsole *con, int *x, int *y,
     *x = p->x;
     *y = p->y;
     *method = p->method;
+    return true;
+}
+
+bool qemu_pointer_unknown_once(QemuConsole *con)
+{
+    QemuPointer *p = pointer_find(con, true);
+
+    if (pointer_valid(p, qemu_console_get_width(con, 0),
+                      qemu_console_get_height(con, 0))) {
+        p->unknown_told = false;    /* tell again once it is lost */
+        return false;
+    }
+    if (p->unknown_told) {
+        return false;
+    }
+    p->unknown_told = true;
     return true;
 }
 

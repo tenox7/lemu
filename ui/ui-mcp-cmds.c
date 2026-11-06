@@ -729,10 +729,24 @@ static void mcp_add_combo(QemuInputBatch *b, const unsigned int *codes, int n,
     qemu_input_batch_delay(b, delay_ms);
 }
 
-static void mcp_caps_warning(McpInputResult *res, QemuConsole *con)
+/* What a key tool's caller should know about where the keys may go */
+static void mcp_key_warning(McpInputResult *res, QemuConsole *con)
 {
+    g_autoptr(GString) w = g_string_new(NULL);
+
     if (qemu_input_get_leds_mask(con) & QEMU_CAPS_LOCK_LED) {
-        res->warning = g_strdup("Caps Lock is on in the guest");
+        g_string_append(w, "Caps Lock is on in the guest");
+    }
+    if (strcmp(qemu_input_mouse_kind(con), "none") &&
+        qemu_pointer_unknown_once(con)) {
+        g_string_append_printf(w, "%sthe mouse pointer is where the guest"
+                               " left it, not placed by lemu since the VM"
+                               " started; if this desktop sends keys to the"
+                               " window under the pointer, move the pointer"
+                               " onto the window first", w->len ? "; " : "");
+    }
+    if (w->len) {
+        res->warning = g_string_free(g_steal_pointer(&w), false);
     }
 }
 
@@ -792,7 +806,7 @@ McpInputResult *coroutine_fn qmp_key(strList *keys, bool has_delay_ms,
     res = g_new0(McpInputResult, 1);
     g_string_printf(summary, "sent %d key combination%s", combos,
                     combos == 1 ? "" : "s");
-    mcp_caps_warning(res, con);
+    mcp_key_warning(res, con);
     if (!mcp_co_input_finish(&in, res, summary, errp)) {
         qapi_free_McpInputResult(res);
         return NULL;
@@ -1030,7 +1044,7 @@ McpInputResult *coroutine_fn qmp_type_text(const char *text,
     res = g_new0(McpInputResult, 1);
     g_string_printf(summary, "typed %ld character%s", count,
                     count == 1 ? "" : "s");
-    mcp_caps_warning(res, con);
+    mcp_key_warning(res, con);
     if (!mcp_co_input_finish(&in, res, summary, errp)) {
         qapi_free_McpInputResult(res);
         return NULL;

@@ -554,9 +554,21 @@ static void fake_move(FakeGuest *g, int x, int y, int slack, const char *want)
 static void test_pointer_slow(void)
 {
     FakeGuest g;
+    QDict *rsp, *ret;
 
     fake_init(&g, 0.35, 0);
     g.caret = true;
+
+    /* keys say once that lemu has not placed the pointer */
+    rsp = fake_run(&g, "{'execute': 'key', 'arguments': {'keys': ['a']}}");
+    ret = qdict_get_qdict(rsp, "return");
+    g_assert(qdict_haskey(ret, "warning"));
+    g_assert(strstr(qdict_get_str(ret, "warning"), "not placed by lemu"));
+    qobject_unref(rsp);
+    rsp = fake_run(&g, "{'execute': 'key', 'arguments': {'keys': ['a']}}");
+    g_assert(!qdict_haskey(qdict_get_qdict(rsp, "return"), "warning"));
+    qobject_unref(rsp);
+
     fake_move(&g, 300, 200, 1, "a count moves 0.35 px");
     fake_move(&g, 500, 420, 2, NULL);
     fake_move(&g, 40, 30, 2, NULL);
