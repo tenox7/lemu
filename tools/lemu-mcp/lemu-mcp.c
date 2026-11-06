@@ -68,7 +68,8 @@ static const char vm_wait_tool[] =
     " example after a guest shutdown. until port: a TCP port on this"
     " host sends an answer, such as a port that hostfwd forwards to the"
     " guest; for a server that waits for the client to talk first (rsh,"
-    " http), give send.\","
+    " http), give send. It connects from a source port below 1024 when"
+    " this host allows it, as rshd wants.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"vm\":{\"type\":\"string\",\"description\":\"until up and gone: the"
     " VM, a name or PID\"},"
@@ -940,6 +941,7 @@ typedef struct Wait {
     int fd;                     /* the try now, or -1 */
     guint fd_watch;
     bool connected;
+    bool reserved;              /* from a source port below 1024 */
     GString *answer;
     int tries;
     char *last;                 /* what the last try saw */
@@ -1272,15 +1274,54 @@ static gboolean port_io(int fd, GIOCondition cond, gpointer opaque)
     }
     w->fd_watch = 0;
     if (!w->answer->len) {
-        port_try_end(w, g_strdup("it took the connection and closed it at"
-                                 " once: with QEMU user networking"
-                                 " (hostfwd) that means the guest refused"
-                                 " it, so nothing listens on that guest"
-                                 " port yet"));
+        port_try_end(w, g_strdup_printf("it took the connection and closed it"
+                                        " after %" PRId64 " ms without a"
+                                        " word: with QEMU user networking"
+                                        " (hostfwd) that means nothing"
+                                        " listens on that guest port yet, or"
+                                        " the server dropped the client%s",
+                                        now_ms() - w->try_start_ms,
+                                        w->reserved ? ""
+                                        : " (rshd drops clients whose source"
+                                          " port is not below 1024, and this"
+                                          " host did not allow one)"));
     } else {
         port_try_end(w, port_no_answer(w));
     }
     return G_SOURCE_REMOVE;
+}
+
+/*
+ * Connect from a source port below 1024 when this host allows it, as
+ * rshd and rlogind want; other servers don't mind.  macOS lets any user
+ * bind those ports.  True if it got one.
+ */
+static bool port_bind_reserved(int fd, const struct addrinfo *ai)
+{
+    int i;
+
+    for (i = 0; i < 16; i++) {
+        struct sockaddr_storage ss = { .ss_family = ai->ai_family };
+        uint16_t port = htons(512 + g_random_int_range(0, 512));
+        socklen_t len;
+
+        if (ai->ai_family == AF_INET) {
+            ((struct sockaddr_in *)&ss)->sin_port = port;
+            len = sizeof(struct sockaddr_in);
+        } else if (ai->ai_family == AF_INET6) {
+            ((struct sockaddr_in6 *)&ss)->sin6_port = port;
+            len = sizeof(struct sockaddr_in6);
+        } else {
+            return false;
+        }
+        if (bind(fd, (struct sockaddr *)&ss, len) == 0) {
+            return true;
+        }
+        if (errno != EADDRINUSE) {
+            return false;       /* not allowed: any port will do */
+        }
+    }
+    return false;
 }
 
 static void port_try_start(Wait *w)
@@ -1299,6 +1340,7 @@ static void port_try_start(Wait *w)
     }
     g_unix_set_fd_nonblocking(fd, true, NULL);
     w->fd = fd;
+    w->reserved = port_bind_reserved(fd, ai);
     if (connect(fd, ai->ai_addr, ai->ai_addrlen) < 0 &&
         errno != EINPROGRESS && errno != EINTR) {
         port_try_end(w, port_connect_error(w, errno));
