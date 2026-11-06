@@ -57,7 +57,7 @@ only when exactly one VM is running and you started it.
 | `media` | List, insert or eject CDs and floppies |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
-| `hmp`, `qmp` | Run any QEMU monitor command, for experts |
+| `hmp`, `qmp` | Run any QEMU monitor command: registers, memory, disassembly, pause and go on |
 
 ## How to drive a VM
 
@@ -66,8 +66,13 @@ The server sends these rules to every agent that connects:
 - **Look before you act.** Take a screenshot first. The keyboard and
   mouse tools take `then`, so they can wait and look again in the same
   call.
-- **Don't sleep.** Use `wait-screen`. For long installs, call it in a
-  loop.
+- **Don't sleep.** Use `wait-screen`, or `serial-expect` for serial
+  text. For long installs, call it in a loop.
+- **No scripts.** Don't write Python or socket scripts to drive a VM.
+  The tools do it; see [Without Python](#without-python).
+- **Graphics console:** to read text from a Unix guest whose console is
+  a graphics screen, log in on a serial port (start a getty there) and
+  use `serial-expect`.
 - **Check the focus before typing.** Keys go to the focused window.
 - **Old dialogs:** use Tab and Shift+Tab, then Space or Enter.
 - **Mouse:** most old guests have a relative mouse. If a click misses,
@@ -78,6 +83,43 @@ The server sends these rules to every agent that connects:
   `de` for German.
 - **Events:** every result lists what happened in the VM since your last
   call, such as a reset or a pause.
+
+## Without Python
+
+Don't write scripts for the monitor socket, the serial port or waiting.
+Use these:
+
+| You want to | Use |
+|---|---|
+| Read the CPU registers | `hmp` `info registers` |
+| Read guest memory | `hmp` `xp /16wx 0x1000` (physical) or `x /16wx ADDR` (virtual) |
+| Disassemble guest code | `hmp` `x /10i ADDR` |
+| Save memory to a file | `hmp` `pmemsave ADDR SIZE FILE` |
+| Pause and go on | `vm-power` `pause` and `resume`, or `hmp` `stop` and `cont` |
+| Any other monitor command | `hmp` (`help` lists them) or `qmp` |
+| Type into a serial console | `serial-write` (old Unix wants `\r`) |
+| Wait for serial text | `serial-expect` |
+| Read what a serial port printed | `serial-read` |
+| Wait for the screen | `wait-screen` |
+| Crop or zoom a screenshot | `screenshot` with `region` and `scale` |
+| Find a screen that went by | `frames` |
+| Change a CD or floppy | `media` |
+
+- **Every serial port works.** The serial tools see what the guest
+  writes to every serial port, whatever it is connected to: a socket, a
+  pty, a window or `mon:stdio`. You don't need a socket of your own.
+- **Waiting for something outside the VM,** such as a QEMU process that
+  should exit: use your agent's own way to wait in the background (in
+  Claude Code, a background shell with an `until` loop), not a Python
+  sleep.
+- **Files and logs on the host:** `xxd`, `od`, `grep`, `jq` and `cmp` do
+  the job.
+
+Not covered yet: breakpoints, single steps, memory writes, running a
+command in the guest with its exit status, and copying files. For guests
+that run `rshd`, an rsh MCP server such as
+[rsh-mcp](https://github.com/tenox7/rsh-mcp) runs commands and copies
+files.
 
 ## Safety
 
