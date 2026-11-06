@@ -266,6 +266,11 @@ Use these:
 - **Your own socket.** `-mcp unix:vm.mcp,server=on,wait=off` gives a VM its
   own socket instead of the default one. `lemu-mcp` still finds it. On
   macOS, Unix socket paths must stay under about 104 bytes.
+- **"Another one may have it".** A VM takes one MCP client at a time:
+  the first `lemu-mcp` that uses it, or a script on its socket. Others
+  wait, and their calls fail after 5 s, with the call not run.
+  `vm-list` and the tool list only look: they leave each VM to the
+  session that uses it.
 - **Long waits in Claude Code.** A tool call that runs longer than 2
   minutes moves to the background, and Claude Code tells the agent when
   it ends. Stopping it (TaskStop) cancels the wait in the VM. One call

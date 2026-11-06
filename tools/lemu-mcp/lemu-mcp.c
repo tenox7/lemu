@@ -33,6 +33,7 @@
 
 #define LINE_MAX_BYTES      (64 * 1024 * 1024)
 #define TOOLS_TIMEOUT_MS    3000
+#define INIT_TIMEOUT_MS     5000    /* for a VM to answer our initialize */
 #define WAIT_TICK_MS        200
 #define WAIT_DEFAULT_MS     30000
 #define WAIT_PROGRESS_MS    5000
@@ -89,6 +90,14 @@ static const char vm_wait_tool[] =
     " this long, at most 1500000, 25 minutes (default: 30000)\"}}},"
     "\"annotations\":{\"destructiveHint\":false,\"openWorldHint\":true}}";
 
+/*
+ * A VM's MCP socket takes one client at a time; the kernel holds the
+ * next one until that client leaves, and then the VM takes it
+ */
+#define ONE_CLIENT \
+    "a VM takes one MCP client at a time, and another one may have it" \
+    " (another session's lemu-mcp, or a script on its socket)"
+
 static const char vm_arg_schema[] =
     "{\"type\":\"string\","
     "\"description\":\"the VM: a name or PID from vm-list (needed when"
@@ -120,6 +129,8 @@ typedef struct Vm {
 
     int fd;                     /* -1 when not connected */
     guint watch;
+    guint init_timer;           /* until our initialize is answered */
+    bool used;                  /* for a call or a vm-wait, not to look */
     GString *in;
     bool ready;                 /* our initialize was answered */
     int64_t next_id;
@@ -280,11 +291,24 @@ static void vm_disconnect(Vm *vm, const char *why)
             error_report("VM %s (pid %d): %s", vm->name, vm->pid, why);
         }
     }
+    if (vm->init_timer) {
+        g_source_remove(vm->init_timer);
+        vm->init_timer = 0;
+    }
     vm->ready = false;
+    vm->used = false;
 
     g_hash_table_iter_init(&iter, vm->calls);
     while (g_hash_table_iter_next(&iter, NULL, (gpointer *)&call)) {
-        if (call->kind == CALL_CLIENT) {
+        if (call->kind == CALL_CLIENT && call->line) {
+            /* still waiting for our initialize to be answered */
+            g_autofree char *text = g_strdup_printf(
+                "could not use VM %s (pid %d)%s%s; the call did not run."
+                " Check with vm-list.", vm->name, vm->pid,
+                why ? ": " : "", why ? why : "");
+
+            client_tool_result(call->client_id, text, NULL, true);
+        } else if (call->kind == CALL_CLIENT) {
             g_autofree char *text = g_strdup_printf(
                 "lost the connection to VM %s (pid %d)%s%s; the call may or"
                 " may not have run. Check with vm-list.", vm->name, vm->pid,
@@ -478,6 +502,9 @@ static void vm_request(Vm *vm, CallKind kind, QObject *client_id,
     qdict_put_int(msg, "id", call->vm_id);
     call->line = message_line(msg);
     g_hash_table_insert(vm->calls, &call->vm_id, call);
+    if (kind == CALL_CLIENT) {
+        vm->used = true;
+    }
 
     if (vm->ready || kind == CALL_INIT) {
         g_autofree char *line = g_steal_pointer(&call->line);
@@ -541,6 +568,10 @@ static void vm_response(Vm *vm, QDict *msg)
     switch (call->kind) {
     case CALL_INIT:
         g_hash_table_remove(vm->calls, &id);
+        if (vm->init_timer) {
+            g_source_remove(vm->init_timer);
+            vm->init_timer = 0;
+        }
         if (result) {
             vm_ready(vm);
         } else {
@@ -550,7 +581,12 @@ static void vm_response(Vm *vm, QDict *msg)
         return;
     case CALL_TOOLS:
         tools_answer(result ? tools_from_vm(result) : NULL);
-        break;
+        g_hash_table_remove(vm->calls, &id);
+        /* connected only for the list: leave the VM to its own client */
+        if (!vm->used) {
+            vm_disconnect(vm, NULL);
+        }
+        return;
     case CALL_CLIENT:
         qdict_del(msg, "id");
         qdict_put_obj(msg, "id", qobject_ref(call->client_id));
@@ -609,6 +645,41 @@ static gboolean vm_readable(int fd, GIOCondition cond, gpointer opaque)
     return G_SOURCE_CONTINUE;
 }
 
+/*
+ * A connection that waits this long for its initialize is given up, so
+ * that it never takes the VM later, when the VM's client leaves
+ */
+static gboolean vm_init_timeout(gpointer opaque)
+{
+    Vm *vm = opaque;
+
+    vm->init_timer = 0;
+    vm_disconnect(vm, "it did not answer for 5 s: " ONE_CLIENT
+                  ", or it is still starting");
+    return G_SOURCE_REMOVE;
+}
+
+/*
+ * Whether the VM's socket takes a connection, without keeping one: a
+ * connection kept only to look would take the VM from its own client
+ */
+static bool vm_probe(Vm *vm)
+{
+    g_autoptr(SocketAddress) addr = NULL;
+    int fd;
+
+    if (vm->fd >= 0) {
+        return true;
+    }
+    addr = socket_parse(vm->endpoint, NULL);
+    fd = addr ? socket_connect(addr, NULL) : -1;
+    if (fd < 0) {
+        return false;
+    }
+    close(fd);
+    return true;
+}
+
 static bool vm_connect(Vm *vm, Error **errp)
 {
     g_autoptr(SocketAddress) addr = NULL;
@@ -642,6 +713,9 @@ static bool vm_connect(Vm *vm, Error **errp)
         g_autoptr(QDict) msg = request("initialize", params);
 
         vm_request(vm, CALL_INIT, NULL, msg);
+    }
+    if (vm->fd >= 0) {
+        vm->init_timer = g_timeout_add(INIT_TIMEOUT_MS, vm_init_timeout, vm);
     }
     return vm->fd >= 0;
 }
@@ -826,7 +900,7 @@ static void client_vm_list(QObject *id)
                     list->len == 1 ? "" : "s");
     for (i = 0; i < list->len; i++) {
         Vm *vm = g_ptr_array_index(list, i);
-        bool reachable = vm_connect(vm, NULL);
+        bool reachable = vm_probe(vm);
 
         vm_line(s, vm, reachable);
         qlist_append(arr, vm_describe(vm, reachable));
@@ -1147,7 +1221,10 @@ static bool wait_check_up(Wait *w)
     }
     w->listed = true;
     if (!found->ready) {
-        vm_connect(found, NULL);    /* ready once it answers initialize */
+        /* ready once it answers initialize; then the agent uses it */
+        if (vm_connect(found, NULL)) {
+            found->used = true;
+        }
         return false;
     }
     text = g_strdup_printf("VM %s (pid %d) is up after %.1f s: %s in %s",
@@ -1364,7 +1441,8 @@ static void wait_timeout(Wait *w)
     case WAIT_UP:
         if (w->listed) {
             text = g_strdup_printf("%s is listed but does not answer after"
-                                   " %.1f s", w->label, wait_secs(w));
+                                   " %.1f s: " ONE_CLIENT ", or it hangs",
+                                   w->label, wait_secs(w));
         } else if (w->pid >= 0) {
             text = g_strdup_printf("process %" PRId64 " runs, but no lemu VM"
                                    " with that PID came up in %.1f s; was it"
@@ -1661,9 +1739,10 @@ static void client_tools_call(QObject *id, QDict *msg)
         return;
     }
     if (!vm_connect(vm, &err)) {
+        /* its process runs, or the registry scan would have dropped it */
         g_autofree char *text = g_strdup_printf(
-            "cannot reach VM %s (pid %d): %s", vm->name, vm->pid,
-            error_get_pretty(err));
+            "cannot reach VM %s (pid %d): %s; " ONE_CLIENT, vm->name,
+            vm->pid, error_get_pretty(err));
 
         error_free(err);
         client_tool_result(id, text, NULL, true);
