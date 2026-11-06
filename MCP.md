@@ -5,8 +5,8 @@ With it, an AI agent can work a VM like a person at the keyboard:
 
 - look at the screen
 - type and use the mouse
-- read and write serial ports
-- change CDs and floppies
+- read and write serial ports, and log in over telnet
+- change CDs and floppies, and copy files in and out on them
 - power the VM on and off, and take snapshots
 
 It works on macOS and Linux.
@@ -59,6 +59,7 @@ only when exactly one VM is running and you started it.
 | `pointer-locate` | Find where the guest's mouse pointer really is |
 | `serial-read`, `serial-write`, `serial-expect` | Read, write and wait for serial port text |
 | `serial-run` | Run a command in a shell on a serial port: get its output and exit status in one call |
+| `serial-connect` | Open a telnet session to the guest and use it like a serial port |
 | `media` | List, insert or eject CDs and floppies; put host files on a new one, or copy the files off a floppy |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
@@ -87,9 +88,10 @@ The server sends these rules to every agent that connects:
   The tools do it; see [Without Python](#without-python).
 - **Commands in a Unix guest:** log in on a serial port and use
   `serial-run`. It returns the output and the exit status. If the
-  console is a graphics screen, start a getty on a serial port first.
-  Old Unix tools lack GNU options such as `grep -A` and `sed -i`: use
-  `awk`.
+  console is a graphics screen, open a telnet session with
+  `serial-connect` and log in there: the serial tools work on it the
+  same way. Old Unix tools lack GNU options such as `grep -A` and
+  `sed -i`: use `awk`.
 - **Files without a network:** `media` `insert` with `files` puts host
   files on a new CD or floppy. To get files out, insert a blank floppy
   (`files: []`), let the guest write to it, then `media` `copy-out`.
@@ -127,6 +129,7 @@ Use these:
 | Type into a serial console | `serial-write` (old Unix wants `\r`) |
 | Wait for serial text | `serial-expect` |
 | Read what a serial port printed | `serial-read` |
+| Log in over the network, when the console is the screen | `serial-connect`, then the serial tools on the port it names |
 | Wait for the screen | `wait-screen` |
 | Wait for a VM to start, or to end | `vm-wait` until `up` or `gone` |
 | Wait until a guest service answers on a forwarded port | `vm-wait` until `port` |
@@ -140,6 +143,14 @@ Use these:
 - **Every serial port works.** The serial tools see what the guest
   writes to every serial port, whatever it is connected to: a socket, a
   pty, a window or `mon:stdio`. You don't need a socket of your own.
+- **Telnet sessions are ports too.** `serial-connect` with `address`
+  `2323` connects to 127.0.0.1:2323 and returns a port name such as
+  `telnet0`. With user networking, use the host port that is forwarded
+  to the guest's port 23; to add one in a running VM, use `hmp`
+  `hostfwd_add tcp:127.0.0.1:2323-:23`. lemu answers the telnet options
+  itself (terminal type VT100), so the guest's telnetd needs no setup.
+  When the guest ends the session, the serial tools say so at once;
+  `serial-connect` again opens a new one on the same port name.
 - **Waiting outside the VM:** `vm-wait` covers a QEMU process that
   starts or ends, and a port that should answer. For anything else, use
   your agent's own way to wait in the background (in Claude Code, a

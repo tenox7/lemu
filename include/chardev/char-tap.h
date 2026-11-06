@@ -33,5 +33,7 @@ size_t qemu_chr_tap_read(CharTap *t, uint64_t from, uint8_t *buf,
                          size_t max, uint64_t *actual);
 void qemu_chr_tap_add_notifier(CharTap *t, Notifier *n);
 void qemu_chr_tap_remove_notifier(Notifier *n);
+/* Run the notifiers without new data, for news about the source */
+void qemu_chr_tap_notify(CharTap *t);
 
 #endif

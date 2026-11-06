@@ -109,3 +109,8 @@ void qemu_chr_tap_remove_notifier(Notifier *n)
 {
     notifier_remove(n);
 }
+
+void qemu_chr_tap_notify(CharTap *t)
+{
+    qemu_bh_schedule(t->bh);
+}

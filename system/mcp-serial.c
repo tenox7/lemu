@@ -4,7 +4,8 @@
  * Every chardev frontend of a device gets a tap once the machine is up,
  * so what the guest writes to its serial ports can be read back without
  * changing the command line, even behind mon:stdio.  Input goes straight
- * to the device's own read handlers, past any mux.
+ * to the device's own read handlers, past any mux.  A telnet session
+ * that serial-connect opens is a port too, with a tap of its own.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -20,8 +21,10 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-mcp.h"
 #include "qemu/cutils.h"
+#include "qemu/sockets.h"
 #include "qemu/timer.h"
 #include "system/mcp-serial.h"
+#include "system/mcp-telnet.h"
 #include "system/runstate.h"
 #include "system/system.h"
 #include "ui/input.h"
@@ -35,9 +38,13 @@
 #define SERIAL_LINE_LIMIT   255
 #define SERIAL_QUIET_MS     100     /* before serial-run types */
 #define SERIAL_QUIET_MAX_MS 2000
+#define SERIAL_CONNECT_MS   15000
+#define SERIAL_GREET_MS     3000    /* for the telnet server's greeting */
 
 typedef struct McpSerialPort {
-    CharFrontend *fe;
+    CharFrontend *fe;           /* the device's end; NULL for telnet */
+    McpTelnet *telnet;          /* a session serial-connect opened */
+    bool used;                  /* telnet: a session opened once */
     CharTap *tap;
     uint64_t mark;              /* where the last read or expect stopped */
     bool running;               /* serial-run is typing or waiting */
@@ -131,18 +138,49 @@ void mcp_serial_init(void)
     qemu_add_machine_init_done_notifier(&serial_init_done);
 }
 
+/* "open", "connecting", or "closed" and why */
+static char *mcp_serial_telnet_state(McpSerialPort *port)
+{
+    const char *why = mcp_telnet_reason(port->telnet);
+
+    switch (mcp_telnet_state(port->telnet)) {
+    case MCP_TELNET_OPEN:
+        return g_strdup("open");
+    case MCP_TELNET_CONNECTING:
+        return g_strdup("connecting");
+    default:
+        return why ? g_strdup_printf("closed (%s)", why) : g_strdup("closed");
+    }
+}
+
+/* A telnet session that is no longer open */
+static bool mcp_serial_closed(McpSerialPort *port)
+{
+    return port->telnet &&
+           mcp_telnet_state(port->telnet) == MCP_TELNET_CLOSED;
+}
+
 void mcp_serial_list(strList **tail)
 {
     int i;
 
     for (i = 0; serial_ports && i < serial_ports->len; i++) {
         McpSerialPort *port = g_ptr_array_index(serial_ports, i);
-        Chardev *chr = port->fe->chr;
+        Chardev *chr = port->fe ? port->fe->chr : NULL;
         g_autofree char *backend = NULL;
 
-        backend = chr ? g_strdup_printf("%s (%s)", chr->label,
-                                        object_get_typename(OBJECT(chr)))
-                      : g_strdup("none");
+        if (port->telnet) {
+            g_autofree char *state = mcp_serial_telnet_state(port);
+
+            backend = g_strdup_printf("telnet to %s, %s",
+                                      mcp_telnet_address(port->telnet),
+                                      state);
+        } else if (chr) {
+            backend = g_strdup_printf("%s (%s)", chr->label,
+                                      object_get_typename(OBJECT(chr)));
+        } else {
+            backend = g_strdup("none");
+        }
         QAPI_LIST_APPEND(tail, g_strdup_printf("%s: %s",
                                                qemu_chr_tap_name(port->tap),
                                                backend));
@@ -280,10 +318,12 @@ McpSerialResult *qmp_serial_read(const char *port_name, bool has_cursor,
         res->lost = actual - from;
     }
     res->summary = g_strdup_printf("%s: %zu bytes from %" PRIu64
-                                   "%s, cursor %" PRIu64 "%s%s",
+                                   "%s, cursor %" PRIu64 "%s%s%s",
                                    res->port, n, actual,
                                    actual + n < end ? " (more to read)" : "",
                                    actual + n,
+                                   mcp_serial_closed(port)
+                                   ? "; the telnet session is closed" : "",
                                    n ? ":\n" : "", text->str);
     return res;
 }
@@ -316,6 +356,34 @@ static bool mcp_serial_running(Error **errp)
     return true;
 }
 
+/* ... and a telnet session takes it only while it is open */
+static bool mcp_serial_ready(McpSerialPort *port, Error **errp)
+{
+    g_autofree char *state = NULL;
+
+    if (!mcp_serial_running(errp)) {
+        return false;
+    }
+    if (port->telnet && mcp_telnet_state(port->telnet) != MCP_TELNET_OPEN) {
+        state = mcp_serial_telnet_state(port);
+        error_setg(errp, "the telnet session on %s is %s; serial-connect "
+                   "opens a new one", qemu_chr_tap_name(port->tap), state);
+        return false;
+    }
+    return true;
+}
+
+/* How many bytes @port takes now; -1 if its telnet session closed */
+static int mcp_serial_room(McpSerialPort *port)
+{
+    CharFrontend *fe = port->fe;
+
+    if (port->telnet) {
+        return mcp_telnet_room(port->telnet);
+    }
+    return fe->chr_can_read ? fe->chr_can_read(fe->opaque) : 0;
+}
+
 /*
  * Type @data into @port as fast as the device takes it, or @delay ms
  * apart.  With @finish, a cancel does not stop it halfway, which would
@@ -330,9 +398,17 @@ static bool coroutine_fn mcp_serial_send(McpSerialPort *port,
     size_t pos = 0;
 
     while (pos < data->len) {
-        CharFrontend *fe = port->fe;
-        int n = fe->chr_can_read ? fe->chr_can_read(fe->opaque) : 0;
+        uint8_t *buf = (uint8_t *)data->str + pos;
+        int n = mcp_serial_room(port);
 
+        if (n < 0) {
+            g_autofree char *state = mcp_serial_telnet_state(port);
+
+            error_setg(errp, "the telnet session on %s is %s, after %zu of "
+                       "%zu bytes; serial-connect opens a new one",
+                       qemu_chr_tap_name(port->tap), state, pos, data->len);
+            return false;
+        }
         if (ctx->cancelled && !finish) {
             error_setg(errp, "cancelled after %zu of %zu bytes", pos,
                        data->len);
@@ -350,7 +426,13 @@ static bool coroutine_fn mcp_serial_send(McpSerialPort *port,
             continue;
         }
         n = delay ? 1 : MIN(n, data->len - pos);
-        fe->chr_read(fe->opaque, (uint8_t *)data->str + pos, n);
+        if (port->telnet) {
+            /* the byte after: CR LF goes as it is, a lone CR as CR NUL */
+            mcp_telnet_write(port->telnet, buf, n,
+                             pos + n < data->len ? buf[n] : -1);
+        } else {
+            port->fe->chr_read(port->fe->opaque, buf, n);
+        }
         pos += n;
         last_progress = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
         port->last_io_ms = last_progress;
@@ -373,7 +455,7 @@ McpResult *coroutine_fn qmp_serial_write(const char *port_name,
     McpResult *res;
     uint64_t first, end;
 
-    if (!port || !mcp_serial_running(errp)) {
+    if (!port || !mcp_serial_ready(port, errp)) {
         return NULL;
     }
     /* typing by hand: serial-run no longer waits for its last command */
@@ -469,7 +551,8 @@ typedef bool McpSerialFound(McpSerialScan *s, void *opaque);
 
 /*
  * Scan @port's output from @from on until @found sees what it waits for,
- * the deadline passes or the call is cancelled.  True if @found saw it.
+ * the deadline passes, the call is cancelled or the telnet session
+ * closes.  True if @found saw it.
  */
 static bool coroutine_fn mcp_serial_wait(McpSerialPort *port,
                                          QemuInputCtx *ctx, uint64_t from,
@@ -489,7 +572,8 @@ static bool coroutine_fn mcp_serial_wait(McpSerialPort *port,
             break;
         }
         now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-        if (ctx->cancelled || now >= deadline) {
+        /* a closed session sends nothing more */
+        if (ctx->cancelled || now >= deadline || mcp_serial_closed(port)) {
             break;
         }
         mcp_serial_sleep(ctx, deadline - now);
@@ -587,6 +671,16 @@ McpSerialResult *coroutine_fn qmp_serial_expect(const char *port_name,
                                        qemu_clock_get_ms(QEMU_CLOCK_REALTIME)
                                        - start_ms, end_off,
                                        mcp_serial_tail(s.text, 4096));
+    } else if (mcp_serial_closed(port)) {
+        g_autofree char *state = mcp_serial_telnet_state(port);
+
+        res->cursor = from;
+        res->summary = g_strdup_printf("%s: no match, and the telnet session "
+                                       "is %s; serial-connect opens a new "
+                                       "one. %zu bytes since the cursor, "
+                                       "ending with:\n%s",
+                                       res->port, state, s.len,
+                                       mcp_serial_tail(s.text, 2048));
     } else {
         /* the cursor stays, so the next call sees the same text */
         res->cursor = from;
@@ -795,6 +889,10 @@ static bool coroutine_fn mcp_serial_run_settle(McpSerialPort *port,
         error_setg(errp, "cancelled");
         return false;
     }
+    if (!ended && mcp_serial_closed(port)) {
+        g_clear_pointer(&port->pending, g_free);
+        return mcp_serial_ready(port, errp);
+    }
     if (!ended) {
         error_setg(errp, "the command that serial-run typed before is still "
                    "running on %s; wait for its end with serial-expect "
@@ -850,7 +948,7 @@ static bool coroutine_fn mcp_serial_run_turn(McpSerialPort *port,
         }
         mcp_serial_sleep(ctx, 10);
     }
-    if (!mcp_serial_running(errp)) {
+    if (!mcp_serial_ready(port, errp)) {
         return false;
     }
     port->running = true;
@@ -897,7 +995,7 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
     uint64_t first, from;
     unsigned id = ++run_seq;
     size_t full;
-    bool done;
+    bool done, closed;
 
     if (!port) {
         return NULL;
@@ -974,6 +1072,8 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
         r.out = mcp_serial_run_output(&r, s.text->str, s.text->len, true);
         r.ms = r.me = s.text->len;
     }
+    /* the command went with the session: nothing to wait for */
+    closed = !done && mcp_serial_closed(port);
 
     out = g_string_new_len(s.text->str + r.out, r.ms - r.out);
     if (out->len && out->str[out->len - 1] == '\n') {
@@ -999,6 +1099,8 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
             after++;
         }
         res->cursor = mcp_serial_scan_offset(&s, after);
+    } else if (closed) {
+        res->cursor = mcp_serial_scan_offset(&s, s.text->len);
     } else {
         /* serial-expect for the end goes on from the output */
         res->cursor = res->start;
@@ -1018,6 +1120,12 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
     if (res->has_exit_status) {
         g_string_append_printf(sum, "exit status %" PRId64 " after %" PRId64
                                " ms", res->exit_status, ms);
+    } else if (closed) {
+        g_autofree char *state = mcp_serial_telnet_state(port);
+
+        g_string_append_printf(sum, "the telnet session is %s after %" PRId64
+                               " ms, before the command ended; "
+                               "serial-connect opens a new one", state, ms);
     } else if (!done) {
         g_string_append_printf(sum, "still running after %" PRId64 " ms",
                                ms);
@@ -1032,9 +1140,11 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
     }
     if (lines) {
         g_string_append_printf(sum, ", %" PRId64 " line%s%s", lines,
-                               lines == 1 ? "" : "s", done ? "" : " so far");
+                               lines == 1 ? "" : "s",
+                               done || closed ? "" : " so far");
     } else {
-        g_string_append(sum, done ? ", no output" : ", no output yet");
+        g_string_append(sum, done || closed ? ", no output"
+                                            : ", no output yet");
     }
     if (out->len < full) {
         g_string_append_printf(sum, ", showing the %s %" PRId64
@@ -1046,7 +1156,7 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
         g_string_append_printf(sum, "; the first %" PRIu64 " bytes are "
                                "lost, more than 1 MB came", s.start - from);
     }
-    if (!done) {
+    if (!done && !closed) {
         g_string_append_printf(sum, "; wait for the end with serial-expect "
                                "pattern \"%s\", or stop the command with "
                                "serial-write \"\\x03\"", res->end_pattern);
@@ -1058,5 +1168,254 @@ McpSerialRunResult *coroutine_fn qmp_serial_run(const char *port_name,
     res->summary = g_string_free(g_steal_pointer(&sum), false);
     g_free(r.status);
     mcp_serial_scan_free(&s);
+    return res;
+}
+
+/* serial-connect */
+
+/* host:port, a host (port 23), or a port on 127.0.0.1 */
+static bool mcp_serial_telnet_parse(const char *address, char **host,
+                                    char **tcp_port, Error **errp)
+{
+    g_autoptr(InetSocketAddress) inet = g_new0(InetSocketAddress, 1);
+    g_autofree char *full = NULL;
+
+    if (*address && !address[strspn(address, "0123456789")]) {
+        full = g_strdup_printf("127.0.0.1:%s", address);
+    } else if (*address != '[' && !strchr(address, ':')) {
+        full = g_strdup_printf("%s:23", address);
+    } else {
+        full = g_strdup(address);
+    }
+    if (!*address || inet_parse(inet, full, NULL) < 0) {
+        error_setg(errp, "address \"%s\" is not host:port, a host or a port "
+                   "on 127.0.0.1", address);
+        return false;
+    }
+    *host = g_strdup(*inet->host ? inet->host : "127.0.0.1");
+    *tcp_port = g_strdup(inet->port);
+    return true;
+}
+
+static McpSerialPort *mcp_serial_telnet_find(const char *host,
+                                             const char *tcp_port)
+{
+    int i;
+
+    for (i = 0; serial_ports && i < serial_ports->len; i++) {
+        McpSerialPort *port = g_ptr_array_index(serial_ports, i);
+
+        if (port->telnet && mcp_telnet_matches(port->telnet, host, tcp_port)) {
+            return port;
+        }
+    }
+    return NULL;
+}
+
+/*
+ * A port for a session to @host:@tcp_port, named telnet0, telnet1, ...
+ * One whose session never opened is taken first, so failed connects do
+ * not pile up.
+ */
+static McpSerialPort *mcp_serial_telnet_add(const char *host,
+                                            const char *tcp_port)
+{
+    g_autofree char *name = NULL;
+    McpSerialPort *port;
+    int i;
+
+    for (i = 0; serial_ports && i < serial_ports->len; i++) {
+        port = g_ptr_array_index(serial_ports, i);
+        if (port->telnet && !port->used && mcp_serial_closed(port)) {
+            mcp_telnet_set_address(port->telnet, host, tcp_port);
+            return port;
+        }
+    }
+    for (i = 0; !name || mcp_serial_find(name, NULL); i++) {
+        g_free(name);
+        name = g_strdup_printf("telnet%d", i);
+    }
+    port = g_new0(McpSerialPort, 1);
+    port->tap = qemu_chr_tap_new(name, SERIAL_TAP_SIZE);
+    port->telnet = mcp_telnet_new(host, tcp_port, port->tap);
+    port->io.notify = mcp_serial_io;
+    qemu_chr_tap_add_notifier(port->tap, &port->io);
+    if (!serial_ports) {
+        serial_ports = g_ptr_array_new();
+    }
+    g_ptr_array_add(serial_ports, port);
+    g_ptr_array_sort(serial_ports, mcp_serial_cmp);
+    return port;
+}
+
+/* What the session sent from the port's mark on, as text */
+static GString *mcp_serial_telnet_text(McpSerialPort *port)
+{
+    g_autofree uint8_t *buf = g_malloc(SERIAL_READ_MAX);
+    uint64_t actual;
+    size_t n = qemu_chr_tap_read(port->tap, port->mark, buf, SERIAL_READ_MAX,
+                                 &actual);
+
+    return mcp_serial_text(buf, n, true, NULL);
+}
+
+static bool mcp_serial_loopback(const char *host)
+{
+    return g_str_has_prefix(host, "127.") || !strcmp(host, "localhost") ||
+           !strcmp(host, "::1");
+}
+
+/*
+ * Open @port's telnet session and wait until it is open and the
+ * server's greeting has come and gone quiet.  The session's output
+ * starts at the port's mark.
+ */
+static bool coroutine_fn mcp_serial_telnet_open(McpSerialPort *port,
+                                                QemuInputCtx *ctx,
+                                                const char *host,
+                                                Error **errp)
+{
+    McpTelnet *t = port->telnet;
+    McpSerialWaiter w = { .notifier.notify = mcp_serial_wake, .ctx = ctx };
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    int64_t deadline = now + SERIAL_CONNECT_MS, opened = 0, changed = 0;
+    uint64_t first, end, seen;
+    McpTelnetState state;
+
+    qemu_chr_tap_range(port->tap, &first, &end);
+    port->mark = seen = end;
+    g_clear_pointer(&port->pending, g_free);
+    qemu_chr_tap_add_notifier(port->tap, &w.notifier);
+    mcp_telnet_open(t);
+    for (;;) {
+        int64_t wake = deadline;
+
+        state = mcp_telnet_state(t);
+        now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        if (state == MCP_TELNET_CLOSED || ctx->cancelled) {
+            break;
+        }
+        if (state == MCP_TELNET_OPEN) {
+            opened = opened ? opened : now;
+            qemu_chr_tap_range(port->tap, &first, &end);
+            if (end != seen) {
+                seen = end;
+                changed = now;
+            }
+            wake = opened + SERIAL_GREET_MS;
+            if (seen > port->mark) {
+                wake = MIN(wake, changed + SERIAL_QUIET_MS * 3);
+            }
+        }
+        if (now >= wake) {
+            break;
+        }
+        mcp_serial_sleep(ctx, wake - now);
+    }
+    qemu_chr_tap_remove_notifier(&w.notifier);
+
+    if (ctx->cancelled) {
+        mcp_telnet_close(t, "cancelled while connecting");
+        error_setg(errp, "cancelled");
+        return false;
+    }
+    if (state == MCP_TELNET_CONNECTING) {
+        mcp_telnet_close(t, "no answer");
+        error_setg(errp, "no answer from %s within %d s",
+                   mcp_telnet_address(t), SERIAL_CONNECT_MS / 1000);
+        return false;
+    }
+    if (state == MCP_TELNET_CLOSED && opened) {
+        g_autoptr(GString) text = mcp_serial_telnet_text(port);
+
+        error_setg(errp, "%s took the connection but closed it at once%s%s; "
+                   "with user networking, that is what happens while "
+                   "nothing listens on the guest port", mcp_telnet_address(t),
+                   text->len ? ", saying: " : "",
+                   mcp_serial_tail(text, 512));
+        return false;
+    }
+    if (state == MCP_TELNET_CLOSED) {
+        error_setg(errp, "cannot connect to %s: %s%s", mcp_telnet_address(t),
+                   mcp_telnet_reason(t),
+                   mcp_serial_loopback(host)
+                   ? "; with user networking, forward a host port to the "
+                     "guest's telnet port first, for example with hmp "
+                     "\"hostfwd_add tcp:127.0.0.1:2323-:23\"" : "");
+        return false;
+    }
+    return true;
+}
+
+McpSerialResult *coroutine_fn qmp_serial_connect(const char *address,
+                                                 bool has_close, bool close,
+                                                 Error **errp)
+{
+    g_auto(QemuInputCtx) local = { 0 };
+    QemuInputCtx *ctx = mcp_serial_ctx(&local);
+    g_autofree char *host = NULL;
+    g_autofree char *tcp_port = NULL;
+    g_autoptr(GString) text = NULL;
+    McpSerialPort *port;
+    McpSerialResult *res;
+    uint64_t first, end;
+    const char *name;
+
+    if (!mcp_serial_telnet_parse(address, &host, &tcp_port, errp)) {
+        return NULL;
+    }
+    port = mcp_serial_telnet_find(host, tcp_port);
+    if (has_close && close) {
+        if (!port || mcp_telnet_state(port->telnet) != MCP_TELNET_OPEN) {
+            error_setg(errp, "no telnet session to %s is open",
+                       port ? mcp_telnet_address(port->telnet) : address);
+            return NULL;
+        }
+        mcp_telnet_close(port->telnet, "serial-connect closed it");
+        g_clear_pointer(&port->pending, g_free);
+        qemu_chr_tap_range(port->tap, &first, &end);
+        port->mark = end;
+        res = g_new0(McpSerialResult, 1);
+        res->port = g_strdup(qemu_chr_tap_name(port->tap));
+        res->start = res->cursor = end;
+        res->summary = g_strdup_printf("%s: closed the session to %s",
+                                       res->port,
+                                       mcp_telnet_address(port->telnet));
+        return res;
+    }
+    if (!mcp_serial_running(errp)) {
+        return NULL;
+    }
+    if (!port) {
+        port = mcp_serial_telnet_add(host, tcp_port);
+    }
+    name = qemu_chr_tap_name(port->tap);
+    res = g_new0(McpSerialResult, 1);
+    res->port = g_strdup(name);
+    if (mcp_telnet_state(port->telnet) == MCP_TELNET_OPEN) {
+        res->start = res->cursor = port->mark;
+        res->summary = g_strdup_printf("%s: already connected to %s; the "
+                                       "serial tools go on from cursor %"
+                                       PRIu64, name,
+                                       mcp_telnet_address(port->telnet),
+                                       port->mark);
+        return res;
+    }
+    if (!mcp_serial_telnet_open(port, ctx, host, errp)) {
+        qapi_free_McpSerialResult(res);
+        return NULL;
+    }
+    port->used = true;
+    /* the greeting stays unread, so serial-expect finds the prompt */
+    text = mcp_serial_telnet_text(port);
+    res->start = res->cursor = port->mark;
+    res->summary = g_strdup_printf("%s: connected to %s; give port \"%s\" to "
+                                   "the serial tools, which start at cursor %"
+                                   PRIu64 "%s%s", name,
+                                   mcp_telnet_address(port->telnet), name,
+                                   port->mark,
+                                   text->len ? ". It says:\n"
+                                             : ". Nothing came yet.",
+                                   mcp_serial_tail(text, 2048));
     return res;
 }

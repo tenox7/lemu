@@ -16,6 +16,10 @@
  * The serial tests play the guest on COM1: a terminal that echoes what
  * "serial-run" types, and a shell that answers it.
  *
+ * The telnet test plays a telnet server: "serial-connect" must answer
+ * its options and take the telnet commands out of what it sends, and
+ * what is typed must have IAC doubled and a lone CR followed by NUL.
+ *
  * The debug tests run a BIOS of two instructions under TCG, step it,
  * stop it at an address and patch it while it runs.
  *
@@ -28,6 +32,7 @@
 
 #include "qemu/osdep.h"
 #include <math.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include "libqtest.h"
@@ -36,6 +41,7 @@
 #include "qobject/qdict.h"
 #include "qobject/qjson.h"
 #include "qobject/qlist.h"
+#include "qobject/qstring.h"
 #include "qemu/bswap.h"
 #include "qemu/timer.h"
 #include "qemu/units.h"
@@ -942,6 +948,315 @@ static void test_serial_run_cancel(void)
     rmdir(dir);
 }
 
+#define TN_IAC     "\xff"
+#define TN_DONT    "\xfe"
+#define TN_DO      "\xfd"
+#define TN_WONT    "\xfc"
+#define TN_WILL    "\xfb"
+#define TN_SB      "\xfa"
+#define TN_NOP     "\xf1"
+#define TN_SE      "\xf0"
+#define TN_ECHO    "\x01"
+#define TN_SGA     "\x03"
+#define TN_TTYPE   "\x18"
+#define TN_NAWS    "\x1f"
+#define TN_NEWENV  "\x27"
+
+typedef struct TelnetServer {
+    int fd;                     /* listens */
+    int port;
+    GThread *thread;
+    char *failed;               /* what went wrong in the thread */
+} TelnetServer;
+
+static int telnet_listen(int *port, bool keep)
+{
+    struct sockaddr_in a = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t len = sizeof(a);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    g_assert(fd >= 0);
+    g_assert(!bind(fd, (struct sockaddr *)&a, sizeof(a)));
+    g_assert(!getsockname(fd, (struct sockaddr *)&a, &len));
+    *port = ntohs(a.sin_port);
+    if (!keep) {
+        close(fd);              /* a port where nothing listens */
+        return -1;
+    }
+    g_assert(!listen(fd, 1));
+    return fd;
+}
+
+static void telnet_send(int fd, const char *data, size_t len)
+{
+    g_assert_cmpint(send(fd, data, len, 0), ==, len);
+}
+
+/* Read exactly what the client should send next */
+static bool telnet_expect(TelnetServer *ts, int fd, const char *what,
+                          const char *want, size_t len)
+{
+    g_autofree char *buf = g_malloc0(len + 1);
+    size_t got = 0;
+
+    while (got < len) {
+        ssize_t n = recv(fd, buf + got, len - got, 0);
+
+        if (n <= 0) {
+            break;
+        }
+        got += n;
+    }
+    if (got != len || memcmp(buf, want, len)) {
+        ts->failed = g_strdup_printf("%s: %zu of %zu bytes%s", what, got, len,
+                                     got == len ? ", not the ones wanted"
+                                                : "");
+        return false;
+    }
+    return true;
+}
+
+static int telnet_accept(int lfd)
+{
+    struct timeval tv = { .tv_sec = 10 };
+    int fd = accept(lfd, NULL, NULL);
+
+    g_assert(fd >= 0);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+/* String literals, with the NULs in them */
+#define TN_SEND(fd, s) telnet_send(fd, s, sizeof(s) - 1)
+#define TN_EXPECT(ts, fd, what, s) telnet_expect(ts, fd, what, s, sizeof(s) - 1)
+
+static gpointer telnet_server(gpointer opaque)
+{
+    TelnetServer *ts = opaque;
+    char c;
+    int fd = telnet_accept(ts->fd);
+
+    /* what a BSD telnetd asks first, and an option nobody knows */
+    TN_SEND(fd, TN_IAC TN_DO TN_TTYPE TN_IAC TN_WILL TN_ECHO
+                TN_IAC TN_WILL TN_SGA TN_IAC TN_DO TN_NAWS
+                TN_IAC TN_DO TN_NEWENV TN_IAC TN_WILL "\x63");
+    if (!TN_EXPECT(ts, fd, "option answers",
+                   TN_IAC TN_WILL TN_TTYPE TN_IAC TN_DO TN_ECHO
+                   TN_IAC TN_DO TN_SGA TN_IAC TN_WONT TN_NAWS
+                   TN_IAC TN_WONT TN_NEWENV TN_IAC TN_DONT "\x63")) {
+        goto out;
+    }
+    /* asked again: no answer, or the two ends could loop */
+    TN_SEND(fd, TN_IAC TN_WILL TN_ECHO
+                TN_IAC TN_SB TN_TTYPE "\x01" TN_IAC TN_SE);
+    if (!TN_EXPECT(ts, fd, "terminal type",
+                   TN_IAC TN_SB TN_TTYPE "\x00" "VT100" TN_IAC TN_SE)) {
+        goto out;
+    }
+    /* a CR NUL, a doubled IAC and a NOP in the text */
+    TN_SEND(fd, "line1\r\na\r\0b" TN_IAC TN_IAC "c" TN_IAC TN_NOP
+                "\r\nlogin: ");
+    if (!TN_EXPECT(ts, fd, "a lone CR", "root\r\0") ||
+        !TN_EXPECT(ts, fd, "CR LF and IAC", "a\r\nb" TN_IAC TN_IAC) ||
+        !TN_EXPECT(ts, fd, "one byte at a time", "x\r\ny\r\0")) {
+        goto out;
+    }
+    TN_SEND(fd, "bye\r\n");
+    close(fd);
+
+    /* the second session ends from the client's side */
+    fd = telnet_accept(ts->fd);
+    TN_SEND(fd, "again\r\nlogin: ");
+    if (recv(fd, &c, 1, 0) != 0) {
+        ts->failed = g_strdup("serial-connect close left the session open");
+    }
+out:
+    close(fd);
+    return NULL;
+}
+
+static QDict *telnet_call(QTestState *qts, const char *cmd, QDict *args,
+                          char **error)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute': %s, 'arguments': %p}", cmd,
+                           args);
+    QDict *ret = qdict_get_qdict(rsp, "return");
+    QDict *err = qdict_get_qdict(rsp, "error");
+
+    *error = err ? g_strdup(qdict_get_str(err, "desc")) : NULL;
+    if (ret) {
+        g_test_message("%s: %s", cmd, qdict_get_str(ret, "summary"));
+        qobject_ref(ret);
+    }
+    qobject_unref(rsp);
+    return ret;
+}
+
+static QDict *telnet_ok(QTestState *qts, const char *cmd, QDict *args)
+{
+    g_autofree char *err = NULL;
+    QDict *ret = telnet_call(qts, cmd, args, &err);
+
+    if (err) {
+        g_test_message("%s: %s", cmd, err);
+        g_assert_not_reached();
+    }
+    return ret;
+}
+
+static void telnet_error(QTestState *qts, const char *cmd, QDict *args,
+                         const char *want)
+{
+    g_autofree char *err = NULL;
+
+    g_assert(!telnet_call(qts, cmd, args, &err));
+    if (!strstr(err, want)) {
+        g_test_message("%s: '%s' lacks '%s'", cmd, err, want);
+        g_assert_not_reached();
+    }
+}
+
+static QDict *telnet_args(const char *key, const char *val, const char *key2,
+                          const char *val2)
+{
+    QDict *args = qdict_new();
+
+    qdict_put_str(args, key, val);
+    if (key2) {
+        qdict_put_str(args, key2, val2);
+    }
+    return args;
+}
+
+static void telnet_summary(QDict *ret, const char *want)
+{
+    const char *sum = qdict_get_str(ret, "summary");
+
+    if (!strstr(sum, want)) {
+        g_test_message("'%s' lacks '%s'", sum, want);
+        g_assert_not_reached();
+    }
+    qobject_unref(ret);
+}
+
+/* vm-info's list of serial ports, one per line */
+static char *telnet_ports(QTestState *qts)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute': 'vm-info'}");
+    QList *list = qdict_get_qlist(qdict_get_qdict(rsp, "return"), "serial");
+    GString *s = g_string_new(NULL);
+    QListEntry *e;
+
+    QLIST_FOREACH_ENTRY(list, e) {
+        g_string_append_printf(s, "%s\n",
+                               qstring_get_str(qobject_to(QString,
+                                                          e->value)));
+    }
+    qobject_unref(rsp);
+    return g_string_free(s, false);
+}
+
+static void test_serial_telnet(void)
+{
+    TelnetServer ts = { 0 };
+    QTestState *qts = qtest_init("-machine none -display none");
+    g_autofree char *addr = NULL;
+    g_autofree char *gone1 = NULL;
+    g_autofree char *gone2 = NULL;
+    g_autofree char *ports = NULL;
+    g_autofree char *want = NULL;
+    QDict *args, *ret;
+    gint64 start;
+    int port1, port2;
+
+    ts.fd = telnet_listen(&ts.port, true);
+    ts.thread = g_thread_new("telnet", telnet_server, &ts);
+    addr = g_strdup_printf("%d", ts.port);
+
+    ret = telnet_ok(qts, "serial-connect",
+                    telnet_args("address", addr, NULL, NULL));
+    g_assert_cmpstr(qdict_get_str(ret, "port"), ==, "telnet0");
+    g_assert_cmpint(qdict_get_int(ret, "cursor"), ==, 0);
+    telnet_summary(ret, "login: ");
+    ret = telnet_ok(qts, "serial-expect",
+                    telnet_args("port", "telnet0", "pattern", "login: $"));
+    g_assert(qdict_get_bool(ret, "matched"));
+    qobject_unref(ret);
+
+    qobject_unref(telnet_ok(qts, "serial-write",
+                            telnet_args("port", "telnet0", "text",
+                                        "root\\r")));
+    qobject_unref(telnet_ok(qts, "serial-write",
+                            telnet_args("port", "telnet0", "text",
+                                        "a\\r\\nb\\xff")));
+    args = telnet_args("port", "telnet0", "text", "x\\r\\ny\\r");
+    qdict_put_int(args, "char-delay-ms", 1);
+    qobject_unref(telnet_ok(qts, "serial-write", args));
+
+    /* the server says bye and hangs up: the wait ends at once */
+    start = g_get_monotonic_time();
+    args = telnet_args("port", "telnet0", "pattern", "never");
+    qdict_put_int(args, "timeout-ms", 20000);
+    ret = telnet_ok(qts, "serial-expect", args);
+    g_assert(!qdict_get_bool(ret, "matched"));
+    g_assert_cmpint(g_get_monotonic_time() - start, <, 10 * G_USEC_PER_SEC);
+    telnet_summary(ret, "closed (the other end closed it)");
+    telnet_error(qts, "serial-write",
+                 telnet_args("port", "telnet0", "text", "ls\\r"),
+                 "the telnet session on telnet0 is closed");
+
+    /* telnet commands taken out, CR NUL made a lone CR, IAC IAC kept */
+    args = telnet_args("port", "telnet0", NULL, NULL);
+    qdict_put_int(args, "cursor", 0);
+    qdict_put_bool(args, "strip-ansi", false);
+    ret = telnet_ok(qts, "serial-read", args);
+    telnet_summary(ret, "line1\r\na\rb\xef\xbf\xbd" "c\r\nlogin: bye\r\n");
+
+    /* a new session on the same port, then closed from here */
+    ret = telnet_ok(qts, "serial-connect",
+                    telnet_args("address", addr, NULL, NULL));
+    g_assert_cmpstr(qdict_get_str(ret, "port"), ==, "telnet0");
+    telnet_summary(ret, "again");
+    args = telnet_args("address", addr, NULL, NULL);
+    qdict_put_bool(args, "close", true);
+    telnet_summary(telnet_ok(qts, "serial-connect", args),
+                   "closed the session");
+    g_thread_join(ts.thread);
+    close(ts.fd);
+    if (ts.failed) {
+        g_test_message("telnet server: %s", ts.failed);
+        g_assert_not_reached();
+    }
+
+    /* nothing listens: a hint, and failed ports do not pile up */
+    telnet_listen(&port1, false);
+    gone1 = g_strdup_printf("127.0.0.1:%d", port1);
+    telnet_error(qts, "serial-connect",
+                 telnet_args("address", gone1, NULL, NULL), "hostfwd_add");
+    telnet_listen(&port2, false);
+    gone2 = g_strdup_printf("localhost:%d", port2);
+    telnet_error(qts, "serial-connect",
+                 telnet_args("address", gone2, NULL, NULL), "cannot connect");
+    ports = telnet_ports(qts);
+    want = g_strdup_printf("telnet0: telnet to 127.0.0.1:%d, closed "
+                           "(serial-connect closed it)\ntelnet1: telnet to "
+                           "localhost:%d, closed (", ts.port, port2);
+    if (!strstr(ports, want) || strstr(ports, "telnet2")) {
+        g_test_message("ports: %s", ports);
+        g_assert_not_reached();
+    }
+
+    args = telnet_args("address", gone1, NULL, NULL);
+    qdict_put_bool(args, "close", true);
+    telnet_error(qts, "serial-connect", args, "no telnet session");
+    telnet_error(qts, "serial-connect", telnet_args("address", "", NULL, NULL),
+                 "is not host:port");
+    qtest_quit(qts);
+}
+
 /*
  * A BIOS of three bytes at the reset vector: inc ax at 0xfffffff0,
  * then jmp short back to it at 0xfffffff1.  Halts everywhere else.
@@ -1704,6 +2019,7 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);
     qtest_add_func("/mcp/serial/run-cancel", test_serial_run_cancel);
+    qtest_add_func("/mcp/serial/telnet", test_serial_telnet);
     qtest_add_func("/mcp/media/disc", test_media_disc);
     qtest_add_func("/mcp/media/floppy", test_media_floppy);
     if (qtest_has_accel("tcg")) {

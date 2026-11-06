@@ -941,7 +941,8 @@
 #     lemu keeps the last 1 MB of each port.  Offsets count every
 #     byte since the VM started.
 #
-# @port: "serial0", "serial1", ... or a chardev id (default: serial0)
+# @port: "serial0", "serial1", ..., a chardev id, or a telnet session
+#     from serial-connect (default: serial0)
 #
 # @cursor: offset to read from (default: where the last serial-read
 #     or serial-expect stopped, or where the last serial-write
@@ -972,7 +973,8 @@
 #     and serial-read look only at what the guest writes from now on;
 #     give them a cursor to look further back.
 #
-# @port: "serial0", "serial1", ... or a chardev id (default: serial0)
+# @port: "serial0", "serial1", ..., a chardev id, or a telnet session
+#     from serial-connect (default: serial0)
 #
 # @text: the text
 #
@@ -1001,7 +1003,8 @@
 #     the text up to the end of the match and the cursor after it.
 #     Use "(?i)" for case-insensitive matching.
 #
-# @port: "serial0", "serial1", ... or a chardev id (default: serial0)
+# @port: "serial0", "serial1", ..., a chardev id, or a telnet session
+#     from serial-connect (default: serial0)
 #
 # @pattern: a regular expression (PCRE)
 #
@@ -1084,7 +1087,8 @@
 #     (after its timeout or a cancel), unless serial-write was used
 #     since.
 #
-# @port: "serial0", "serial1", ... or a chardev id (default: serial0)
+# @port: "serial0", "serial1", ..., a chardev id, or a telnet session
+#     from serial-connect (default: serial0)
 #
 # @command: one line, without "\r" at the end
 #
@@ -1118,6 +1122,35 @@
             '*tail': 'bool', '*line-limit': 'int',
             '*char-delay-ms': 'int' },
   'returns': 'McpSerialRunResult',
+  'features': [ 'mcp' ],
+  'coroutine': true }
+
+##
+# @serial-connect:
+#     Open a telnet session and use it like a serial port: give the
+#     port name this returns to serial-read, serial-write,
+#     serial-expect and serial-run.  For guests whose console is the
+#     screen, or for a second shell.  With user networking, connect to
+#     the host port that is forwarded to the guest's port 23; to make
+#     one, use hmp "hostfwd_add tcp:127.0.0.1:2323-:23".  lemu answers
+#     the telnet options itself (terminal type VT100).  When the guest
+#     ends the session, the serial tools say so; connect again for a
+#     new one.  The summary shows what the guest sent first, such as
+#     its login prompt.
+#
+# @address: host:port, a host (port 23), or just a port on 127.0.0.1
+#
+# @close: end the session instead (default: false)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# Since: 11.2
+##
+{ 'command': 'serial-connect',
+  'data': { 'address': 'str', '*close': 'bool' },
+  'returns': 'McpSerialResult',
   'features': [ 'mcp' ],
   'coroutine': true }
 
