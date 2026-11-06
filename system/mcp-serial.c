@@ -371,6 +371,7 @@ McpResult *coroutine_fn qmp_serial_write(const char *port_name,
     QemuInputCtx *ctx = mcp_serial_ctx(&local);
     g_autoptr(GString) data = NULL;
     McpResult *res;
+    uint64_t first, end;
 
     if (!port || !mcp_serial_running(errp)) {
         return NULL;
@@ -379,6 +380,12 @@ McpResult *coroutine_fn qmp_serial_write(const char *port_name,
     g_clear_pointer(&port->pending, g_free);
     data = (has_escapes && !escapes) ? g_string_new(text)
                                      : mcp_unescape(text);
+    /*
+     * What the guest wrote before this was seen, or passed over: the next
+     * serial-expect waits for the answer, not for an old prompt.
+     */
+    qemu_chr_tap_range(port->tap, &first, &end);
+    port->mark = end;
     if (!mcp_serial_send(port, ctx, data,
                          has_char_delay_ms ? MAX(char_delay_ms, 0) : 0,
                          false, errp)) {
@@ -386,8 +393,10 @@ McpResult *coroutine_fn qmp_serial_write(const char *port_name,
     }
 
     res = g_new0(McpResult, 1);
-    res->summary = g_strdup_printf("sent %zu bytes to %s", data->len,
-                                   qemu_chr_tap_name(port->tap));
+    res->summary = g_strdup_printf("sent %zu bytes to %s; serial-expect and"
+                                   " serial-read go on from cursor %" PRIu64,
+                                   data->len, qemu_chr_tap_name(port->tap),
+                                   end);
     return res;
 }
 

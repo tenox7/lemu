@@ -924,7 +924,8 @@
 # @port: "serial0", "serial1", ... or a chardev id (default: serial0)
 #
 # @cursor: offset to read from (default: where the last serial-read
-#     or serial-expect stopped)
+#     or serial-expect stopped, or where the last serial-write
+#     started)
 #
 # @max-bytes: at most this much, up to 16384 (default: 4096)
 #
@@ -947,7 +948,9 @@
 ##
 # @serial-write:
 #     Send text to a serial port, as if typed on a terminal.  Old
-#     Unix consoles want "\r" to end a line.
+#     Unix consoles want "\r" to end a line.  The next serial-expect
+#     and serial-read look only at what the guest writes from now on;
+#     give them a cursor to look further back.
 #
 # @port: "serial0", "serial1", ... or a chardev id (default: serial0)
 #
@@ -983,7 +986,8 @@
 # @pattern: a regular expression (PCRE)
 #
 # @cursor: offset to search from (default: where the last
-#     serial-read or serial-expect stopped)
+#     serial-read or serial-expect stopped, or where the last
+#     serial-write started; a failed serial-expect leaves it there)
 #
 # @timeout-ms: give up after this long, at most 1500000, 25 minutes
 #     (default: 30000)

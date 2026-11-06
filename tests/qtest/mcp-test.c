@@ -476,6 +476,28 @@ static void test_serial_expect(void)
     g_assert(ret);
     g_assert(!qdict_get_bool(ret, "matched"));
     qobject_unref(rsp);
+
+    /*
+     * A failed serial-expect leaves the cursor before the prompt, but the
+     * answer typed after it moves the cursor: the next serial-expect
+     * waits for the next prompt, not the old one.
+     */
+    uart_puts(qts, "Erase? [y/n]: ");
+    rsp = qtest_qmp(qts, "{'execute': 'serial-expect', 'arguments':"
+                    " {'pattern': 'Password:', 'timeout-ms': 200}}");
+    g_assert(!qdict_get_bool(qdict_get_qdict(rsp, "return"), "matched"));
+    qobject_unref(rsp);
+    qtest_qmp_assert_success(qts, "{'execute': 'serial-write', 'arguments':"
+                             " {'text': 'n'}}");
+    g_assert_cmpint(qtest_inb(qts, COM1), ==, 'n');
+    uart_puts(qts, "n\r\nKeep? [y/n]: ");
+    rsp = qtest_qmp(qts, "{'execute': 'serial-expect', 'arguments':"
+                    " {'pattern': '[A-Za-z]+\\\\? \\\\[y/n\\\\]',"
+                    " 'timeout-ms': 5000}}");
+    ret = qdict_get_qdict(rsp, "return");
+    g_assert(qdict_get_bool(ret, "matched"));
+    g_assert_cmpstr(qdict_get_str(ret, "match"), ==, "Keep? [y/n]");
+    qobject_unref(rsp);
     qtest_quit(qts);
 }
 
