@@ -1468,6 +1468,9 @@
 # @watch: what the CPU did to the watched memory, when that stopped
 #     the VM (debug-run)
 #
+# @exception: the exception the CPU took, when that stopped the VM
+#     (debug-run)
+#
 # @history: how the CPU got there (debug-run with @history): the last
 #     blocks of code it ran, oldest first, each as start-end in hex,
 #     with " xN" when it ran N times in a row
@@ -1479,7 +1482,7 @@
   'data': { 'reached': 'bool', '*cpu': 'int', '*pc': 'str',
             '*hits': 'int', '*steps': 'int', 'running': 'bool',
             '*retry': 'bool', '*watch': 'McpWatchHit',
-            '*history': [ 'str' ] },
+            '*exception': 'McpExceptionHit', '*history': [ 'str' ] },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1546,6 +1549,61 @@
   'if': 'CONFIG_TCG' }
 
 ##
+# @McpExceptions:
+#     The exceptions a debug tool stops at or logs.  An exception is a
+#     trap or a fault that a CPU takes: it notes where it was and goes
+#     to the guest's handler for it, as for a page fault, a TLB miss,
+#     an illegal instruction, a divide by zero, a breakpoint
+#     instruction or a system call.  Interrupts from devices are not
+#     exceptions.  The numbers are QEMU's for the CPU, not names:
+#     debug-trace with @exception {} shows which ones a guest takes,
+#     and how often.
+#
+# @numbers: only these, up to 32 (default: all)
+#
+# @skip: all but these, up to 32, such as the ones a guest takes all
+#     the time (default: none)
+#
+# Since: 11.2
+##
+{ 'struct': 'McpExceptions',
+  'data': { '*numbers': [ 'int' ], '*skip': [ 'int' ] },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpExceptionHit:
+#     An exception a CPU took.
+#
+# @number: QEMU's number for it
+#
+# @pc: the instruction that took it, in hex
+#
+# @handler: where the CPU went, in hex: the first instruction of the
+#     guest's handler
+#
+# Since: 11.2
+##
+{ 'struct': 'McpExceptionHit',
+  'data': { 'number': 'int', 'pc': 'str', 'handler': 'str' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpExceptionCount:
+#     How often CPUs took an exception (@debug-trace).
+#
+# @number: QEMU's number for it
+#
+# @count: how often
+#
+# @handler: where the CPU went the first time, in hex
+#
+# Since: 11.2
+##
+{ 'struct': 'McpExceptionCount',
+  'data': { 'number': 'int', 'count': 'int', 'handler': 'str' },
+  'if': 'CONFIG_TCG' }
+
+##
 # @McpWatchHit:
 #     What a CPU did to watched memory.
 #
@@ -1564,17 +1622,19 @@
 ##
 # @debug-run:
 #     Let the guest run until a CPU gets to an address (a breakpoint),
-#     or touches watched memory, then stop the VM and show where it
-#     is, the registers and any @memory.  Use it instead of a GDB
-#     script.  The VM stays stopped: look around with hmp, go on with
-#     debug-step or another debug-run, or resume it with vm-power.  A
-#     CPU that is stopped at one of the addresses when the call begins
-#     first steps past it, so the call stops at the next arrival.
+#     touches watched memory, or takes an exception, then stop the VM
+#     and show where it is, the registers and any @memory.  Use it
+#     instead of a GDB script.  The VM stays stopped: look around with
+#     hmp, go on with debug-step or another debug-run, or resume it
+#     with vm-power.  A CPU that is stopped at one of the addresses
+#     when the call begins first steps past it, so the call stops at
+#     the next arrival.
 #
 # @address: where to stop: hex with 0x, or decimal, or a list of up
 #     to 64 of them, to stop at whichever a CPU gets to first.  A
 #     virtual address as the CPU sees it (on x86 the linear address:
-#     CS base plus EIP).  Give it, @watch, or both.
+#     CS base plus EIP).  Give it, @watch, @exception, or more of
+#     them.
 #
 # @address-mask: compare only the bits of each address that are set
 #     in this number, written as an address: a CPU stops at any
@@ -1589,8 +1649,14 @@
 #     CPUs are watched, not devices that write memory themselves
 #     (DMA).
 #
-# @hits: stop at this arrival or watched access, counting from 1
-#     (default: 1)
+# @exception: stop right after a CPU takes one of these exceptions,
+#     at the first instruction of the guest's handler; the summary
+#     shows the instruction that took it.  {} stops at any: to catch
+#     a crash, an illegal instruction or a trap the guest does not
+#     expect.
+#
+# @hits: stop at this arrival, watched access or exception, counting
+#     from 1 (default: 1)
 #
 # @cpu: watch only this CPU (default: all)
 #
@@ -1612,7 +1678,8 @@
 ##
 { 'command': 'debug-run',
   'data': { '*address': 'McpAddresses', '*address-mask': 'str',
-            '*watch': 'McpWatches', '*hits': 'int',
+            '*watch': 'McpWatches', '*exception': 'McpExceptions',
+            '*hits': 'int',
             '*cpu': 'int', '*memory': [ 'McpDebugMemory' ],
             '*history': 'int', '*timeout-ms': 'int' },
   'returns': 'McpDebugStop',
@@ -1629,11 +1696,14 @@
 # @cpu: the CPU
 #
 # @pc: the address it got to, or the instruction that touched the
-#     watched memory, in hex
+#     watched memory or took the exception, in hex
 #
 # @watch: what it did to the watched memory, when that was the hit
 #
 # @value: the watched word after that, in hex
+#
+# @exception: the exception it took, when that was the hit; the
+#     registers and memory are those at the handler
 #
 # @retry: true when the CPU may be back to run the instruction again,
 #     after it took an interruption there (see @McpDebugStop)
@@ -1644,15 +1714,16 @@
 ##
 { 'struct': 'McpTraceEntry',
   'data': { 'hit': 'int', 'cpu': 'int', 'pc': 'str',
-            '*watch': 'McpWatchHit', '*value': 'str', '*retry': 'bool',
+            '*watch': 'McpWatchHit', '*value': 'str',
+            '*exception': 'McpExceptionHit', '*retry': 'bool',
             '*values': [ 'str' ] },
   'if': 'CONFIG_TCG' }
 
 ##
 # @McpTraceInstruction:
-#     An instruction that touched the watched memory, or, with several
-#     addresses or an address mask, one that CPUs got to
-#     (@debug-trace).
+#     An instruction that touched the watched memory or took an
+#     exception, or, with several addresses or an address mask, one
+#     that CPUs got to (@debug-trace).
 #
 # @pc: its address, in hex
 #
@@ -1678,8 +1749,12 @@
 # @running: the VM is running
 #
 # @instructions: when memory was watched, the instructions that
-#     touched it, most first; with several addresses or an address
-#     mask, also each address the CPUs got to
+#     touched it, most first; with exceptions, the instructions that
+#     took them; with several addresses or an address mask, also each
+#     address the CPUs got to
+#
+# @exceptions: when exceptions were traced, how often CPUs took each
+#     one, most first
 #
 # @entries: the hits it lists
 #
@@ -1689,21 +1764,22 @@
   'base': 'McpResult',
   'data': { 'hits': 'int', 'ms': 'int', 'running': 'bool',
             '*instructions': [ 'McpTraceInstruction' ],
+            '*exceptions': [ 'McpExceptionCount' ],
             'entries': [ 'McpTraceEntry' ] },
   'if': 'CONFIG_TCG' }
 
 ##
 # @debug-trace:
-#     Log each time a CPU gets to an address (a breakpoint) or touches
-#     watched memory, with the registers and memory asked for, and let
-#     the guest go on.  For watched memory it also counts which
-#     instructions touched it: use it to find what overwrites
-#     something.  Each hit stops the VM for a moment, so a busy
-#     address slows the guest down while it traces.  It ends after
-#     @count hits or @duration-ms, and the guest keeps running.
+#     Log each time a CPU gets to an address (a breakpoint), touches
+#     watched memory or takes an exception, with the registers and
+#     memory asked for, and let the guest go on.  For watched memory
+#     it also counts which instructions touched it: use it to find
+#     what overwrites something.  Each hit stops the VM for a moment,
+#     so a busy address slows the guest down while it traces.  It ends
+#     after @count hits or @duration-ms, and the guest keeps running.
 #
 # @address: log arrivals here, or at each address of a list, written
-#     as for debug-run.  Give it, @watch, or both.
+#     as for debug-run.  Give it, @watch, @exception, or more of them.
 #
 # @address-mask: compare only these bits of each address, as for
 #     debug-run
@@ -1711,12 +1787,17 @@
 # @watch: log the accesses to this memory, or to each area of a list,
 #     with the instruction that did each one
 #
+# @exception: log these exceptions as CPUs take them, and count them
+#     by number and by the instruction that took them; {} for all.
+#     Use it to learn which ones a guest takes, and how often, before
+#     debug-run stops at a rare one.
+#
 # @count: stop after this many hits, up to 100000 (default: 1000)
 #
 # @list: list this many hits in full, up to 500; after them, only the
-#     first access to the watched memory by each new instruction, and
-#     with several addresses or @address-mask the first arrival at
-#     each new address (default: 20)
+#     first access to the watched memory or exception by each new
+#     instruction, and with several addresses or @address-mask the
+#     first arrival at each new address (default: 20)
 #
 # @cpu: trace only this CPU (default: all)
 #
@@ -1736,7 +1817,8 @@
 ##
 { 'command': 'debug-trace',
   'data': { '*address': 'McpAddresses', '*address-mask': 'str',
-            '*watch': 'McpWatches', '*count': 'int',
+            '*watch': 'McpWatches', '*exception': 'McpExceptions',
+            '*count': 'int',
             '*list': 'int', '*cpu': 'int', '*registers': [ 'str' ],
             '*memory': [ 'McpDebugMemory' ], '*duration-ms': 'int' },
   'returns': 'McpTrace',

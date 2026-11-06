@@ -30,6 +30,7 @@
 #include "exec/cpu-interrupt.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
+#include "exec/excp-watch.h"
 #include "exec/tb-history.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
@@ -745,6 +746,10 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
 #else
     if (replay_exception()) {
         const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+        CPUExcpWatch *w = cpu->excp_watch;
+        int32_t taken = cpu->exception_index;
+        vaddr from = unlikely(w) ? cpu->cc->get_pc(cpu) : 0;
+        bool stop;
 
         bql_lock();
         tcg_ops->do_interrupt(cpu);
@@ -752,7 +757,15 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
         bql_unlock();
         cpu->exception_index = -1;
 
-        if (unlikely(cpu_single_stepping(cpu))) {
+        /* the MCP debug tools stop in the handler (excp-watch.h) */
+        stop = unlikely(w) && cpu_excp_watch_match(w, taken);
+        if (stop) {
+            w->number = taken;
+            w->from = from;
+            w->to = cpu->cc->get_pc(cpu);
+            w->hit = true;
+        }
+        if (unlikely(cpu_single_stepping(cpu) || stop)) {
             /*
              * After processing the exception, ensure an EXCP_DEBUG is
              * raised when single-stepping so that GDB doesn't miss the

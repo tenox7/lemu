@@ -1953,7 +1953,7 @@ static void test_debug_watch(void)
 
     debug_check_error(qts, "debug-run", "{'watch': {'address': 'ebx'}}",
                       "needs the VM stopped");
-    debug_check_error(qts, "debug-run", "{}", "or both");
+    debug_check_error(qts, "debug-run", "{}", "or more of them");
     debug_check_error(qts, "debug-run",
                       "{'watch': {'address': '0x1000', 'length': 0}}",
                       "watch length must be 1 to 4096");
@@ -2294,6 +2294,137 @@ static void test_debug_several(void)
     unlink(bios_watch);
 }
 
+/* The exception in @ret: @number, taken at @pc, handled at @handler */
+static void debug_check_excp(QDict *ret, int number, uint64_t pc,
+                             uint64_t handler)
+{
+    QDict *e = qdict_get_qdict(ret, "exception");
+    g_autofree char *want_pc = g_strdup_printf("0x%" PRIx64, pc);
+    g_autofree char *want_handler = g_strdup_printf("0x%" PRIx64, handler);
+
+    g_assert(e);
+    g_assert_cmpint(qdict_get_int(e, "number"), ==, number);
+    g_assert_cmpstr(qdict_get_str(e, "pc"), ==, want_pc);
+    g_assert_cmpstr(qdict_get_str(e, "handler"), ==, want_handler);
+}
+
+/*
+ * debug-run stops at the handler of an exception, and debug-trace
+ * counts them.  Each loop of the fault BIOS divides by zero once: x86
+ * exception 0, the divide error.
+ */
+static void test_debug_exception(void)
+{
+    g_autofree char *bios = debug_bios_fault();
+    g_autoptr(GString) many = g_string_new("{'exception': {'numbers': [");
+    QTestState *qts;
+    QDict *ret, *x;
+    QList *list;
+    int i;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    ret = debug_ok(qts, "debug-run", "{'exception': {}}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf001e");
+    debug_check_excp(ret, 0, FAULT_DIV, FAULT_HANDLER);
+    debug_summary_has(ret, "CPU 0 took exception 0 at 0xf001a; the VM is"
+                      " stopped at the first instruction of the guest's"
+                      " handler for it, 0xf001e. The instruction that took"
+                      " it:\n0x000f001a:");
+    debug_summary_has(ret, "Next instruction:\n0x000f001e:");
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 0);
+    qobject_unref(ret);
+
+    /* the third from here; the handler has not run, so bl is still 0 */
+    ret = debug_ok(qts, "debug-run", "{'exception': {'numbers': [0]},"
+                   " 'hits': 3}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 3);
+    debug_check_excp(ret, 0, FAULT_DIV, FAULT_HANDLER);
+    debug_summary_has(ret, "CPU 0 took exception 0 at 0xf001a (exception"
+                      " 3); the VM is stopped");
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 0);
+    qobject_unref(ret);
+
+    /*
+     * Back at the div from the handler, bl is 1; at the next loop, 0.
+     * A CPU stopped there steps past it, into the handler.
+     */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf001a'}");
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 1);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf001a'}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf001a");
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 0);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf001a', 'exception':"
+                   " {}}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 1);
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf001e");
+    debug_check_excp(ret, 0, FAULT_DIV, FAULT_HANDLER);
+    qobject_unref(ret);
+
+    /* the guest takes no other: the time runs out, the guest goes on */
+    ret = debug_ok(qts, "debug-run", "{'exception': {'skip': [0]},"
+                   " 'timeout-ms': 200}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    g_assert(!qdict_haskey(ret, "exception"));
+    debug_summary_has(ret, "no CPU took an exception other than 0 in 0.2 s;"
+                      " the VM keeps running");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'exception': {'numbers': [6, 13]},"
+                   " 'timeout-ms': 100}");
+    debug_summary_has(ret, "no CPU took exceptions 6 or 13 in 0.1 s;");
+    qobject_unref(ret);
+
+    /* counted by number and by instruction, each listed */
+    ret = debug_ok(qts, "debug-trace", "{'exception': {}, 'count': 5,"
+                   " 'registers': ['ebx']}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 5);
+    g_assert(qdict_get_bool(ret, "running"));
+    list = qdict_get_qlist(ret, "exceptions");
+    g_assert_cmpint(qlist_size(list), ==, 1);
+    x = qobject_to(QDict, qlist_peek(list));
+    g_assert_cmpint(qdict_get_int(x, "number"), ==, 0);
+    g_assert_cmpint(qdict_get_int(x, "count"), ==, 5);
+    g_assert_cmpstr(qdict_get_str(x, "handler"), ==, "0xf001e");
+    g_assert_cmpint(debug_trace_count(ret, "0xf001a"), ==, 5);
+    x = qobject_to(QDict, qlist_peek(qdict_get_qlist(ret, "entries")));
+    debug_check_excp(x, 0, FAULT_DIV, FAULT_HANDLER);
+    debug_summary_has(ret, "Traced exceptions for ");
+    debug_summary_has(ret, "\n\nBy exception:\n       5 x exception 0,"
+                      " handler 0xf001e\n\nBy instruction:\n"
+                      "       5 x 0x000f001a:");
+    debug_summary_has(ret, "\n\nHits:\n#1 CPU 0 at 0xf001a took exception"
+                      " 0, went to 0xf001e: ebx=0x0\n#2 ");
+    qobject_unref(ret);
+
+    /* with an address: arrivals at the loop and the exceptions */
+    ret = debug_ok(qts, "debug-trace", "{'address': '0xf0015',"
+                   " 'exception': {'numbers': [0]}, 'count': 6, 'list': 0}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 6);
+    debug_summary_has(ret, "Traced arrivals at 0xf0015 and exception 0 for ");
+    debug_summary_has(ret, "Hits (the first exception taken by each"
+                      " instruction):\n#");
+    qobject_unref(ret);
+
+    for (i = 0; i < 33; i++) {
+        g_string_append_printf(many, "%s%d", i ? ", " : "", i);
+    }
+    g_string_append(many, "]}}");
+    debug_check_error(qts, "debug-run", many->str,
+                      "give at most 32 exception numbers");
+    debug_check_error(qts, "debug-run", "{'exception': {'numbers': [1],"
+                      " 'skip': [2]}}", "not both");
+    debug_check_error(qts, "debug-trace", "{'exception': {'skip':"
+                      " [65536]}}", "exception numbers are 0 to 65535");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 /* debug-trace logs the hits and lets the guest go on */
 static void test_debug_trace(void)
 {
@@ -2361,7 +2492,7 @@ static void test_debug_trace(void)
     debug_summary_has(ret, " for 0.2 s: no hits; the guest runs on.");
     qobject_unref(ret);
 
-    debug_check_error(qts, "debug-trace", "{}", "or both");
+    debug_check_error(qts, "debug-trace", "{}", "or more of them");
     debug_check_error(qts, "debug-trace", "{'address': '0xf0008',"
                       " 'registers': ['nope']}",
                       "'nope' is not a register; the registers are pc,");
@@ -3058,6 +3189,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/history", test_debug_history);
         qtest_add_func("/mcp/debug/mask", test_debug_mask);
         qtest_add_func("/mcp/debug/several", test_debug_several);
+        qtest_add_func("/mcp/debug/exception", test_debug_exception);
     }
     return g_test_run();
 }

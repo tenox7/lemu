@@ -574,6 +574,8 @@ struct CPUState {
     uint32_t exceptions_taken;
     /* The last blocks it ran, when the MCP debug tools ask (tb-history.h) */
     struct CPUTBHistory *tb_history;
+    /* The exceptions that stop it, for the MCP debug tools (excp-watch.h) */
+    struct CPUExcpWatch *excp_watch;
 
     bool vcpu_dirty;
     AccelCPUState *accel;

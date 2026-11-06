@@ -63,8 +63,8 @@ only when exactly one VM is running and you started it.
 | `media` | List, insert or eject CDs and floppies; put host files on a new one, or copy the files off a floppy |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
-| `debug-run` | Run until a CPU gets to an address (a breakpoint) or touches watched memory, then show the instruction, the registers and memory |
-| `debug-trace` | Log each arrival at an address or access to watched memory, with registers and memory, while the guest runs on |
+| `debug-run` | Run until a CPU gets to an address (a breakpoint), touches watched memory or takes an exception, then show the instruction, the registers and memory |
+| `debug-trace` | Log each arrival at an address, access to watched memory or exception, with registers and memory, while the guest runs on |
 | `debug-step` | Run one CPU an instruction at a time, and show each one |
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
@@ -126,6 +126,8 @@ Use these:
 | Save memory to a file | `hmp` `pmemsave ADDR SIZE FILE` |
 | Stop when the guest gets to an address (a breakpoint) | `debug-run` |
 | Stop at whichever of several addresses comes first | `debug-run` with a list in `address` |
+| Stop when the guest crashes or takes a trap (an exception) | `debug-run` with `exception` |
+| See which exceptions the guest takes, and how often | `debug-trace` with `exception: {}` |
 | Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
 | See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
 | See how the CPU got to where it stopped | `debug-run` with `history` |
@@ -204,6 +206,14 @@ Use these:
   and `watch` a list of up to 16 areas. `debug-run` stops at whichever
   a CPU gets to or touches first; `debug-trace` logs them all and
   counts the arrivals by address.
+- **Exceptions (traps and faults):** `debug-run` with `exception`
+  stops right after a CPU takes one, at the first instruction of the
+  guest's handler, and shows the instruction that took it. The numbers
+  are QEMU's for each CPU, so look first: `debug-trace` with
+  `exception: {}` counts the ones the guest takes, by number and by
+  instruction. Then stop at a rare one with `numbers`, or at anything
+  but the everyday ones (page faults, TLB misses, system calls) with
+  `skip`. Interrupts from devices are not exceptions.
 - **How did it get here?** `debug-run` with `history: 16` notes the
   last 16 blocks of code each CPU runs, and shows them when it stops,
   oldest first, as start-end ranges. A block runs from where a jump
