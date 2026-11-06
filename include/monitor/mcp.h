@@ -39,10 +39,11 @@ int64_t mcp_wait_max_ms(void);
 /*
  * Text as HMP prints it, for the debug tools: the integer registers of
  * @cpu (info registers without the FPU), and @count instructions at
- * the virtual address @pc.  NULL when QEMU was built without HMP.
+ * the virtual (or @physical) address @pc.  NULL when QEMU was built
+ * without HMP.
  */
 char *mcp_cpu_registers(CPUState *cpu);
-char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count);
+char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count, bool physical);
 
 /* @words 32-bit words at @addr, as HMP's x (or xp) prints them */
 char *mcp_cpu_memory(CPUState *cpu, uint64_t addr, int words, bool physical);

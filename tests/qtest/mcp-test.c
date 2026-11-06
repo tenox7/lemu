@@ -1613,6 +1613,118 @@ static void test_debug_run(void)
  * the old bytes goes away; debug-profile finds the loop
  */
 /*
+ * A BIOS whose loop takes a fault that comes back to the instruction,
+ * as a TLB miss does.  At f000:0000, after a far jump from the reset
+ * vector, so that the IRET comes back to the same address:
+ *
+ *  0000  xor ax,ax / mov ds,ax           the divide error vector is
+ *  0004  mov word [0],001e               f000:001e
+ *  000a  mov word [2],f000
+ *  0010  mov ss,ax / mov sp,7c00
+ *  0015  xor bx,bx                       loop
+ *  0017  mov ax,1
+ *  001a  div bl                          faults while bl is 0
+ *  001c  jmp 0015
+ *  001e  inc bx / iret                   the handler: bl = 1, again
+ */
+#define FAULT_DIV       0xf001a
+#define FAULT_HANDLER   0xf001e
+
+static char *debug_bios_fault(void)
+{
+    static const uint8_t code[] = {
+        0x31, 0xc0, 0x8e, 0xd8,
+        0xc7, 0x06, 0x00, 0x00, 0x1e, 0x00,
+        0xc7, 0x06, 0x02, 0x00, 0x00, 0xf0,
+        0x8e, 0xd0, 0xbc, 0x00, 0x7c,
+        0x31, 0xdb,
+        0xb8, 0x01, 0x00,
+        0xf6, 0xf3,
+        0xeb, 0xf7,
+        0x43, 0xcf,
+    };
+    static const uint8_t reset[] = { 0xea, 0x00, 0x00, 0x00, 0xf0 };
+    g_autofree uint8_t *rom = g_malloc(64 * KiB);
+    char *path = NULL;
+    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    memset(rom, 0xf4, 64 * KiB);
+    memcpy(rom, code, sizeof(code));
+    memcpy(rom + 0xfff0, reset, sizeof(reset));
+    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
+    close(fd);
+    return path;
+}
+
+/*
+ * An arrival that comes right after the instruction took an
+ * interruption may be the CPU running it again: debug-run says so,
+ * and debug-step marks the instruction.  The profile has the
+ * physical addresses, which in real mode are the same.
+ */
+static void test_debug_retry(void)
+{
+    g_autofree char *bios = debug_bios_fault();
+    g_autofree char *at = g_strdup_printf("{'address': '0x%x'}", FAULT_DIV);
+    QTestState *qts;
+    QDict *ret, *top;
+    QList *list;
+
+    /* from the reset, so that the first arrival is with bl = 0 */
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* the first arrival: the div has not run yet */
+    ret = debug_ok(qts, "debug-run", at);
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(!qdict_get_try_bool(ret, "retry", false));
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 0);
+    qobject_unref(ret);
+
+    /* going on, the div faults, and the handler comes back to it */
+    ret = debug_ok(qts, "debug-run", at);
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_try_bool(ret, "retry", false));
+    g_assert(strstr(qdict_get_str(ret, "summary"), "coming back"));
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 1);
+    qobject_unref(ret);
+
+    /* now it runs, and the loop gets there anew */
+    ret = debug_ok(qts, "debug-run", at);
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(!qdict_get_try_bool(ret, "retry", false));
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 0);
+    qobject_unref(ret);
+
+    /* a step into the fault says where the CPU went */
+    ret = debug_ok(qts, "debug-step", "{}");
+    g_assert(strstr(qdict_get_str(ret, "summary"),
+                    "-> it took an interruption: the CPU went to 0xf001e"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf001e");
+    qobject_unref(ret);
+
+    /* and the next run finds it back at the div: that is a retry too */
+    ret = debug_ok(qts, "debug-run", at);
+    g_assert(qdict_get_try_bool(ret, "retry", false));
+    g_assert_cmpint(debug_reg(ret, "BX") & 0xff, ==, 1);
+    qobject_unref(ret);
+
+    qobject_unref(debug_ok(qts, "cont", "{}"));
+    ret = debug_ok(qts, "debug-profile", "{'interval-ms': 300}");
+    list = qdict_get_qlist(ret, "top");
+    g_assert(!qlist_empty(list));
+    top = qobject_to(QDict, qlist_peek(list));
+    g_assert_cmpstr(qdict_get_str(top, "physical"), ==,
+                    qdict_get_str(top, "pc"));
+    g_assert(qdict_haskey(top, "instruction"));
+    qobject_unref(ret);
+
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
  * A debug-run step that does not get to its address stops the steps,
  * and a debug-step that does all its steps lets them go on
  */
@@ -2286,6 +2398,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/run", test_debug_run);
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
         qtest_add_func("/mcp/steps/debug", test_steps_debug);
+        qtest_add_func("/mcp/debug/retry", test_debug_retry);
     }
     return g_test_run();
 }

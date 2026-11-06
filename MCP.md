@@ -181,6 +181,16 @@ Use these:
   Addresses are virtual, as the CPU sees them (on x86: the CS base plus
   EIP). These tools need TCG, the default for the old CPUs, and no GDB
   stub.
+- **TLB misses and page faults:** when the CPU has no mapping for an
+  address right now, the debug tools say so instead of showing the
+  instruction or the memory there. Kernels are often mapped 1:1: ask
+  for that memory with `physical: true`. An instruction that takes a
+  TLB miss or a page fault runs again once the guest has mapped it.
+  `debug-step` shows where such an instruction sent the CPU, and
+  `debug-run` marks the arrival when the CPU comes back with
+  `retry: true`. Run `debug-run` again to get to the next real
+  arrival. `debug-profile` gives each hot spot's `physical` address
+  too, so the same address in two processes is two entries.
 - **When you need GDB after all,** for example to trace many addresses
   at once: `hmp` `gdbserver tcp:127.0.0.1:1234` turns the GDB stub on in
   a running VM, with no restart. Don't use `debug-run` or `debug-step`

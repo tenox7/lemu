@@ -24,10 +24,10 @@ static void perror_memory(int status, bfd_vma memaddr,
         /* Can't happen.  */
         info->fprintf_func(info->stream, "Unknown error %d\n", status);
     } else {
-        /* Address between memaddr and memaddr + len was out of bounds.  */
+        /* Address between memaddr and memaddr + len could not be read */
         info->fprintf_func(info->stream,
-                           "Address 0x%" PRIx64 " is out of bounds.\n",
-                           memaddr);
+                           "Cannot read 0x%" PRIx64 ": it is not mapped now,"
+                           " or not RAM or ROM.\n", memaddr);
     }
 }
 

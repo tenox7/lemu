@@ -1446,12 +1446,19 @@
 #
 # @running: the VM is still running
 #
+# @retry: true when this arrival may be the CPU coming back to run the
+#     instruction again (debug-run): when a debug tool last took this
+#     CPU on from the address, the instruction took an interruption
+#     first, such as a TLB miss or a page fault, and the CPU came back
+#     soon after.  Run debug-run again to go on.
+#
 # Since: 11.2
 ##
 { 'struct': 'McpDebugStop',
   'base': 'McpResult',
   'data': { 'reached': 'bool', '*cpu': 'int', '*pc': 'str',
-            '*hits': 'int', '*steps': 'int', 'running': 'bool' },
+            '*hits': 'int', '*steps': 'int', 'running': 'bool',
+            '*retry': 'bool' },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1529,13 +1536,18 @@
 #
 # @percent: its share of the samples in which a CPU ran, rounded
 #
-# @instruction: the instruction there
+# @physical: the physical address of the code there, in hex, as the
+#     CPU mapped it when it was sampled; the same @pc in two processes
+#     is two entries.  Missing when the CPU had no mapping for it.
+#
+# @instruction: the instruction there, read at @physical when there
+#     is one, as the mapping may have changed since
 #
 # Since: 11.2
 ##
 { 'struct': 'McpProfileEntry',
   'data': { 'pc': 'str', 'count': 'int', 'percent': 'int',
-            '*instruction': 'str' },
+            '*physical': 'str', '*instruction': 'str' },
   'if': 'CONFIG_TCG' }
 
 ##

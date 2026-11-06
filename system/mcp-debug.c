@@ -590,10 +590,29 @@ static McpMem *mcp_parse_memory(McpDebugMemoryList *list, int *count,
     return g_steal_pointer(&mem);
 }
 
+static bool mcp_debug_mapped(CPUState *cpu, uint64_t addr)
+{
+    TranslateForDebugResult t;
+
+    return cpu_translate_for_debug(cpu, addr, &t);
+}
+
+/* The instruction at @pc, or why it can't be read */
+static char *mcp_debug_insn(CPUState *cpu, uint64_t pc)
+{
+    if (!mcp_debug_mapped(cpu, pc)) {
+        return g_strdup_printf("0x%" PRIx64 ":  (not mapped for CPU %d now,"
+                               " so it can't be shown; the CPU may take a"
+                               " TLB miss or page fault there)\n", pc,
+                               cpu->cpu_index);
+    }
+    return mcp_cpu_disas(cpu, pc, 1, false);
+}
+
 /* The next instruction of @cpu, its registers and the memory asked for */
 static void mcp_debug_show(GString *s, CPUState *cpu, McpMem *mem, int n)
 {
-    g_autofree char *insn = mcp_cpu_disas(cpu, cpu->cc->get_pc(cpu), 1);
+    g_autofree char *insn = mcp_debug_insn(cpu, cpu->cc->get_pc(cpu));
     g_autofree char *regs = mcp_cpu_registers(cpu);
     int i;
 
@@ -606,14 +625,114 @@ static void mcp_debug_show(GString *s, CPUState *cpu, McpMem *mem, int n)
     g_string_append_printf(s, "Next instruction:\n%s\nRegisters:\n%s\n",
                            insn, g_strchomp(regs));
     for (i = 0; i < n; i++) {
-        g_autofree char *dump = mcp_cpu_memory(cpu, mem[i].addr,
-                                               mem[i].words,
-                                               mem[i].physical);
+        g_autofree char *dump = NULL;
 
+        if (!mem[i].physical && !mcp_debug_mapped(cpu, mem[i].addr)) {
+            g_string_append_printf(s, "\nMemory at 0x%" PRIx64 ": not mapped"
+                                   " for CPU %d now. If it is at the same"
+                                   " physical address (kernels often are),"
+                                   " ask for it with physical: true.\n",
+                                   mem[i].addr, cpu->cpu_index);
+            continue;
+        }
+        dump = mcp_cpu_memory(cpu, mem[i].addr, mem[i].words,
+                              mem[i].physical);
         g_string_append_printf(s, "\nMemory at %s0x%" PRIx64 ":\n%s",
                                mem[i].physical ? "physical " : "",
                                mem[i].addr, dump ? dump : "");
     }
+}
+
+/*
+ * By CPU index: the instruction that took an interruption (a TLB miss,
+ * a page fault) when a debug tool last stepped it.  The CPU usually
+ * comes back to run it again, and that is not a new arrival there.
+ */
+typedef struct McpRetryMark {
+    bool set;
+    uint64_t pc;
+    uint32_t taken;             /* exceptions_taken after it */
+} McpRetryMark;
+
+static McpRetryMark *mcp_retry_marks;
+static int mcp_n_retry_marks;
+
+/* More interruptions than this since, and it did not come back soon */
+#define RETRY_SOON      1000
+
+static McpRetryMark *mcp_retry_mark(CPUState *cpu)
+{
+    int n = cpu->cpu_index + 1;
+
+    if (n > mcp_n_retry_marks) {
+        mcp_retry_marks = g_renew(McpRetryMark, mcp_retry_marks, n);
+        memset(mcp_retry_marks + mcp_n_retry_marks, 0,
+               (n - mcp_n_retry_marks) * sizeof(McpRetryMark));
+        mcp_n_retry_marks = n;
+    }
+    return &mcp_retry_marks[cpu->cpu_index];
+}
+
+/*
+ * Take one instruction on @cpu.  *@interrupted tells whether the CPU
+ * took an interruption (a fault, a trap) instead of finishing it.
+ */
+static McpStepResult coroutine_fn mcp_debug_step_one(QemuInputCtx *ctx,
+                                                     CPUState *cpu,
+                                                     bool *interrupted)
+{
+    McpRetryMark *m = mcp_retry_mark(cpu);
+    uint64_t pc = cpu->cc->get_pc(cpu);
+    uint32_t taken = qatomic_read(&cpu->exceptions_taken);
+    McpStepResult step = mcp_debug_step(ctx, cpu);
+
+    *interrupted = step == STEP_DONE &&
+                   qatomic_read(&cpu->exceptions_taken) != taken;
+    if (*interrupted) {
+        m->set = true;
+        m->pc = pc;
+        m->taken = qatomic_read(&cpu->exceptions_taken);
+    } else if (step == STEP_DONE && m->pc == pc) {
+        m->set = false;         /* it ran this time */
+    }
+    return step;
+}
+
+/*
+ * Whether @cpu, at @pc, may be back to run the instruction there again
+ * after it took an interruption.  That uses up its mark.
+ */
+static bool mcp_debug_retry(CPUState *cpu, uint64_t pc)
+{
+    McpRetryMark *m = mcp_retry_mark(cpu);
+    uint32_t since = qatomic_read(&cpu->exceptions_taken) - m->taken;
+
+    if (!m->set || m->pc != pc) {
+        return false;
+    }
+    m->set = false;
+    return since <= RETRY_SOON;
+}
+
+/*
+ * How many of the CPUs at the address may be back to run its
+ * instruction again; *@retry tells whether @at is one of them.
+ */
+static int mcp_debug_retries(McpBreak *b, CPUState *at, bool *retry)
+{
+    CPUState *cpu, *dummy;
+    int n = 0;
+
+    *retry = false;
+    CPU_FOREACH(cpu) {
+        if ((!b->only || cpu == b->only) &&
+            mcp_debug_count_at(cpu, b->addr, &dummy) &&
+            mcp_debug_retry(cpu, b->addr)) {
+            *retry |= cpu == at;
+            n++;
+        }
+    }
+    return n;
 }
 
 static void mcp_debug_set_cpu(McpDebugStop *res, CPUState *cpu)
@@ -649,9 +768,9 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
     McpStepResult step;
     McpDebugStop *res;
     CPUState *at = NULL, *cpu;
-    int64_t end, n_hits = 0;
+    int64_t end, n_hits = 0, n_retries = 0;
     int n_mem = 0, k;
-    bool inserted = false;
+    bool inserted = false, retry = false, interrupted;
 
     if (!ctx) {
         qemu_input_ctx_init(&local, NULL);
@@ -687,6 +806,9 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         mcp_debug_outside(mcp_debug_stop, &paused);
         if (!runstate_is_running()) {
             n_hits = mcp_debug_count_at(b.only, b.addr, &at);
+            if (n_hits) {
+                n_retries += mcp_debug_retries(&b, at, &retry);
+            }
         }
     }
     while (n_hits < hits) {
@@ -705,7 +827,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
 
             if ((!b.only || cpu == b.only) &&
                 mcp_debug_count_at(cpu, b.addr, &dummy)) {
-                step = mcp_debug_step(ctx, cpu);
+                step = mcp_debug_step_one(ctx, cpu, &interrupted);
                 if (step != STEP_DONE && step != STEP_HALTED) {
                     break;
                 }
@@ -732,6 +854,8 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
                 /* got there as the time ran out; its stop comes next */
                 n_hits += b.hits;
                 at = b.at;
+                retry = mcp_debug_retry(at, b.addr);
+                n_retries += retry;
                 result = n_hits >= hits ? RUN_REACHED : RUN_STOPPED;
                 mcp_debug_wait_stop(ctx, qemu_clock_get_ms(QEMU_CLOCK_REALTIME)
                                     + STEP_WAIT_MS, NULL);
@@ -745,6 +869,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
             result = RUN_STOPPED;
             break;
         }
+        n_retries += mcp_debug_retries(&b, at, &retry);
         n_hits += k;
     }
     if (n_hits >= hits) {
@@ -772,6 +897,10 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
         mcp_debug_set_cpu(res, at);
     }
     res->running = runstate_is_running();
+    if (at && retry) {
+        res->has_retry = true;
+        res->retry = true;
+    }
     switch (result) {
     case RUN_REACHED:
         g_string_printf(s, "CPU %d reached 0x%" PRIx64, at->cpu_index,
@@ -780,6 +909,18 @@ McpDebugStop *coroutine_fn qmp_debug_run(const char *address,
             g_string_append_printf(s, " (arrival %" PRId64 ")", n_hits);
         }
         g_string_append(s, "; the VM is stopped");
+        if (retry) {
+            g_string_append(s, ". This may be the CPU coming back to run"
+                            " the instruction again: when it went on from"
+                            " here, the instruction took an interruption"
+                            " first (such as a TLB miss). Run debug-run"
+                            " again to go on");
+        }
+        if (hits > 1 && n_retries) {
+            g_string_append_printf(s, " (%" PRId64 " of the arrivals came"
+                                   " right after an interruption there)",
+                                   n_retries);
+        }
         break;
     case RUN_TIMEOUT:
         g_string_printf(s, "no CPU reached 0x%" PRIx64 " in %.1f s", b.addr,
@@ -836,6 +977,7 @@ McpDebugStop *coroutine_fn qmp_debug_step(bool has_count, int64_t count,
     CPUState *cpu;
     int64_t done, first, i;
     int n_mem = 0;
+    bool interrupted;
 
     if (!ctx) {
         qemu_input_ctx_init(&local, NULL);
@@ -872,13 +1014,21 @@ McpDebugStop *coroutine_fn qmp_debug_step(bool has_count, int64_t count,
                   "interrupts away";
             break;
         }
-        insn = mcp_cpu_disas(cpu, cpu->cc->get_pc(cpu), 1);
-        step = mcp_debug_step(ctx, cpu);
+        insn = mcp_debug_insn(cpu, cpu->cc->get_pc(cpu));
+        step = mcp_debug_step_one(ctx, cpu, &interrupted);
         if (step == STEP_NOT_STARTED || step == STEP_CANCELLED) {
             g_free(insn);
             why = step == STEP_CANCELLED ? "cancelled" :
                   "the VM did not start";
             break;
+        }
+        if (interrupted && insn) {
+            char *old = insn;
+
+            insn = g_strdup_printf("%s  -> it took an interruption: the CPU"
+                                   " went to 0x%" PRIx64 "\n", old,
+                                   (uint64_t)cpu->cc->get_pc(cpu));
+            g_free(old);
         }
         g_free(*slot);
         *slot = insn;
@@ -942,10 +1092,27 @@ McpDebugStop *coroutine_fn qmp_debug_step(bool has_count, int64_t count,
     return res;
 }
 
+#define PC_NO_PHYS      UINT64_MAX
+
 typedef struct McpPcCount {
     uint64_t pc;
+    uint64_t pa;                /* where it was then, or PC_NO_PHYS */
     int64_t count;
 } McpPcCount;
+
+static guint mcp_pc_hash(gconstpointer key)
+{
+    const McpPcCount *c = key;
+
+    return g_int64_hash(&c->pc) * 31 + g_int64_hash(&c->pa);
+}
+
+static gboolean mcp_pc_equal(gconstpointer a, gconstpointer b)
+{
+    const McpPcCount *x = a, *y = b;
+
+    return x->pc == y->pc && x->pa == y->pa;
+}
 
 /*
  * The samples, shared by the tool and its queued work: the last of
@@ -953,7 +1120,7 @@ typedef struct McpPcCount {
  */
 typedef struct McpProfileData {
     int refs;
-    GHashTable *pcs;            /* &McpPcCount.pc -> McpPcCount */
+    GHashTable *pcs;            /* set of McpPcCount, by pc and pa */
     int64_t ran, halted;
     bool *pending;              /* by CPU index: a sample is queued */
 } McpProfileData;
@@ -978,13 +1145,18 @@ static void mcp_profile_sample(CPUState *cpu, run_on_cpu_data data)
     } else if (cpu->halted) {
         p->halted++;
     } else {
-        uint64_t pc = cpu->cc->get_pc(cpu);
-        McpPcCount *c = g_hash_table_lookup(p->pcs, &pc);
+        McpPcCount key = { .pc = cpu->cc->get_pc(cpu), .pa = PC_NO_PHYS };
+        TranslateForDebugResult t;
+        McpPcCount *c;
 
+        /* now, while the CPU runs there: the mapping may be gone later */
+        if (cpu_translate_for_debug(cpu, key.pc, &t)) {
+            key.pa = t.physaddr;
+        }
+        c = g_hash_table_lookup(p->pcs, &key);
         if (!c) {
-            c = g_new0(McpPcCount, 1);
-            c->pc = pc;
-            g_hash_table_insert(p->pcs, &c->pc, c);
+            c = g_memdup2(&key, sizeof(key));
+            g_hash_table_add(p->pcs, c);
         }
         c->count++;
         p->ran++;
@@ -1000,7 +1172,10 @@ static gint mcp_pc_count_cmp(gconstpointer a, gconstpointer b)
     if (x->count != y->count) {
         return x->count < y->count ? 1 : -1;
     }
-    return x->pc < y->pc ? -1 : x->pc > y->pc;
+    if (x->pc != y->pc) {
+        return x->pc < y->pc ? -1 : 1;
+    }
+    return x->pa < y->pa ? -1 : x->pa > y->pa;
 }
 
 McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
@@ -1047,8 +1222,7 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
 
     p = g_new0(McpProfileData, 1);
     p->refs = 1;
-    p->pcs = g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL,
-                                   g_free);
+    p->pcs = g_hash_table_new_full(mcp_pc_hash, mcp_pc_equal, g_free, NULL);
     p->pending = g_new0(bool, MAX(ncpus, 1));
     start = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     end = start + interval_ms;
@@ -1086,7 +1260,7 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
 
     all = g_ptr_array_new();
     g_hash_table_iter_init(&iter, p->pcs);
-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+    while (g_hash_table_iter_next(&iter, &value, NULL)) {
         g_ptr_array_add(all, value);
     }
     g_ptr_array_sort(all, mcp_pc_count_cmp);
@@ -1101,9 +1275,14 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
     for (i = 0; i < all->len && i < top; i++) {
         McpPcCount *c = g_ptr_array_index(all, i);
         McpProfileEntry *e = g_new0(McpProfileEntry, 1);
-        g_autofree char *insn = cpu ? mcp_cpu_disas(cpu, c->pc, 1) : NULL;
+        bool phys = c->pa != PC_NO_PHYS;
+        g_autofree char *insn = cpu ? mcp_cpu_disas(cpu, phys ? c->pa : c->pc,
+                                                    1, phys) : NULL;
 
         e->pc = g_strdup_printf("0x%" PRIx64, c->pc);
+        if (phys) {
+            e->physical = g_strdup_printf("0x%" PRIx64, c->pa);
+        }
         e->count = c->count;
         e->percent = (c->count * 100 + p->ran / 2) / p->ran;
         if (insn) {

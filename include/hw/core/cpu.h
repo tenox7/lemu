@@ -570,6 +570,8 @@ struct CPUState {
     uint32_t tcg_cflags;
     uint32_t halted;
     int32_t exception_index;
+    /* Exceptions and interrupts TCG delivered, for the MCP debug tools */
+    uint32_t exceptions_taken;
 
     bool vcpu_dirty;
     AccelCPUState *accel;

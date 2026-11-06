@@ -134,6 +134,7 @@ typedef struct McpDisas {
     CPUState *cpu;
     uint64_t pc;
     int count;
+    bool physical;
 } McpDisas;
 
 /* The monitor writes \r\n line ends; agents read \n */
@@ -159,7 +160,7 @@ static void mcp_print_disas(MonitorHMP *hmp, void *opaque)
 {
     McpDisas *d = opaque;
 
-    monitor_disas(hmp, d->cpu, d->pc, d->count, false);
+    monitor_disas(hmp, d->cpu, d->pc, d->count, d->physical);
 }
 
 /*
@@ -187,9 +188,10 @@ char *mcp_cpu_registers(CPUState *cpu)
     return mcp_print(mcp_print_registers, cpu);
 }
 
-char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count)
+char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count, bool physical)
 {
-    McpDisas d = { .cpu = cpu, .pc = pc, .count = count };
+    McpDisas d = { .cpu = cpu, .pc = pc, .count = count,
+                   .physical = physical };
 
     return mcp_print(mcp_print_disas, &d);
 }
@@ -209,7 +211,7 @@ char *mcp_cpu_registers(CPUState *cpu)
     return NULL;
 }
 
-char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count)
+char *mcp_cpu_disas(CPUState *cpu, uint64_t pc, int count, bool physical)
 {
     return NULL;
 }

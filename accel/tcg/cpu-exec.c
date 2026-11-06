@@ -736,6 +736,7 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
 
         bql_lock();
         tcg_ops->do_interrupt(cpu);
+        qatomic_set(&cpu->exceptions_taken, cpu->exceptions_taken + 1);
         bql_unlock();
         cpu->exception_index = -1;
 
@@ -847,6 +848,8 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
              * and via longjmp via cpu_loop_exit.
              */
             if (tcg_ops->cpu_exec_interrupt(cpu, interrupt_request)) {
+                qatomic_set(&cpu->exceptions_taken,
+                            cpu->exceptions_taken + 1);
                 if (!tcg_ops->need_replay_interrupt ||
                     tcg_ops->need_replay_interrupt(interrupt_request)) {
                     replay_interrupt();
