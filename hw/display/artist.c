@@ -898,16 +898,21 @@ static int vram_bit_write(ARTISTState *s, uint32_t pos, int posy,
         pos += 16;
         break;
 
+    /*
+     * One bit per pixel: a write sets size * 8 pixels, so a write with X
+     * increment moves on by that many pixels (4 address bytes each).  The
+     * X server of HP-UX 9 draws bitmaps wider than 32 pixels this way.
+     */
     case 0x2ea0:
         artist_vram_write32(s, buf, get_vram_offset(s, buf, pos >> 2, posy),
                             size, data, s->fg_color, s->bg_color);
-        pos += 4;
+        pos += size * 8 * 4;
         break;
 
     case 0x28a0:
         artist_vram_write32(s, buf, get_vram_offset(s, buf, pos >> 2, posy),
                             size, data, 1, 0);
-        pos += 4;
+        pos += size * 8 * 4;
         break;
 
     default:
