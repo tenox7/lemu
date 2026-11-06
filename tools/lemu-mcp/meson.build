@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-executable('lemu-mcp', files('lemu-mcp.c'),
+executable('lemu-mcp', files('lemu-mcp.c', 'main.c'),
            dependencies: [qemuutil], install: true)

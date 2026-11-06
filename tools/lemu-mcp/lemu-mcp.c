@@ -1797,7 +1797,7 @@ static gboolean client_readable(int fd, GIOCondition cond, gpointer opaque)
     return G_SOURCE_CONTINUE;
 }
 
-int main(int argc, char **argv)
+int lemu_mcp_main(int argc, char **argv, const char *cmd)
 {
     if (argc > 1) {
         printf("Usage: %s\n"
@@ -1805,7 +1805,7 @@ int main(int argc, char **argv)
                " VMs.\n"
                "Add it to Claude Code with:\n"
                "  claude mcp add --scope user --transport stdio lemu -- %s\n",
-               argv[0], argv[0]);
+               cmd, cmd);
         return strcmp(argv[1], "-h") && strcmp(argv[1], "--help");
     }
 

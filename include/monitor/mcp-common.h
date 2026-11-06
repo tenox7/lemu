@@ -49,4 +49,12 @@ const char *mcp_meta_protocol(QDict *params);
 /* Turn \r, \n, \t, \e, \\ and \xHH in @text into bytes; others stay */
 GString *mcp_unescape(const char *text);
 
+/*
+ * The lemu-mcp bridge: an MCP server on stdin and stdout for all running
+ * VMs.  It is its own program, and every system emulator also runs it
+ * when its first option is -mcp-bridge, so the kits need no extra file.
+ * @cmd is how to start the bridge, for the usage text.  Not on Windows.
+ */
+int lemu_mcp_main(int argc, char **argv, const char *cmd);
+
 #endif

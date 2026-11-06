@@ -21,14 +21,16 @@ It works on macOS and Linux.
 
 ## Setup
 
-1. Build LEMU (see [README.md](README.md)). The bridge is
-   `build/tools/lemu-mcp/lemu-mcp`. The ready-to-run kits do not include
-   the bridge yet.
+1. Find the bridge. Every LEMU binary is also the bridge when its first
+   option is `-mcp-bridge`, for example `qemu-system-ppc -mcp-bridge`.
+   That includes the binaries in the ready-to-run kits made from
+   November 2026 on. A LEMU build (see [README.md](README.md)) also has
+   the bridge as its own program, `build/tools/lemu-mcp/lemu-mcp`.
 2. Add the bridge to your agent once.
    - Claude Code:
-     `claude mcp add lemu -s user -- /path/to/build/tools/lemu-mcp/lemu-mcp`
-   - Other MCP clients: add a stdio server. The command is the path to
-     `lemu-mcp`, with no arguments.
+     `claude mcp add lemu -s user -- /path/to/qemu-system-ppc -mcp-bridge`
+     or `claude mcp add lemu -s user -- /path/to/build/tools/lemu-mcp/lemu-mcp`
+   - Other MCP clients: add a stdio server with that command.
 3. Start a VM from a shell, for example a kit's `./run.sh`. Add
    `-name myvm` to give it a short name.
 4. In the agent: run `vm-list`, then `vm-info` and `screenshot`.

@@ -50,9 +50,10 @@ The PC has no kit, so its `run.sh` is an example.
 
 ## Use it with an agent
 
-1. Build LEMU. The MCP bridge is `build/tools/lemu-mcp/lemu-mcp`.
+1. Build LEMU, or take a kit made from November 2026 on. Every LEMU
+   binary is also the MCP bridge when its first option is `-mcp-bridge`.
 2. Add the bridge to your agent once. For Claude Code:
-   `claude mcp add lemu -s user -- /path/to/build/tools/lemu-mcp/lemu-mcp`
+   `claude mcp add lemu -s user -- /path/to/qemu-system-ppc -mcp-bridge`
 3. Start a VM from a shell, for example a kit's `./run.sh`.
 4. Ask the agent to list the VMs and take a screenshot.
 

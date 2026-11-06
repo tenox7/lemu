@@ -3863,6 +3863,10 @@ endif
 common_ss.add(files('cpu-common.c'))
 user_ss.add(files('cpu-target.c'))
 system_ss.add(files('cpu-target.c'))
+if host_os != 'windows'
+  # every system emulator is also the MCP bridge: qemu-system-* -mcp-bridge
+  system_ss.add(files('tools/lemu-mcp/lemu-mcp.c'))
+endif
 
 # Work around a gcc bug/misfeature wherein constant propagation looks
 # through an alias:

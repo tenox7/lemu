@@ -4998,7 +4998,8 @@ SRST
 ERST
 
 DEF("mcp", HAS_ARG, QEMU_OPTION_mcp, \
-    "-mcp on|off|dev  MCP server for AI agents (default: on)\n",
+    "-mcp on|off|dev  MCP server for AI agents (default: on)\n"
+    "-mcp-bridge      as the first option: run the lemu-mcp bridge, not a VM\n",
     QEMU_ARCH_ALL)
 SRST
 ``-mcp on|off|dev``
@@ -5012,6 +5013,11 @@ SRST
         -mcp unix:vm.mcp,server=on,wait=off
 
     MCP is off under ``-qtest``.
+
+``-mcp-bridge``
+    As the first option, this runs the ``lemu-mcp`` bridge instead of a
+    VM: one MCP server on stdin and stdout for all running VMs, the
+    program an agent starts.  Not on Windows.
 ERST
 
 DEF("mon", HAS_ARG, QEMU_OPTION_mon, \

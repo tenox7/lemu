@@ -14,4 +14,5 @@ Run shutdown -F and wait for "Halt completed" before quitting QEMU.
 For 1024x768 graphics: chdev -l iga0 -a monitor_type=Default -P, then shutdown -Fr.
 macOS: if the binary is blocked, run xattr -cr . in this folder.
 
+AI agents (macOS, Linux): in this folder, claude mcp add lemu -s user -- "$PWD/bin/macos-arm64/qemu-system-ppc" -mcp-bridge (on Linux bin/linux-x86_64 or bin/linux-aarch64) lets an agent such as Claude Code see the screen and use the keyboard, mouse and serial ports of the running VM. See MCP.md in the QEMU source.
 QEMU source: https://github.com/tenox7/lemu branch master (GPLv2, see bin/COPYING). qemu-system-ppc --version names the commit.

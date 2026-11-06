@@ -865,9 +865,55 @@ static void test_debug_memory(void)
     unlink(bios);
 }
 
+/* Run the emulator as the bridge, with @input on stdin; returns stdout */
+static char *bridge_run(const char *arg, const char *input)
+{
+    const char *script = "printf '%s\\n' \"$2\" | \"$0\" -mcp-bridge $1";
+    char *argv[] = {
+        (char *)"/bin/sh", (char *)"-c", (char *)script,
+        (char *)g_getenv("QTEST_QEMU_BINARY"), (char *)arg, (char *)input,
+        NULL
+    };
+    g_autoptr(GError) err = NULL;
+    char *out = NULL;
+    int status;
+
+    g_assert(g_spawn_sync(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL,
+                          &out, NULL, &status, &err));
+    g_assert_no_error(err);
+    g_assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    return out;
+}
+
+/*
+ * Every system emulator is also the lemu-mcp bridge, so the kits need no
+ * extra file.  initialize does not look for VMs, so this touches none.
+ */
+static void test_bridge(void)
+{
+    g_autofree char *usage = bridge_run("--help", "");
+    g_autofree char *out = bridge_run("", "{\"jsonrpc\": \"2.0\", \"id\": 1,"
+        " \"method\": \"initialize\", \"params\": {\"protocolVersion\":"
+        " \"2025-06-18\", \"capabilities\": {}, \"clientInfo\": {\"name\":"
+        " \"t\", \"version\": \"1\"}}}");
+    g_autoptr(QDict) reply = NULL;
+    QDict *result;
+
+    g_assert(strstr(usage, " -mcp-bridge\n"));
+    g_assert(strchr(out, '\n'));
+    *strchr(out, '\n') = 0;
+    reply = qobject_to(QDict, qobject_from_json(out, &error_abort));
+    result = qdict_get_qdict(reply, "result");
+    g_assert_cmpstr(qdict_get_str(qdict_get_qdict(result, "serverInfo"),
+                                  "name"), ==, "lemu");
+    g_assert(strstr(qdict_get_str(result, "instructions"), "screenshot"));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+
+    qtest_add_func("/mcp/bridge", test_bridge);
 
     qtest_add_func("/mcp/keys", test_keys);
     qtest_add_func("/mcp/screen/change", test_screen_change);

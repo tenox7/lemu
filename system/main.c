@@ -27,6 +27,7 @@
 #include "qemu/main-loop.h"
 #include "system/replay.h"
 #include "system/system.h"
+#include "monitor/mcp-common.h"
 
 #ifdef CONFIG_SDL
 /*
@@ -68,6 +69,16 @@ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
 
 int main(int argc, char **argv)
 {
+#ifndef _WIN32
+    /* Be the lemu-mcp bridge instead of a VM, so a kit needs no extra file */
+    if (argc > 1 && !strcmp(argv[1], "-mcp-bridge")) {
+        g_autofree char *cmd = g_strconcat(argv[0], " -mcp-bridge", NULL);
+
+        argv[1] = argv[0];
+        return lemu_mcp_main(argc - 1, argv + 1, cmd);
+    }
+#endif
+
     qemu_init(argc, argv);
 
     /*

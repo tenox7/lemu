@@ -6,4 +6,5 @@ Extra QEMU options are passed through, e.g. ./run.sh -display vnc=:1. The QEMU m
 QEMU halts the CPU while OS/2 is idle, so an idle VM uses 2-6% of a host core.
 macOS: if the binary is blocked, run xattr -cr . in this folder.
 
+AI agents (macOS, Linux): in this folder, claude mcp add lemu -s user -- "$PWD/bin/macos-arm64/qemu-system-ppc" -mcp-bridge (on Linux bin/linux-x86_64 or bin/linux-aarch64) lets an agent such as Claude Code see the screen and use the keyboard, mouse and serial ports of the running VM. See MCP.md in the QEMU source.
 QEMU source: https://github.com/tenox7/lemu branch master (GPLv2, see bin/COPYING). qemu-system-ppc --version names the commit.
