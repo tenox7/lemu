@@ -402,24 +402,43 @@ addbi           101011 ..... ..... ... ........... . .  @rib_cf f=1
 # Shift, Extract, Deposit
 ####
 
-shrp_sar        110100 r2:5 r1:5 c:3 00 0 d:1 0000  t:5
+# The variable forms take the position from SAR, so on PA 1.1 bits 22-26
+# are unused.  SoftPC 3.1 for HP-UX makes ZVDEP with them set and ran on
+# PA 1.1 workstations, so those CPUs ignore them; do the same for all the
+# variable forms.  PA 2.0 uses the bits for the doubleword forms, so the
+# *_pa11 patterns come first and are refused on PA 2.0.
+
+{
+  shrp_sar_pa11 110100 r2:5 r1:5 c:3 00 0 ----- t:5
+  shrp_sar      110100 r2:5 r1:5 c:3 00 0 d:1 0000  t:5
+}
 shrp_imm        110100 r2:5 r1:5 c:3 01 0 cpos:5    t:5       d=0
 shrp_imm        110100 r2:5 r1:5 c:3 0. 1 .....  t:5          \
                 d=1 cpos=%cpos6_11
 
-extr_sar        110100 r:5  t:5  c:3 10 se:1 00 000 .....     d=0 len=%len5
-extr_sar        110100 r:5  t:5  c:3 10 se:1 1. 000 .....     d=1 len=%len6_8
+{
+  extr_sar_pa11 110100 r:5  t:5  c:3 10 se:1 ----- .....      len=%len5
+  extr_sar      110100 r:5  t:5  c:3 10 se:1 00 000 .....     d=0 len=%len5
+  extr_sar      110100 r:5  t:5  c:3 10 se:1 1. 000 .....     d=1 len=%len6_8
+}
 extr_imm        110100 r:5  t:5  c:3 11 se:1 pos:5  .....     d=0 len=%len5
 extr_imm        110110 r:5  t:5  c:3 .. se:1 ..... .....      \
                 d=1 len=%len6_12 pos=%cpos6_11
 
-dep_sar         110101 t:5 r:5   c:3 00 nz:1 00 000 .....     d=0 len=%len5
-dep_sar         110101 t:5 r:5   c:3 00 nz:1 1. 000 .....     d=1 len=%len6_8
+{
+  dep_sar_pa11  110101 t:5 r:5   c:3 00 nz:1 ----- .....      len=%len5
+  dep_sar       110101 t:5 r:5   c:3 00 nz:1 00 000 .....     d=0 len=%len5
+  dep_sar       110101 t:5 r:5   c:3 00 nz:1 1. 000 .....     d=1 len=%len6_8
+}
 dep_imm         110101 t:5 r:5   c:3 01 nz:1 cpos:5 .....     d=0 len=%len5
 dep_imm         111100 t:5 r:5   c:3 .. nz:1 ..... .....      \
                 d=1 len=%len6_12 cpos=%cpos6_11
-depi_sar        110101 t:5 ..... c:3 10 nz:1 d:1 . 000 .....  \
+{
+  depi_sar_pa11 110101 t:5 ..... c:3 10 nz:1 ----- .....      \
+                i=%im5_16 len=%len5
+  depi_sar      110101 t:5 ..... c:3 10 nz:1 d:1 . 000 .....  \
                 i=%im5_16 len=%len6_8
+}
 depi_imm        110101 t:5 ..... c:3 11 nz:1 cpos:5 .....     \
                 d=0 i=%im5_16 len=%len5
 depi_imm        111101 t:5 ..... c:3 .. nz:1 ..... .....      \

@@ -3751,6 +3751,17 @@ static bool trans_shrp_sar(DisasContext *ctx, arg_shrp_sar *a)
     return nullify_end(ctx);
 }
 
+/*
+ * PA 1.1 forms of the variable shift, extract and deposit: the CPU
+ * ignores bits 22-26.  See the comment in insns.decode.
+ */
+static bool trans_shrp_sar_pa11(DisasContext *ctx, arg_shrp_sar_pa11 *a)
+{
+    arg_shrp_sar b = { .r1 = a->r1, .r2 = a->r2, .c = a->c, .t = a->t };
+
+    return !ctx->is_pa20 && trans_shrp_sar(ctx, &b);
+}
+
 static bool trans_shrp_imm(DisasContext *ctx, arg_shrp_imm *a)
 {
     unsigned width, sa;
@@ -3831,6 +3842,15 @@ static bool trans_extr_sar(DisasContext *ctx, arg_extr_sar *a)
     /* Install the new nullification.  */
     ctx->null_cond = do_sed_cond(ctx, a->c, a->d, dest);
     return nullify_end(ctx);
+}
+
+static bool trans_extr_sar_pa11(DisasContext *ctx, arg_extr_sar_pa11 *a)
+{
+    arg_extr_sar b = {
+        .r = a->r, .t = a->t, .c = a->c, .se = a->se, .len = a->len
+    };
+
+    return !ctx->is_pa20 && trans_extr_sar(ctx, &b);
 }
 
 static bool trans_extr_imm(DisasContext *ctx, arg_extr_imm *a)
@@ -3992,6 +4012,24 @@ static bool trans_depi_sar(DisasContext *ctx, arg_depi_sar *a)
     }
     return do_dep_sar(ctx, a->t, a->c, a->d, a->nz, a->len,
                       tcg_constant_i64(a->i));
+}
+
+static bool trans_dep_sar_pa11(DisasContext *ctx, arg_dep_sar_pa11 *a)
+{
+    arg_dep_sar b = {
+        .t = a->t, .r = a->r, .c = a->c, .nz = a->nz, .len = a->len
+    };
+
+    return !ctx->is_pa20 && trans_dep_sar(ctx, &b);
+}
+
+static bool trans_depi_sar_pa11(DisasContext *ctx, arg_depi_sar_pa11 *a)
+{
+    arg_depi_sar b = {
+        .t = a->t, .i = a->i, .c = a->c, .nz = a->nz, .len = a->len
+    };
+
+    return !ctx->is_pa20 && trans_depi_sar(ctx, &b);
 }
 
 static bool trans_be(DisasContext *ctx, arg_be *a)
