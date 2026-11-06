@@ -15,6 +15,7 @@
 #include "chardev/char.h"
 #include "hw/core/qdev-properties-system.h"
 #include "hw/core/qdev.h"
+#include "monitor/mcp-common.h"
 #include "monitor/mcp.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-mcp.h"
@@ -288,54 +289,6 @@ McpSerialResult *qmp_serial_read(const char *port_name, bool has_cursor,
     return res;
 }
 
-/* Turn \r, \n, \t, \e, \\ and \xHH into characters; others stay */
-static GString *mcp_serial_unescape(const char *text)
-{
-    GString *s = g_string_new(NULL);
-    const char *p = text;
-
-    while (*p) {
-        if (p[0] != '\\' || !p[1]) {
-            g_string_append_c(s, *p++);
-            continue;
-        }
-        switch (p[1]) {
-        case 'r':
-            g_string_append_c(s, '\r');
-            p += 2;
-            break;
-        case 'n':
-            g_string_append_c(s, '\n');
-            p += 2;
-            break;
-        case 't':
-            g_string_append_c(s, '\t');
-            p += 2;
-            break;
-        case 'e':
-            g_string_append_c(s, 0x1b);
-            p += 2;
-            break;
-        case '\\':
-            g_string_append_c(s, '\\');
-            p += 2;
-            break;
-        case 'x':
-            if (g_ascii_isxdigit(p[2]) && g_ascii_isxdigit(p[3])) {
-                g_string_append_c(s, g_ascii_xdigit_value(p[2]) * 16 +
-                                     g_ascii_xdigit_value(p[3]));
-                p += 4;
-                break;
-            }
-            /* fall through */
-        default:
-            g_string_append_c(s, *p++);
-            break;
-        }
-    }
-    return s;
-}
-
 /* The input context: the MCP call's, or @local for a QMP caller */
 static QemuInputCtx *mcp_serial_ctx(QemuInputCtx *local)
 {
@@ -426,7 +379,7 @@ McpResult *coroutine_fn qmp_serial_write(const char *port_name,
     /* typing by hand: serial-run no longer waits for its last command */
     g_clear_pointer(&port->pending, g_free);
     data = (has_escapes && !escapes) ? g_string_new(text)
-                                     : mcp_serial_unescape(text);
+                                     : mcp_unescape(text);
     if (!mcp_serial_send(port, ctx, data,
                          has_char_delay_ms ? MAX(char_delay_ms, 0) : 0,
                          false, errp)) {

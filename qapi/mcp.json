@@ -315,6 +315,68 @@
   'features': [ 'mcp', 'mcp-read-only' ] }
 
 ##
+# @McpVcpuStats:
+#     How one virtual CPU spent the time that @vm-stats measured.
+#
+# @index: CPU index
+#
+# @halted-percent: share of the running time in which the CPU was
+#     halted, waiting for an interrupt.  A guest whose idle loop halts
+#     the CPU shows a high number when it has nothing to do.
+#
+# Since: 11.2
+##
+{ 'struct': 'McpVcpuStats',
+  'data': { 'index': 'int', 'halted-percent': 'int' } }
+
+##
+# @McpVmStats:
+#     What @vm-stats returns.
+#
+# @interval-ms: how long it measured
+#
+# @cpu-percent: host CPU time that the QEMU process used, in percent
+#     of one host core (two busy cores are 200)
+#
+# @cpu-ms: host CPU time used in the interval, user and system
+#
+# @paused-percent: share of the time in which the VM was paused
+#
+# @vcpus: the virtual CPUs
+#
+# Since: 11.2
+##
+{ 'struct': 'McpVmStats',
+  'base': 'McpResult',
+  'data': { 'interval-ms': 'int', 'cpu-percent': 'number',
+            'cpu-ms': 'int', 'paused-percent': 'int',
+            'vcpus': [ 'McpVcpuStats' ] } }
+
+##
+# @vm-stats:
+#     Measure for a while how much host CPU the VM uses and how often
+#     each virtual CPU is halted.  A guest that idles well halts its
+#     CPUs and costs little host CPU; one that spins in its idle loop
+#     keeps a host core busy.  Use it instead of ps or top in a shell.
+#
+# @interval-ms: how long to measure, from 100 to 100000 (default:
+#     5000)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# @mcp-read-only: does not change the VM
+#
+# Since: 11.2
+##
+{ 'command': 'vm-stats',
+  'data': { '*interval-ms': 'int' },
+  'returns': 'McpVmStats',
+  'features': [ 'mcp', 'mcp-read-only' ],
+  'coroutine': true }
+
+##
 # @screenshot:
 #     Capture a guest console as PNG.  Coordinates in all tools are
 #     framebuffer pixels of this console, origin top-left.  If @scale

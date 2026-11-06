@@ -9,14 +9,16 @@ used by AI agents, so AI-written code is welcome here.
   agent that connects.
 - **No Python to drive VMs.** The MCP tools do it: `hmp` for the monitor,
   memory and registers, `serial-run` for commands in the guest, the
-  other serial tools for serial consoles, `wait-screen` instead of
-  sleeping. See [MCP.md](MCP.md#without-python).
+  other serial tools for serial consoles, `wait-screen` and `vm-wait`
+  instead of sleeping, `vm-stats` instead of `ps` and `top`. See
+  [MCP.md](MCP.md#without-python).
 - **Only touch your own VMs.** Never stop, reset or change a VM you did
   not start, unless the user asks.
 - **Work on copies.** Test with copies of disk images and NVRAM files
   (`cp -c` on macOS, `cp --reflink` on Linux), never with the originals.
-- **Start VMs from a shell.** There is no tool to start a VM. On macOS,
-  keep Unix socket paths under about 104 bytes: use short relative names.
+- **Start VMs from a shell,** then call `vm-wait`. There is no tool to
+  start a VM. On macOS, keep Unix socket paths under about 104 bytes:
+  use short relative names.
 
 ## Working on LEMU
 

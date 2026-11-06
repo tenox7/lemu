@@ -38,4 +38,7 @@ QList *mcp_protocol_list(void);
  */
 const char *mcp_meta_protocol(QDict *params);
 
+/* Turn \r, \n, \t, \e, \\ and \xHH in @text into bytes; others stay */
+GString *mcp_unescape(const char *text);
+
 #endif

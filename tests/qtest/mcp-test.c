@@ -413,6 +413,37 @@ static QDict *run(QTestState *qts, const char *args, const char *answer,
     return rsp;
 }
 
+/* vm-stats measures for the time asked, at least 100 ms, every vCPU */
+static void test_vm_stats(void)
+{
+    QTestState *qts = qtest_init("-machine pc -display none -smp 2");
+    QDict *rsp, *ret;
+
+    rsp = qtest_qmp(qts, "{'execute': 'vm-stats', 'arguments':"
+                    " {'interval-ms': 300}}");
+    ret = qdict_get_qdict(rsp, "return");
+    g_assert(ret);
+    g_assert_cmpint(qdict_get_int(ret, "interval-ms"), >=, 300);
+    g_assert_cmpint(qdict_get_int(ret, "interval-ms"), <, 5000);
+    g_assert_cmpfloat(qdict_get_double(ret, "cpu-percent"), >=, 0);
+    g_assert_cmpint(qdict_get_int(ret, "paused-percent"), ==, 0);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "vcpus")), ==, 2);
+    g_assert(strstr(qdict_get_str(ret, "summary"), "host CPU"));
+    qobject_unref(rsp);
+
+    /* a paused VM runs no CPU */
+    qtest_qmp_assert_success(qts, "{'execute': 'stop'}");
+    rsp = qtest_qmp(qts, "{'execute': 'vm-stats', 'arguments':"
+                    " {'interval-ms': 1}}");
+    ret = qdict_get_qdict(rsp, "return");
+    g_assert(ret);
+    g_assert_cmpint(qdict_get_int(ret, "interval-ms"), >=, 100);
+    g_assert_cmpint(qdict_get_int(ret, "paused-percent"), ==, 100);
+    g_assert(strstr(qdict_get_str(ret, "summary"), "paused"));
+    qobject_unref(rsp);
+    qtest_quit(qts);
+}
+
 /* serial-expect waits for text, and its cursor moves past the match */
 static void test_serial_expect(void)
 {
@@ -617,6 +648,7 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/keys", test_keys);
     qtest_add_func("/mcp/screen/change", test_screen_change);
     qtest_add_func("/mcp/screen/blink", test_screen_blink);
+    qtest_add_func("/mcp/vm-stats", test_vm_stats);
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);
     qtest_add_func("/mcp/serial/run-cancel", test_serial_run_cancel);

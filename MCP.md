@@ -44,7 +44,9 @@ only when exactly one VM is running and you started it.
 | Tool | What it does |
 |---|---|
 | `vm-list` | List the running VMs: name, PID, folder, machine, who started it |
+| `vm-wait` | Wait for a VM to start or end, or for a guest service on a forwarded port |
 | `vm-info` | Describe one VM: screens, mouse, disks, serial ports. Use it first |
+| `vm-stats` | Measure how much host CPU a VM uses and how often its CPUs are halted |
 | `screenshot` | Take a picture of a screen (PNG) |
 | `frames` | List recent screens, to find one that went by too fast |
 | `wait-screen` | Wait until the screen changes, settles or shows a colour. Use it instead of sleeping |
@@ -69,6 +71,9 @@ The server sends these rules to every agent that connects:
   call.
 - **Don't sleep.** Use `wait-screen`, or `serial-expect` for serial
   text. For long installs, call it in a loop.
+- **Starting and stopping:** after you start a VM from a shell, call
+  `vm-wait`. After a guest shutdown, `vm-wait` until `gone` before you
+  copy its disk.
 - **No scripts.** Don't write Python or socket scripts to drive a VM.
   The tools do it; see [Without Python](#without-python).
 - **Commands in a Unix guest:** log in on a serial port and use
@@ -103,6 +108,9 @@ Use these:
 | Wait for serial text | `serial-expect` |
 | Read what a serial port printed | `serial-read` |
 | Wait for the screen | `wait-screen` |
+| Wait for a VM to start, or to end | `vm-wait` until `up` or `gone` |
+| Wait until a guest service answers on a forwarded port | `vm-wait` until `port` |
+| See how much host CPU a VM uses, and whether the guest idles | `vm-stats` |
 | Crop or zoom a screenshot | `screenshot` with `region` and `scale` |
 | Find a screen that went by | `frames` |
 | Change a CD or floppy | `media` |
@@ -110,10 +118,10 @@ Use these:
 - **Every serial port works.** The serial tools see what the guest
   writes to every serial port, whatever it is connected to: a socket, a
   pty, a window or `mon:stdio`. You don't need a socket of your own.
-- **Waiting for something outside the VM,** such as a QEMU process that
-  should exit: use your agent's own way to wait in the background (in
-  Claude Code, a background shell with an `until` loop), not a Python
-  sleep.
+- **Waiting outside the VM:** `vm-wait` covers a QEMU process that
+  starts or ends, and a port that should answer. For anything else, use
+  your agent's own way to wait in the background (in Claude Code, a
+  background shell with an `until` loop), not a Python sleep.
 - **Files and logs on the host:** `xxd`, `od`, `grep`, `jq` and `cmp` do
   the job.
 

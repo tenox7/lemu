@@ -107,6 +107,53 @@ QList *mcp_protocol_list(void)
     return list;
 }
 
+GString *mcp_unescape(const char *text)
+{
+    GString *s = g_string_new(NULL);
+    const char *p = text;
+
+    while (*p) {
+        if (p[0] != '\\' || !p[1]) {
+            g_string_append_c(s, *p++);
+            continue;
+        }
+        switch (p[1]) {
+        case 'r':
+            g_string_append_c(s, '\r');
+            p += 2;
+            break;
+        case 'n':
+            g_string_append_c(s, '\n');
+            p += 2;
+            break;
+        case 't':
+            g_string_append_c(s, '\t');
+            p += 2;
+            break;
+        case 'e':
+            g_string_append_c(s, 0x1b);
+            p += 2;
+            break;
+        case '\\':
+            g_string_append_c(s, '\\');
+            p += 2;
+            break;
+        case 'x':
+            if (g_ascii_isxdigit(p[2]) && g_ascii_isxdigit(p[3])) {
+                g_string_append_c(s, g_ascii_xdigit_value(p[2]) * 16 +
+                                     g_ascii_xdigit_value(p[3]));
+                p += 4;
+                break;
+            }
+            /* fall through */
+        default:
+            g_string_append_c(s, *p++);
+            break;
+        }
+    }
+    return s;
+}
+
 const char *mcp_meta_protocol(QDict *params)
 {
     QDict *meta = params ? qdict_get_qdict(params, "_meta") : NULL;

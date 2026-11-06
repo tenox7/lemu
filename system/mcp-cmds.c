@@ -5,16 +5,23 @@
  */
 
 #include "qemu/osdep.h"
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 #include "hw/core/boards.h"
+#include "hw/core/cpu.h"
 #include "hw/core/qdev.h"
 #include "hw/core/status-text.h"
 #include "migration/snapshot.h"
+#include "monitor/mcp.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block.h"
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qapi/qapi-commands-mcp.h"
 #include "qapi/qapi-commands-misc.h"
+#include "qemu/coroutine.h"
+#include "qemu/timer.h"
 #include "qom/object.h"
 #include "system/mcp-serial.h"
 #include "system/runstate.h"
@@ -24,6 +31,10 @@
 #ifdef CONFIG_PIXMAN
 #include "ui/pointer.h"
 #endif
+
+#define STATS_DEFAULT_MS    5000
+#define STATS_MIN_MS        100
+#define STATS_MAX_MS        100000
 
 static McpConsoleInfo *mcp_console_info(QemuConsole *con)
 {
@@ -161,6 +172,130 @@ McpVmInfo *qmp_vm_info(Error **errp)
     }
     vi->summary = g_strdup(s->str);
     return vi;
+}
+
+/* Host CPU time that this process has used, user and system, in us */
+static int64_t mcp_cpu_time_us(void)
+{
+#ifdef _WIN32
+    FILETIME create, end, kernel, user;
+    ULARGE_INTEGER k, u;
+
+    if (!GetProcessTimes(GetCurrentProcess(), &create, &end, &kernel,
+                         &user)) {
+        return 0;
+    }
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+    return (k.QuadPart + u.QuadPart) / 10;
+#else
+    struct rusage ru;
+
+    if (getrusage(RUSAGE_SELF, &ru) < 0) {
+        return 0;
+    }
+    return (int64_t)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000 +
+           ru.ru_utime.tv_usec + ru.ru_stime.tv_usec;
+#endif
+}
+
+McpVmStats *coroutine_fn qmp_vm_stats(bool has_interval_ms,
+                                      int64_t interval_ms, Error **errp)
+{
+    g_auto(QemuInputCtx) local = { 0 };
+    QemuInputCtx *ctx = mcp_current_input_ctx();
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autofree int *halted = NULL;
+    McpVmStats *st;
+    McpVcpuStatsList **tail;
+    int64_t start, now, end, cpu_us, ms, tenths;
+    int ncpus = 0, samples = 0, running = 0;
+    CPUState *cpu;
+
+    if (!ctx) {
+        qemu_input_ctx_init(&local, NULL);
+        ctx = &local;
+    }
+    interval_ms = has_interval_ms ? interval_ms : STATS_DEFAULT_MS;
+    interval_ms = MIN(MAX(interval_ms, STATS_MIN_MS), STATS_MAX_MS);
+    CPU_FOREACH(cpu) {
+        ncpus = MAX(ncpus, cpu->cpu_index + 1);
+    }
+    halted = g_new0(int, MAX(ncpus, 1));
+
+    cpu_us = mcp_cpu_time_us();
+    start = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    end = start + interval_ms;
+    for (;;) {
+        samples++;
+        if (runstate_is_running()) {
+            running++;
+            CPU_FOREACH(cpu) {
+                if (cpu->cpu_index < ncpus && qatomic_read(&cpu->halted)) {
+                    halted[cpu->cpu_index]++;
+                }
+            }
+        }
+        now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        if (now >= end || ctx->cancelled) {
+            break;
+        }
+        /* uneven steps, so that a guest timer can't keep pace with them */
+        qemu_co_sleep_ns_wakeable(&ctx->sleep, QEMU_CLOCK_REALTIME,
+                                  MIN(g_random_int_range(5, 16), end - now)
+                                  * SCALE_MS);
+    }
+    if (ctx->cancelled) {
+        error_setg(errp, "cancelled");
+        return NULL;
+    }
+    cpu_us = mcp_cpu_time_us() - cpu_us;
+    ms = MAX(now - start, 1);
+    tenths = (cpu_us + ms / 2) / ms;
+
+    st = g_new0(McpVmStats, 1);
+    st->interval_ms = ms;
+    st->cpu_ms = cpu_us / 1000;
+    st->cpu_percent = tenths / 10.0;
+    st->paused_percent = (samples - running) * 100 / samples;
+    tail = &st->vcpus;
+    CPU_FOREACH(cpu) {
+        McpVcpuStats *v = g_new0(McpVcpuStats, 1);
+
+        v->index = cpu->cpu_index;
+        if (running && cpu->cpu_index < ncpus) {
+            v->halted_percent = halted[cpu->cpu_index] * 100 / running;
+        }
+        QAPI_LIST_APPEND(tail, v);
+    }
+
+    g_string_printf(s, "over %.1f s, QEMU used %.1f%% host CPU (100%% = one"
+                    " core)", ms / 1000.0, tenths / 10.0);
+    if (!running) {
+        g_string_append(s, "; the VM was paused, so its CPUs did not run");
+    } else if (st->vcpus && !st->vcpus->next) {
+        g_string_append_printf(s, "; CPU %" PRId64 " was halted %" PRId64
+                               "%% of the time", st->vcpus->value->index,
+                               st->vcpus->value->halted_percent);
+    } else {
+        McpVcpuStatsList *v;
+
+        g_string_append(s, "; halted:");
+        for (v = st->vcpus; v; v = v->next) {
+            g_string_append_printf(s, "%s CPU %" PRId64 " %" PRId64 "%%",
+                                   v == st->vcpus ? "" : ",",
+                                   v->value->index,
+                                   v->value->halted_percent);
+        }
+    }
+    if (running && st->paused_percent) {
+        g_string_append_printf(s, "; paused %" PRId64 "%% of the time",
+                               st->paused_percent);
+    }
+    st->summary = g_strdup(s->str);
+    return st;
 }
 
 /* ide-cd, scsi-cd and friends */

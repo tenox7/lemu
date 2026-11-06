@@ -11,6 +11,11 @@
 
 #include "qemu/osdep.h"
 #include <glib-unix.h>
+#include <netdb.h>
+#ifdef CONFIG_DARWIN
+#include <libproc.h>
+#include <sys/proc.h>
+#endif
 #include "monitor/mcp-common.h"
 #include "monitor/mcp-tools.h"
 #include "qapi/error.h"
@@ -28,11 +33,22 @@
 
 #define LINE_MAX_BYTES      (64 * 1024 * 1024)
 #define TOOLS_TIMEOUT_MS    3000
+#define WAIT_TICK_MS        200
+#define WAIT_DEFAULT_MS     30000
+#define WAIT_MAX_MS         110000
+#define WAIT_PROGRESS_MS    5000
+#define PORT_RETRY_MS       500     /* between tries */
+#define PORT_SILENT_MS      5000    /* a try that hears nothing ends */
+#define PORT_ANSWER_MAX     4096
+#define PORT_SHOW_MAX       200
 
 static const char bridge_instructions[] =
     "- Several VMs may be running, the user's and yours. Every tool takes"
     " vm: a VM name or PID from vm-list. You may leave it out only when"
-    " exactly one VM is running and you started it.\n";
+    " exactly one VM is running and you started it.\n"
+    "- After you start a VM from a shell, call vm-wait instead of a sleep"
+    " loop. After a guest shutdown, vm-wait until gone before you copy its"
+    " disk.\n";
 
 static const char vm_list_tool[] =
     "{\"name\":\"vm-list\","
@@ -42,6 +58,36 @@ static const char vm_list_tool[] =
     " tools.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}},"
     "\"annotations\":{\"readOnlyHint\":true,\"openWorldHint\":false}}";
+
+static const char vm_wait_tool[] =
+    "{\"name\":\"vm-wait\","
+    "\"description\":\"Wait for a VM to start or end, or for a TCP port to"
+    " answer, instead of a sleep or pgrep loop in a shell. until up: the"
+    " VM runs and its tools answer (give the name from -name, or the"
+    " PID); then wait for the guest with wait-screen or serial-expect."
+    " until gone: its QEMU process has ended and closed its disks, for"
+    " example after a guest shutdown. until port: a TCP port on this"
+    " host sends an answer, such as a port that hostfwd forwards to the"
+    " guest; for a server that waits for the client to talk first (rsh,"
+    " http), give send.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"vm\":{\"type\":\"string\",\"description\":\"until up and gone: the"
+    " VM, a name or PID\"},"
+    "\"until\":{\"type\":\"string\",\"enum\":[\"up\",\"gone\",\"port\"],"
+    "\"description\":\"what to wait for (default: up)\"},"
+    "\"port\":{\"type\":\"integer\",\"description\":\"until port: the TCP"
+    " port\"},"
+    "\"host\":{\"type\":\"string\",\"description\":\"until port: the host"
+    " (default: 127.0.0.1)\"},"
+    "\"send\":{\"type\":\"string\",\"description\":\"until port: what to"
+    " send once connected; \\\\r, \\\\n, \\\\t, \\\\\\\\ and \\\\xHH are"
+    " escapes\"},"
+    "\"expect\":{\"type\":\"string\",\"description\":\"until port: a"
+    " regular expression that the answer must match (default: any"
+    " answer)\"},"
+    "\"timeout-ms\":{\"type\":\"integer\",\"description\":\"give up after"
+    " this long, at most 110000 (default: 30000)\"}}},"
+    "\"annotations\":{\"destructiveHint\":false,\"openWorldHint\":true}}";
 
 static const char vm_arg_schema[] =
     "{\"type\":\"string\","
@@ -649,6 +695,7 @@ static QList *tools_finish(QList *list)
         }
     }
     qlist_append_obj(list, qobject_from_json(vm_list_tool, &error_abort));
+    qlist_append_obj(list, qobject_from_json(vm_wait_tool, &error_abort));
     return list;
 }
 
@@ -862,6 +909,685 @@ static Vm *vm_choose(QObject *id, QObject *arg)
     return NULL;
 }
 
+/* vm-wait */
+
+typedef enum WaitUntil {
+    WAIT_UP,
+    WAIT_GONE,
+    WAIT_PORT,
+} WaitUntil;
+
+typedef struct Wait {
+    QObject *client_id;
+    QObject *progress_token;
+    WaitUntil until;
+    int64_t start_ms;
+    int64_t deadline_ms;
+    int64_t next_progress_ms;
+    guint timer;
+
+    /* up and gone */
+    char *label;                /* "VM 'x'", "VM x (pid N)" or "pid N" */
+    char *name;                 /* up: the name asked for, or NULL */
+    int64_t pid;                /* the PID, or -1 */
+    char *file;                 /* gone: the VM's registry file */
+    bool listed;                /* up: seen in the registry */
+
+    /* port */
+    char *target;               /* "host:port" */
+    struct addrinfo *addrs;
+    GString *send;
+    GRegex *expect;
+    int fd;                     /* the try now, or -1 */
+    guint fd_watch;
+    bool connected;
+    GString *answer;
+    int tries;
+    char *last;                 /* what the last try saw */
+    char *heard;                /* the last answer that did not match */
+    bool last_heard;            /* the last try got that answer */
+    int64_t try_start_ms;
+    int64_t next_try_ms;
+} Wait;
+
+static GList *waits;
+
+static int64_t now_ms(void)
+{
+    return g_get_monotonic_time() / 1000;
+}
+
+/* @pid runs, and is not a zombie that nobody has reaped yet */
+static bool pid_alive(int64_t pid)
+{
+    if (pid <= 0 || pid > INT_MAX) {
+        return false;
+    }
+    if (kill(pid, 0) < 0 && errno == ESRCH) {
+        return false;
+    }
+#ifdef CONFIG_DARWIN
+    {
+        struct proc_bsdinfo bi;
+
+        if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) ==
+            sizeof(bi) && bi.pbi_status == SZOMB) {
+            return false;
+        }
+    }
+#elif defined(CONFIG_LINUX)
+    {
+        g_autofree char *path = g_strdup_printf("/proc/%" PRId64 "/stat",
+                                                pid);
+        g_autofree char *stat = NULL;
+        const char *p = NULL;
+
+        /* "pid (name) S ...": the state follows the last ')' */
+        if (g_file_get_contents(path, &stat, NULL, NULL)) {
+            p = strrchr(stat, ')');
+        }
+        if (p && p[1] == ' ' && p[2] == 'Z') {
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
+/* @buf as text: \r, \n, \t, \\ and \xHH for what is not printable */
+static char *show_bytes(const char *buf, size_t len, size_t max)
+{
+    GString *s = g_string_new(NULL);
+    size_t i;
+
+    for (i = 0; i < len && s->len < max; i++) {
+        unsigned char c = buf[i];
+
+        if (c == '\r') {
+            g_string_append(s, "\\r");
+        } else if (c == '\n') {
+            g_string_append(s, "\\n");
+        } else if (c == '\t') {
+            g_string_append(s, "\\t");
+        } else if (c == '\\') {
+            g_string_append(s, "\\\\");
+        } else if (c >= 0x20 && c < 0x7f) {
+            g_string_append_c(s, c);
+        } else {
+            g_string_append_printf(s, "\\x%02x", c);
+        }
+    }
+    if (i < len) {
+        g_string_append(s, "...");
+    }
+    return g_string_free(s, false);
+}
+
+static void port_close(Wait *w)
+{
+    if (w->fd_watch) {
+        g_source_remove(w->fd_watch);
+        w->fd_watch = 0;
+    }
+    if (w->fd >= 0) {
+        close(w->fd);
+        w->fd = -1;
+    }
+    w->connected = false;
+}
+
+static void wait_free(Wait *w)
+{
+    waits = g_list_remove(waits, w);
+    if (w->timer) {
+        g_source_remove(w->timer);
+    }
+    port_close(w);
+    qobject_unref(w->client_id);
+    qobject_unref(w->progress_token);
+    g_free(w->label);
+    g_free(w->name);
+    g_free(w->file);
+    g_free(w->target);
+    if (w->addrs) {
+        freeaddrinfo(w->addrs);
+    }
+    if (w->send) {
+        g_string_free(w->send, true);
+    }
+    if (w->expect) {
+        g_regex_unref(w->expect);
+    }
+    if (w->answer) {
+        g_string_free(w->answer, true);
+    }
+    g_free(w->last);
+    g_free(w->heard);
+    g_free(w);
+}
+
+static double wait_secs(Wait *w)
+{
+    return (now_ms() - w->start_ms) / 1000.0;
+}
+
+/* Answer the call with @text and @json, and forget it */
+static void wait_done(Wait *w, bool done, const char *text, QDict *json)
+{
+    if (!json) {
+        json = qdict_new();
+    }
+    qdict_put_bool(json, "done", done);
+    qdict_put_int(json, "ms", now_ms() - w->start_ms);
+    client_tool_result(w->client_id, text, QOBJECT(json), false);
+    wait_free(w);
+}
+
+static void G_GNUC_PRINTF(2, 3) wait_error(Wait *w, const char *fmt, ...)
+{
+    g_autofree char *text = NULL;
+    va_list ap;
+
+    va_start(ap, fmt);
+    text = g_strdup_vprintf(fmt, ap);
+    va_end(ap);
+    client_tool_result(w->client_id, text, NULL, true);
+    wait_free(w);
+}
+
+static void wait_progress(Wait *w, int64_t now)
+{
+    QDict *params = qdict_new();
+    g_autoptr(QDict) msg = request("notifications/progress", params);
+    int64_t s = (now - w->start_ms) / 1000;
+    g_autofree char *text = g_strdup_printf("vm-wait running for %" PRId64
+                                            " s", s);
+
+    qdict_put_obj(params, "progressToken", qobject_ref(w->progress_token));
+    qdict_put_int(params, "progress", s);
+    qdict_put_str(params, "message", text);
+    client_send(msg);
+}
+
+/* until up: true once the call is answered */
+static bool wait_check_up(Wait *w)
+{
+    g_autoptr(GPtrArray) list = registry_scan();
+    g_autofree char *text = NULL;
+    Vm *found = NULL;
+    guint i, n = 0;
+
+    for (i = 0; i < list->len; i++) {
+        Vm *vm = g_ptr_array_index(list, i);
+
+        if (w->pid >= 0 ? vm->pid == w->pid : !strcmp(vm->name, w->name)) {
+            found = vm;
+            n++;
+        }
+    }
+    if (n > 1) {
+        wait_error(w, "several VMs are named '%s'; use the PID", w->name);
+        return true;
+    }
+    if (!found) {
+        if (w->pid >= 0 && !pid_alive(w->pid)) {
+            text = g_strdup_printf("process %" PRId64 " ended before its VM"
+                                   " came up, or never ran; look at the"
+                                   " output of the command that started it",
+                                   w->pid);
+            wait_done(w, false, text, NULL);
+            return true;
+        }
+        return false;
+    }
+    w->listed = true;
+    if (!found->ready) {
+        vm_connect(found, NULL);    /* ready once it answers initialize */
+        return false;
+    }
+    text = g_strdup_printf("VM %s (pid %d) is up after %.1f s: %s in %s",
+                           found->name, found->pid, wait_secs(w),
+                           found->machine, found->cwd);
+    wait_done(w, true, text, vm_describe(found, true));
+    return true;
+}
+
+/* until gone: true once the call is answered */
+static bool wait_check_gone(Wait *w)
+{
+    g_autofree char *text = NULL;
+
+    if (pid_alive(w->pid) &&
+        !(w->file && !g_file_test(w->file, G_FILE_TEST_EXISTS))) {
+        return false;
+    }
+    /* QEMU removes its registry file last, after it closed the disks */
+    text = g_strdup_printf("%s has ended after %.1f s", w->label,
+                           wait_secs(w));
+    wait_done(w, true, text, NULL);
+    return true;
+}
+
+static char *port_connect_error(Wait *w, int err)
+{
+    if (err == ECONNREFUSED) {
+        return g_strdup_printf("the connection was refused: nothing listens"
+                               " on %s (is the VM running, with hostfwd for"
+                               " this port?)", w->target);
+    }
+    return g_strdup_printf("cannot connect to %s: %s", w->target,
+                           strerror(err));
+}
+
+/* End the try now, saying what it saw (@why is taken) */
+static void port_try_end(Wait *w, char *why)
+{
+    w->last_heard = w->answer->len > 0;
+    if (w->last_heard) {
+        g_free(w->heard);
+        w->heard = show_bytes(w->answer->str, w->answer->len, PORT_SHOW_MAX);
+    }
+    port_close(w);
+    g_free(w->last);
+    w->last = why;
+    w->next_try_ms = now_ms() + PORT_RETRY_MS;
+}
+
+static char *port_no_answer(Wait *w)
+{
+    g_autofree char *shown = NULL;
+
+    if (!w->answer->len) {
+        return g_strdup_printf("it took the connection but sent nothing in"
+                               " %.1f s: the guest may not answer yet, or"
+                               " the server waits for the client to talk"
+                               " first (give send)",
+                               (now_ms() - w->try_start_ms) / 1000.0);
+    }
+    shown = show_bytes(w->answer->str, w->answer->len, PORT_SHOW_MAX);
+    return g_strdup_printf("it answered \"%s\", which does not match"
+                           " expect", shown);
+}
+
+static void port_succeed(Wait *w)
+{
+    g_autofree char *shown = show_bytes(w->answer->str, w->answer->len,
+                                        PORT_SHOW_MAX);
+    g_autofree char *text = g_strdup_printf("%s answered after %.1f s (try"
+                                            " %d): \"%s\"", w->target,
+                                            wait_secs(w), w->tries, shown);
+    QDict *json = qdict_new();
+
+    qdict_put_str(json, "answer", shown);
+    qdict_put_int(json, "tries", w->tries);
+    wait_done(w, true, text, json);
+}
+
+static gboolean port_io(int fd, GIOCondition cond, gpointer opaque)
+{
+    Wait *w = opaque;
+    char buf[1024];
+    ssize_t n;
+
+    if (!w->connected) {
+        int err = 0;
+        socklen_t len = sizeof(err);
+
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+            err = errno;
+        }
+        w->fd_watch = 0;
+        if (err) {
+            port_try_end(w, port_connect_error(w, err));
+            return G_SOURCE_REMOVE;
+        }
+        w->connected = true;
+        if (w->send && w->send->len &&
+            !write_all(fd, w->send->str, w->send->len)) {
+            port_try_end(w, g_strdup_printf("the connection closed while"
+                                            " sending: %s",
+                                            strerror(errno)));
+            return G_SOURCE_REMOVE;
+        }
+        w->fd_watch = g_unix_fd_add(fd, G_IO_IN | G_IO_HUP | G_IO_ERR,
+                                    port_io, w);
+        return G_SOURCE_REMOVE;
+    }
+
+    n = read(fd, buf, MIN(sizeof(buf), PORT_ANSWER_MAX - w->answer->len));
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+        return G_SOURCE_CONTINUE;
+    }
+    if (n > 0) {
+        g_string_append_len(w->answer, buf, n);
+        if (!w->expect ||
+            g_regex_match_full(w->expect, w->answer->str, w->answer->len, 0,
+                               0, NULL, NULL)) {
+            w->fd_watch = 0;
+            port_succeed(w);
+            return G_SOURCE_REMOVE;
+        }
+        if (w->answer->len < PORT_ANSWER_MAX) {
+            return G_SOURCE_CONTINUE;
+        }
+    }
+    w->fd_watch = 0;
+    if (!w->answer->len) {
+        port_try_end(w, g_strdup("it took the connection and closed it at"
+                                 " once: with QEMU user networking"
+                                 " (hostfwd) that means the guest refused"
+                                 " it, so nothing listens on that guest"
+                                 " port yet"));
+    } else {
+        port_try_end(w, port_no_answer(w));
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void port_try_start(Wait *w)
+{
+    struct addrinfo *ai = w->addrs;
+    int fd;
+
+    w->tries++;
+    w->try_start_ms = now_ms();
+    g_string_truncate(w->answer, 0);
+    fd = qemu_socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (fd < 0) {
+        port_try_end(w, g_strdup_printf("cannot make a socket: %s",
+                                        strerror(errno)));
+        return;
+    }
+    g_unix_set_fd_nonblocking(fd, true, NULL);
+    w->fd = fd;
+    if (connect(fd, ai->ai_addr, ai->ai_addrlen) < 0 &&
+        errno != EINPROGRESS && errno != EINTR) {
+        port_try_end(w, port_connect_error(w, errno));
+        return;
+    }
+    /* writable once connected, or failed */
+    w->fd_watch = g_unix_fd_add(fd, G_IO_OUT | G_IO_HUP | G_IO_ERR,
+                                port_io, w);
+}
+
+static void wait_timeout(Wait *w)
+{
+    g_autofree char *text = NULL;
+    QDict *json = qdict_new();
+
+    switch (w->until) {
+    case WAIT_UP:
+        if (w->listed) {
+            text = g_strdup_printf("%s is listed but does not answer after"
+                                   " %.1f s", w->label, wait_secs(w));
+        } else if (w->pid >= 0) {
+            text = g_strdup_printf("process %" PRId64 " runs, but no lemu VM"
+                                   " with that PID came up in %.1f s; was it"
+                                   " started with -mcp off?", w->pid,
+                                   wait_secs(w));
+        } else {
+            text = g_strdup_printf("no VM named '%s' came up in %.1f s; look"
+                                   " at the output of the command that"
+                                   " started it", w->name, wait_secs(w));
+        }
+        break;
+    case WAIT_GONE:
+        text = g_strdup_printf("%s still runs after %.1f s", w->label,
+                               wait_secs(w));
+        break;
+    case WAIT_PORT:
+        /* a try still going says more, unless it only just began */
+        if (w->fd >= 0 && (w->answer->len || !w->last)) {
+            port_try_end(w, w->connected ? port_no_answer(w)
+                            : g_strdup_printf("connecting to %s did not"
+                                              " finish", w->target));
+        }
+        text = g_strdup_printf("%s did not answer in %.1f s (%d tr%s); the"
+                               " last try: %s", w->target, wait_secs(w),
+                               w->tries, w->tries == 1 ? "y" : "ies",
+                               w->last);
+        if (w->heard && !w->last_heard) {
+            char *more = g_strdup_printf("%s; an earlier try got \"%s\","
+                                         " which does not match expect",
+                                         text, w->heard);
+
+            g_free(text);
+            text = more;
+        }
+        qdict_put_int(json, "tries", w->tries);
+        qdict_put_str(json, "last", w->last);
+        if (w->heard) {
+            qdict_put_str(json, "heard", w->heard);
+        }
+        break;
+    }
+    wait_done(w, false, text, json);
+}
+
+/* Look once; true when the call is answered (and @w freed) */
+static bool wait_check(Wait *w)
+{
+    int64_t now = now_ms();
+
+    switch (w->until) {
+    case WAIT_UP:
+        if (wait_check_up(w)) {
+            return true;
+        }
+        break;
+    case WAIT_GONE:
+        if (wait_check_gone(w)) {
+            return true;
+        }
+        break;
+    case WAIT_PORT:
+        if (w->fd >= 0 && now - w->try_start_ms >= PORT_SILENT_MS) {
+            port_try_end(w, w->connected ? port_no_answer(w)
+                            : g_strdup_printf("connecting to %s took more"
+                                              " than 5 s", w->target));
+        }
+        if (w->fd < 0 && now >= w->next_try_ms && now < w->deadline_ms) {
+            port_try_start(w);
+        }
+        break;
+    }
+    if (now >= w->deadline_ms) {
+        wait_timeout(w);
+        return true;
+    }
+    return false;
+}
+
+static gboolean wait_tick(gpointer opaque)
+{
+    Wait *w = opaque;
+    int64_t now = now_ms();
+    guint id = w->timer;
+
+    if (w->progress_token && now >= w->next_progress_ms) {
+        wait_progress(w, now);
+        w->next_progress_ms = now + WAIT_PROGRESS_MS;
+    }
+    w->timer = 0;               /* so that wait_free leaves it to us */
+    if (wait_check(w)) {
+        return G_SOURCE_REMOVE;
+    }
+    w->timer = id;
+    return G_SOURCE_CONTINUE;
+}
+
+/* An integer argument, also when it came as a string */
+static bool arg_int(QDict *args, const char *key, int64_t *val)
+{
+    QObject *o = args ? qdict_get(args, key) : NULL;
+    QNum *n = qobject_to(QNum, o);
+    QString *s = qobject_to(QString, o);
+    double d;
+
+    if (!o) {
+        return true;
+    }
+    if (n && qnum_get_try_int(n, val)) {
+        return true;
+    }
+    if (n) {
+        d = qnum_get_double(n);
+        if (d == (int64_t)d) {
+            *val = d;
+            return true;
+        }
+    }
+    return s && !qemu_strtoi64(qstring_get_str(s), NULL, 10, val);
+}
+
+/* false when the call was answered already */
+static bool wait_vm_init(Wait *w, QObject *arg)
+{
+    QString *qs = qobject_to(QString, arg);
+    QNum *qn = qobject_to(QNum, arg);
+    const char *name = qs ? qstring_get_str(qs) : NULL;
+    int64_t pid = -1;
+
+    if (qn && qnum_get_try_int(qn, &pid) && pid > 0) {
+        /* a PID */
+    } else if (name && *name && strspn(name, "0123456789") == strlen(name)) {
+        pid = g_ascii_strtoll(name, NULL, 10);
+    } else if (!name || !*name) {
+        wait_error(w, "vm-wait until %s needs vm: the name from -name, or"
+                   " the PID", w->until == WAIT_UP ? "up" : "gone");
+        return false;
+    }
+    w->pid = pid;
+    if (pid < 0) {
+        w->name = g_strdup(name);
+    }
+
+    if (w->until == WAIT_GONE) {
+        g_autoptr(GPtrArray) list = registry_scan();
+        g_autofree char *path = NULL;
+        Vm *found = NULL;
+        guint i, n = 0;
+
+        for (i = 0; i < list->len; i++) {
+            Vm *vm = g_ptr_array_index(list, i);
+
+            if (pid >= 0 ? vm->pid == pid : !strcmp(vm->name, name)) {
+                found = vm;
+                n++;
+            }
+        }
+        if (n > 1) {
+            wait_error(w, "several VMs are named '%s'; use the PID", name);
+            return false;
+        }
+        if (!found && pid < 0) {
+            g_autofree char *text = g_strdup_printf("no VM named '%s' is"
+                                                    " running", name);
+
+            wait_done(w, true, text, NULL);
+            return false;
+        }
+        if (found) {
+            w->pid = found->pid;
+            w->label = g_strdup_printf("VM %s (pid %d)", found->name,
+                                       found->pid);
+            path = g_strdup_printf("%s/%d.json", registry_dir, found->pid);
+            if (g_file_test(path, G_FILE_TEST_EXISTS)) {
+                w->file = g_steal_pointer(&path);
+            }
+        }
+    }
+    if (!w->label) {
+        w->label = pid >= 0 ? g_strdup_printf("pid %" PRId64, pid)
+                            : g_strdup_printf("VM '%s'", name);
+    }
+    return true;
+}
+
+/* false when the call was answered already */
+static bool wait_port_init(Wait *w, QDict *args, int64_t port)
+{
+    const char *host = args ? qdict_get_try_str(args, "host") : NULL;
+    const char *send = args ? qdict_get_try_str(args, "send") : NULL;
+    const char *expect = args ? qdict_get_try_str(args, "expect") : NULL;
+    struct addrinfo hints = { .ai_socktype = SOCK_STREAM };
+    g_autofree char *service = NULL;
+    g_autoptr(GError) gerr = NULL;
+    int r;
+
+    if (port < 1 || port > 65535) {
+        wait_error(w, "vm-wait until port needs port, from 1 to 65535");
+        return false;
+    }
+    host = host && *host ? host : "127.0.0.1";
+    w->target = g_strdup_printf(strchr(host, ':') ? "[%s]:%" PRId64
+                                                  : "%s:%" PRId64,
+                                host, port);
+    service = g_strdup_printf("%" PRId64, port);
+    r = getaddrinfo(host, service, &hints, &w->addrs);
+    if (r) {
+        wait_error(w, "cannot find host '%s': %s", host, gai_strerror(r));
+        return false;
+    }
+    if (expect) {
+        w->expect = g_regex_new(expect, G_REGEX_RAW | G_REGEX_MULTILINE, 0,
+                                &gerr);
+        if (!w->expect) {
+            wait_error(w, "bad expect: %s", gerr->message);
+            return false;
+        }
+    }
+    if (send) {
+        w->send = mcp_unescape(send);
+    }
+    w->answer = g_string_new(NULL);
+    return true;
+}
+
+static void client_vm_wait(QObject *id, QDict *params)
+{
+    QDict *args = qdict_get_qdict(params, "arguments");
+    QDict *meta = qdict_get_qdict(params, "_meta");
+    QObject *token = meta ? qdict_get(meta, "progressToken") : NULL;
+    const char *until = args ? qdict_get_try_str(args, "until") : NULL;
+    int64_t timeout = WAIT_DEFAULT_MS, port = -1;
+    Wait *w = g_new0(Wait, 1);
+
+    w->client_id = qobject_ref(id);
+    w->progress_token = token ? qobject_ref(token) : NULL;
+    w->pid = -1;
+    w->fd = -1;
+    w->start_ms = now_ms();
+    w->next_progress_ms = w->start_ms + WAIT_PROGRESS_MS;
+    waits = g_list_prepend(waits, w);
+
+    if (!arg_int(args, "timeout-ms", &timeout) ||
+        !arg_int(args, "port", &port)) {
+        wait_error(w, "timeout-ms and port must be integers");
+        return;
+    }
+    w->deadline_ms = w->start_ms + MIN(MAX(timeout, 0), WAIT_MAX_MS);
+    if (!until || !strcmp(until, "up")) {
+        w->until = WAIT_UP;
+    } else if (!strcmp(until, "gone")) {
+        w->until = WAIT_GONE;
+    } else if (!strcmp(until, "port")) {
+        w->until = WAIT_PORT;
+    } else {
+        wait_error(w, "until must be up, gone or port");
+        return;
+    }
+
+    if (w->until == WAIT_PORT ? !wait_port_init(w, args, port)
+                              : !wait_vm_init(w, args ? qdict_get(args, "vm")
+                                                      : NULL)) {
+        return;
+    }
+    if (!wait_check(w)) {
+        w->timer = g_timeout_add(WAIT_TICK_MS, wait_tick, w);
+    }
+}
+
 static void client_tools_call(QObject *id, QDict *msg)
 {
     QDict *params = qdict_get_qdict(msg, "params");
@@ -878,6 +1604,10 @@ static void client_tools_call(QObject *id, QDict *msg)
     }
     if (!strcmp(name, "vm-list")) {
         client_vm_list(id);
+        return;
+    }
+    if (!strcmp(name, "vm-wait")) {
+        client_vm_wait(id, params);
         return;
     }
 
@@ -904,11 +1634,20 @@ static void client_cancelled(QDict *params)
 {
     QObject *id = params ? qdict_get(params, "requestId") : NULL;
     GHashTableIter vi, ci;
+    GList *l;
     Vm *vm;
     Call *call;
 
     if (!id) {
         return;
+    }
+    for (l = waits; l; l = l->next) {
+        Wait *w = l->data;
+
+        if (qobject_is_equal(w->client_id, id)) {
+            wait_free(w);       /* a cancelled call gets no answer */
+            return;
+        }
     }
     g_hash_table_iter_init(&vi, vms);
     while (g_hash_table_iter_next(&vi, NULL, (gpointer *)&vm)) {
