@@ -61,6 +61,14 @@ enum jazz_model_e {
     JAZZ_PICA61,
 };
 
+#define TYPE_MIPS_JAZZ_MACHINE MACHINE_TYPE_NAME("mips-jazz")
+OBJECT_DECLARE_SIMPLE_TYPE(MipsJazzMachineState, MIPS_JAZZ_MACHINE)
+
+struct MipsJazzMachineState {
+    MachineState parent_obj;
+    bool nt_idle;
+};
+
 static void main_cpu_reset(void *opaque)
 {
     MIPSCPU *cpu = opaque;
@@ -213,6 +221,7 @@ static void mips_jazz_init(MachineState *machine,
     cpu = mips_cpu_create_with_clock(machine->cpu_type, cpuclk,
                                      TARGET_BIG_ENDIAN);
     env = &cpu->env;
+    cpu->nt_idle = MIPS_JAZZ_MACHINE(machine)->nt_idle;
     qemu_register_reset(main_cpu_reset, cpu);
 
     /*
@@ -438,6 +447,38 @@ void mips_pica61_init(MachineState *machine)
     mips_jazz_init(machine, JAZZ_PICA61);
 }
 
+static bool mips_jazz_get_nt_idle(Object *obj, Error **errp)
+{
+    return MIPS_JAZZ_MACHINE(obj)->nt_idle;
+}
+
+static void mips_jazz_set_nt_idle(Object *obj, bool value, Error **errp)
+{
+    MIPS_JAZZ_MACHINE(obj)->nt_idle = value;
+}
+
+static void mips_jazz_class_init(ObjectClass *oc, const void *data)
+{
+    object_class_property_add_bool(oc, "nt-idle", mips_jazz_get_nt_idle,
+                                   mips_jazz_set_nt_idle);
+    object_class_property_set_description(oc, "nt-idle",
+        "Halt the CPU in the Windows NT idle loop instead of spinning");
+}
+
+static void mips_jazz_instance_init(Object *obj)
+{
+    MIPS_JAZZ_MACHINE(obj)->nt_idle = true;
+}
+
+static const TypeInfo mips_jazz_type = {
+    .name = TYPE_MIPS_JAZZ_MACHINE,
+    .parent = TYPE_MACHINE,
+    .abstract = true,
+    .instance_size = sizeof(MipsJazzMachineState),
+    .instance_init = mips_jazz_instance_init,
+    .class_init = mips_jazz_class_init,
+};
+
 static void mips_magnum_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -451,7 +492,7 @@ static void mips_magnum_class_init(ObjectClass *oc, const void *data)
 
 static const TypeInfo mips_magnum_type = {
     .name = MACHINE_TYPE_NAME("magnum"),
-    .parent = TYPE_MACHINE,
+    .parent = TYPE_MIPS_JAZZ_MACHINE,
     .class_init = mips_magnum_class_init,
 };
 
@@ -468,12 +509,13 @@ static void mips_pica61_class_init(ObjectClass *oc, const void *data)
 
 static const TypeInfo mips_pica61_type = {
     .name = MACHINE_TYPE_NAME("pica61"),
-    .parent = TYPE_MACHINE,
+    .parent = TYPE_MIPS_JAZZ_MACHINE,
     .class_init = mips_pica61_class_init,
 };
 
 static void mips_jazz_machine_init(void)
 {
+    type_register_static(&mips_jazz_type);
     type_register_static(&mips_magnum_type);
     type_register_static(&mips_pica61_type);
 }
