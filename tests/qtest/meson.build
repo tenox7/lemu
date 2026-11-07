@@ -76,6 +76,8 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_I440FX') ? ['test-x86-cpuid-compat'] : []) +          \
   (config_all_devices.has_key('CONFIG_I440FX') and                                          \
    config_all_accel.has_key('CONFIG_TCG') ? ['apic-reset-test'] : []) +                     \
+  (config_all_devices.has_key('CONFIG_I440FX') and                                          \
+   config_all_devices.has_key('CONFIG_E1000_PCI') ? ['pci-slot-clash-test'] : []) +         \
   (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : []) +           \
   (config_all_devices.has_key('CONFIG_SGA') ? ['boot-serial-test'] : []) +                  \
   (config_all_devices.has_key('CONFIG_ISA_IPMI_KCS') ? ['ipmi-kcs-test'] : []) +            \
