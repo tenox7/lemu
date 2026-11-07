@@ -1,27 +1,31 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 # HP-UX 9.05 on an HP 9000/715 (PA-7100LC): one CPU, 128 MB RAM, Artist graphics,
-# SCSI disk, LASI LAN.
-# There is no kit for this machine, so this script is an example. It runs
-# qemu-system-hppa from PATH, which must be LEMU's. Put hpux905.qcow2 next to it:
-# HP-UX 9.05 on SCSI ID 6 (README.md tells how to install it).
-# The firmware is LEMU's SeaBIOS-hppa 27: the graphics console of HP-UX 9.05 needs
-# its audio module. -boot c makes the firmware boot the disk by itself.
-# HP-UX 9.05 has no SMP: one CPU. 128 MB is what the snapshots of the guest were
-# made with: a snapshot loads only with the same RAM size.
+# SCSI disk, LASI LAN. This starts the kit hpux905-715-qemu (README.txt).
+cd "$(dirname "$0")" || exit 1
+case "$(uname -s)-$(uname -m)" in
+Darwin-arm64) q=bin/macos-arm64/qemu-system-hppa ;;
+Linux-x86_64) q=bin/linux-x86_64/qemu-system-hppa ;;
+Linux-aarch64) q=bin/linux-aarch64/qemu-system-hppa ;;
+*) echo "No QEMU binary for $(uname -sm)" >&2; exit 1 ;;
+esac
+# The firmware is LEMU's SeaBIOS-hppa 27 (bin/share/qemu/hppa-firmware.img): the graphics
+# console of HP-UX 9.05 needs its audio module. -boot c makes the firmware boot the disk.
+# HP-UX 9.05 has no SMP: one CPU. A snapshot (savevm) loads only with the same RAM size.
 # An idle vCPU sleeps (hpux-idle=on is the default). The X server's timer calibration
 # is slowed down (hpux-x11-pace=on is the default); without it the X server dies
-# with SIGFPE at start and the VUE login never appears.
-# User mode network: HP-UX is 10.0.2.15, the host is 10.0.2.2. telnet localhost 2323,
-# ftp localhost 2121 (root has no password).
+# with SIGFPE at start and the VUE login never appears. With -display none the VUE
+# login still runs, out of sight; with -machine 715,graphics=off (no Artist card)
+# the console repeats "X-server can not be started".
+# User mode network: HP-UX is 10.0.2.15, the host is 10.0.2.2. telnet localhost 9023
+# (root has no password); ftp localhost 9021 needs a user with a password.
 # The terminal holds the QEMU monitor: savevm NAME and loadvm NAME take and load a
 # snapshot of the whole VM, or start with -loadvm NAME.
-cd "$(dirname "$0")" || exit 1
-exec qemu-system-hppa \
+exec "$q" \
 	-name "HP-UX 9.05 PA-RISC 715" \
 	-machine 715 -m 128 \
 	-boot c -boot menu=off \
 	-drive if=scsi,bus=0,index=6,file=hpux905.qcow2,format=qcow2 \
-	-nic user,model=lasi_82596,hostfwd=tcp:127.0.0.1:2323-:23,hostfwd=tcp:127.0.0.1:2121-:21 \
+	-nic user,model=lasi_82596,hostfwd=tcp:127.0.0.1:9023-:23,hostfwd=tcp:127.0.0.1:9021-:21 \
 	-monitor stdio \
 	"$@"

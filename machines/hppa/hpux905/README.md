@@ -6,10 +6,13 @@ HP VUE 3.0, a SCSI disk and the LAN, and it installs from the HP CDs. An idle gu
 
 ## Run
 
-[run.sh](run.sh) is an example: there is no kit yet. It needs `hpux905.qcow2` next to it
-(HP-UX 9.05 on SCSI ID 6). The firmware is LEMU's SeaBIOS-hppa 27. Log in as `root` at the
-VUE login (about 100 s after the start); root has no password. `./run.sh -loadvm NAME`
-starts from a snapshot made with `savevm NAME` in the monitor.
+[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux905-715-qemu` (see
+[README.txt](README.txt)); [../release/mkrelease.sh](../release/mkrelease.sh) packs it:
+`mkrelease.sh hpux905 VMDIR STAGE/hppa OUT.tar.lz`, with the disk in `VMDIR/hpux905.qcow2`
+(HP-UX 9.05 on SCSI ID 6). The pack leaves the disk's snapshots out. The kit has LEMU's
+firmware (SeaBIOS-hppa 27) and forwards telnet to localhost 9023 and ftp to 9021. Log in as
+`root` at the VUE login (about 90 s after the start); root has no password.
+`./run.sh -loadvm NAME` starts from a snapshot made with `savevm NAME` in the monitor.
 
 ## Install
 
