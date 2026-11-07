@@ -3,6 +3,7 @@ cd /d "%~dp0"
 qemu\windows-x64\qemu-system-mips64el.exe ^
  -name "Windows NT 4.0 MIPS JAZZ" ^
  -M magnum -m 128 ^
+ -icount shift=3,align=on ^
  -bios NTPROM.RAW ^
  -global ds1225y.filename=nvram.bin ^
  -rtc base=1995-07-08T11:12:13,clock=vm ^

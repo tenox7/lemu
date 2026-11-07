@@ -5,6 +5,7 @@ qemu\windows-x64\qemu-system-mips64el.exe ^
  -M sni-rm200,nvram=nvram-nt.bin ^
  -m 64 ^
  -icount shift=3,align=on ^
+ -rtc base=localtime ^
  -bios "RM200C-NT-AM29F040@PLCC32.BIN" ^
  -monitor stdio ^
  -nic user,model=pcnet ^
