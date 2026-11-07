@@ -15200,26 +15200,68 @@ static const uint32_t nt_idle_loop[][2] = {
     { 0x8e120000, 0xffff0000 },     /* lw    s2,n(s0)    next thread */
 };
 
-/* After the mtc0 that enables interrupts, let helper_nt_idle halt */
-static void gen_nt_idle(DisasContext *ctx, CPUMIPSState *env)
+/*
+ * The NT 3.51 idle loop has no enable. Its HalProcessorIdle enables
+ * interrupts and returns to the top of the loop, which disables them and
+ * checks the DPC list and the next thread as NT 4.0 does, with a0 in the
+ * delay slot. The vCPU halts before that disable, while interrupts are on.
+ */
+static const uint32_t nt351_idle_loop[][2] = {
+    { 0x40966000, 0xffffffff },     /* mtc0  s6,psr      disable */
+    { 0, 0xffffffff }, { 0, 0xffffffff }, { 0, 0xffffffff },
+    { 0x8e640000, 0xffffffff },     /* lw    a0,0(s3)    DPC list */
+    { 0x50930000, 0xffff0000 },     /* beql  a0,s3,...   empty */
+    { 0x8e040000, 0xffff0000 },     /* lw    a0,n(s0)    next thread */
+};
+
+/*
+ * Do the words after the one at pc match the loop? Then return the last
+ * one, the load of the next thread, whose offset helper_nt_idle needs.
+ */
+static bool nt_idle_match(DisasContext *ctx, CPUMIPSState *env,
+                          const uint32_t (*loop)[2], int len, uint32_t *last)
 {
     vaddr pc = ctx->base.pc_next;
     uint32_t insn = 0;
     int i;
 
-    if (!translator_is_same_page(&ctx->base,
-                                 pc + 4 * (ARRAY_SIZE(nt_idle_loop) - 1))) {
-        return;
+    if (!translator_is_same_page(&ctx->base, pc + 4 * (len - 1))) {
+        return false;
     }
-    for (i = 1; i < ARRAY_SIZE(nt_idle_loop); i++) {
+    for (i = 1; i < len; i++) {
         insn = translator_ldl_end(env, &ctx->base, pc + 4 * i,
                                   mo_endian(ctx));
-        if ((insn & nt_idle_loop[i][1]) != nt_idle_loop[i][0]) {
-            return;
+        if ((insn & loop[i][1]) != loop[i][0]) {
+            return false;
         }
     }
-    gen_helper_nt_idle(tcg_env, tcg_constant_tl(pc + 4),
-                       tcg_constant_i32((int16_t)insn));
+    *last = insn;
+    return true;
+}
+
+/* After the mtc0 that enables interrupts, let helper_nt_idle halt */
+static void gen_nt_idle(DisasContext *ctx, CPUMIPSState *env)
+{
+    uint32_t insn;
+
+    if (nt_idle_match(ctx, env, nt_idle_loop, ARRAY_SIZE(nt_idle_loop),
+                      &insn)) {
+        gen_helper_nt_idle(tcg_env, tcg_constant_tl(ctx->base.pc_next + 4),
+                           tcg_constant_i32((int16_t)insn));
+    }
+}
+
+/* Before the mtc0 that disables interrupts, let helper_nt_idle halt */
+static void gen_nt351_idle(DisasContext *ctx, CPUMIPSState *env)
+{
+    uint32_t insn;
+
+    if (nt_idle_match(ctx, env, nt351_idle_loop, ARRAY_SIZE(nt351_idle_loop),
+                      &insn)) {
+        save_cpu_state(ctx, 1);
+        gen_helper_nt_idle(tcg_env, tcg_constant_tl(ctx->base.pc_next),
+                           tcg_constant_i32((int16_t)insn));
+    }
 }
 #endif
 
@@ -15239,6 +15281,11 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         ctx->opcode = translator_ldl_end(env, &ctx->base, ctx->base.pc_next,
                                          mo_endian(ctx));
         insn_bytes = 4;
+#if !defined(CONFIG_USER_ONLY)
+        if (ctx->nt_idle && ctx->opcode == nt351_idle_loop[0][0] && !is_slot) {
+            gen_nt351_idle(ctx, env);
+        }
+#endif
         decode_opc(env, ctx);
 #if !defined(CONFIG_USER_ONLY)
         if (ctx->nt_idle && ctx->opcode == nt_idle_loop[0][0] && !is_slot &&

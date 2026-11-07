@@ -10,7 +10,9 @@
  * HalProcessorIdle, which returns without waiting. The translator finds
  * the loop (gen_nt_idle()) and calls helper_nt_idle() after the mtc0 that
  * enables interrupts, which halts the vCPU as WAIT would when there is no
- * work.
+ * work. In NT 3.51 HalProcessorIdle enables interrupts, so the translator
+ * (gen_nt351_idle()) calls it at the top of the loop, before the mtc0 that
+ * disables them again.
  *
  * With more CPUs, NT gives an idle CPU a thread by writing its next thread,
  * and may queue a DPC for it, without an interrupt. So the other vCPUs
@@ -148,7 +150,7 @@ static bool nt_idle_watched(CPUState *cs, vaddr next, vaddr dpc)
 }
 
 /*
- * The idle loop has just enabled interrupts. If there is no work, halt
+ * Interrupts are on in the idle loop. If there is no work, halt
  * until the next interrupt or watched write: no interrupt pending, the DPC
  * list head at s3 points to itself and the processor block at s0 has no
  * next thread at offset next. The vCPU resumes at resume and the loop
