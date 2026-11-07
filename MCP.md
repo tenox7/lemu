@@ -51,6 +51,7 @@ only when exactly one VM is running and you started it.
 | `vm-stats` | Measure how much host CPU a VM uses and how often its CPUs are halted |
 | `screenshot` | Take a picture of a screen (PNG) |
 | `frames` | List recent screens, to find one that went by too fast |
+| `sound` | Hear the guest's sound: whether it plays one, how long and how loud; wait for a sound and the quiet after it |
 | `wait-screen` | Wait until the screen changes, settles, shows a colour or shows some text. Use it instead of sleeping |
 | `screen-text` | Read a text-mode screen (BIOS, DOS, NT setup) as text |
 | `key` | Press keys and key combinations |
@@ -168,6 +169,7 @@ Use these:
 | See how much host CPU a VM uses, and whether the guest idles | `vm-stats` |
 | Crop or zoom a screenshot | `screenshot` with `region` and `scale` |
 | Find a screen that went by | `frames` |
+| Check that the guest plays sound (a startup sound, a beep), how long and how loud | `sound` `start` (before the guest boots, for a startup sound), then `sound` `wait`; `stop` lists all it heard |
 | Change a CD or floppy | `media` |
 | Put host files into a guest | `media` `insert` with `files` |
 | Get files out of a guest | `media` `insert` with `files: []`, the guest writes to the floppy, then `media` `copy-out` |

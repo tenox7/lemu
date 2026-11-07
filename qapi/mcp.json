@@ -1467,6 +1467,110 @@
   'if': 'CONFIG_PIXMAN' }
 
 ##
+# @McpSoundAction:
+#     What @sound does.
+#
+# @start: begin listening, and forget what it heard before
+#
+# @wait: wait for a sound, and for its end (see @quiet-ms)
+#
+# @stop: say what it heard, and stop listening
+#
+# Since: 11.2
+##
+{ 'enum': 'McpSoundAction',
+  'data': [ 'start', 'wait', 'stop' ] }
+
+##
+# @McpSoundHeard:
+#     One sound: audio louder than @threshold-db, with no pause
+#     longer than 150 ms.
+#
+# @at-ms: when it began, in milliseconds after listening began
+#
+# @length-ms: how long it was, in milliseconds
+#
+# @peak-db: its loudest moment, in dB of full scale (0 is the
+#     loudest there is)
+#
+# @average-db: its average level (RMS), in dB of full scale
+#
+# @channel: "left" or "right" when it played on that channel only
+#
+# @audiodev: the audiodev it came from, when the VM has several
+#
+# Since: 11.2
+##
+{ 'struct': 'McpSoundHeard',
+  'data': { 'at-ms': 'int', 'length-ms': 'int', 'peak-db': 'number',
+            'average-db': 'number', '*channel': 'str',
+            '*audiodev': 'str' } }
+
+##
+# @McpSound:
+#     What @sound returns.
+#
+# @listening: whether it listens now
+#
+# @matched: with wait: whether it heard a sound and, with
+#     @quiet-ms, the quiet after it
+#
+# @listened-ms: how long it has listened, in guest time
+#
+# @played-ms: how much audio the sound devices played in that time,
+#     sound or silence
+#
+# @sounds: the sounds it heard, up to 20: with wait, the ones that
+#     played after the wait before; with stop, all
+#
+# Since: 11.2
+##
+{ 'struct': 'McpSound',
+  'base': 'McpResult',
+  'data': { 'listening': 'bool', '*matched': 'bool',
+            '*listened-ms': 'int', '*played-ms': 'int',
+            '*sounds': [ 'McpSoundHeard' ] } }
+
+##
+# @sound:
+#     Hear the guest's sound: whether it plays one, how long and how
+#     loud.  It listens to the audio that the sound devices play into
+#     the VM's audiodevs, so it works for every guest and sound
+#     device.  Call it with start, do the thing that should make a
+#     sound (with the other tools), then call it with wait, which
+#     waits for a sound and for the quiet after it, or with stop.  To
+#     hear a startup sound, start before the guest boots.  Levels are
+#     in dB of full scale: 0 is the loudest there is, and audio
+#     quieter than @threshold-db counts as silence.
+#
+# @action: start, wait or stop
+#
+# @timeout-ms: with wait: give up after this long, at most 1500000,
+#     25 minutes (default: 30000)
+#
+# @quiet-ms: with wait: how long it must be quiet after a sound for
+#     the sound to have ended; 0 returns as soon as a sound plays
+#     (default: 1000, at most 60000)
+#
+# @threshold-db: with start: audio quieter than this counts as
+#     silence, from -90 to -10 (default: -50)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# @mcp-read-only: does not change the VM
+#
+# Since: 11.2
+##
+{ 'command': 'sound',
+  'data': { 'action': 'McpSoundAction', '*timeout-ms': 'int',
+            '*quiet-ms': 'int', '*threshold-db': 'int' },
+  'returns': 'McpSound',
+  'features': [ 'mcp', 'mcp-read-only' ],
+  'coroutine': true }
+
+##
 # @McpDebugMemory:
 #     Guest memory that a debug tool shows when the CPU stops.
 #

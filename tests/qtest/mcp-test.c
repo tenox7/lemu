@@ -4447,6 +4447,116 @@ static void test_debug_coverage(void)
     unlink(bios);
 }
 
+/* The PC speaker plays 1 kHz while @on */
+static void sound_beep(QTestState *qts, bool on)
+{
+    uint8_t ctl = qtest_inb(qts, 0x61);
+
+    if (on) {
+        qtest_outb(qts, 0x43, 0xb6);            /* PIT channel 2, mode 3 */
+        qtest_outb(qts, 0x42, 1193 & 0xff);     /* 1193182 Hz / 1193 */
+        qtest_outb(qts, 0x42, 1193 >> 8);
+        qtest_outb(qts, 0x61, ctl | 3);         /* gate and speaker on */
+    } else {
+        qtest_outb(qts, 0x61, ctl & ~3);
+    }
+}
+
+/* sound hears a beep of the PC speaker, and how long it was */
+static void test_sound(void)
+{
+    g_autofree char *bios = debug_bios_cover();
+    QTestState *qts;
+    QDict *ret, *h;
+    QList *l;
+
+    qts = qtest_init("-machine pc -nodefaults -vga none");
+    debug_check_error(qts, "sound", "{'action': 'start'}",
+                      "this VM has no sound to hear: it has no audiodev");
+    qtest_quit(qts);
+
+    qts = qtest_initf("-accel tcg -machine pc,pcspk-audiodev=snd"
+                      " -nodefaults -vga none -audiodev none,id=snd"
+                      " -bios %s", bios);
+    debug_check_error(qts, "sound", "{'action': 'stop'}",
+                      "it is not listening");
+    debug_check_error(qts, "sound", "{'action': 'start', 'quiet-ms': 0}",
+                      "timeout-ms and quiet-ms go with wait");
+    debug_check_error(qts, "sound", "{'action': 'wait',"
+                      " 'threshold-db': -40}", "threshold-db goes with start");
+    debug_check_error(qts, "sound", "{'action': 'start',"
+                      " 'threshold-db': 0}", "threshold-db must be -90");
+    debug_check_error(qts, "sound", "{'action': 'wait', 'quiet-ms': -1}",
+                      "quiet-ms must be 0 to 60000");
+
+    ret = debug_ok(qts, "sound", "{'action': 'start'}");
+    g_assert(qdict_get_bool(ret, "listening"));
+    debug_summary_has(ret, "Listening to audiodev 'snd' (none); audio"
+                      " quieter than -50 dBFS counts as silence. Now do");
+    qobject_unref(ret);
+
+    /* the speaker is off */
+    ret = debug_ok(qts, "sound", "{'action': 'wait', 'timeout-ms': 300}");
+    g_assert(!qdict_get_bool(ret, "matched"));
+    g_assert(!qdict_haskey(ret, "sounds"));
+    debug_summary_has(ret, "No sound in ");
+    debug_summary_has(ret, "the sound devices played nothing");
+    qobject_unref(ret);
+
+    /* a beep: wait for it, then for the quiet after it */
+    sound_beep(qts, true);
+    ret = debug_ok(qts, "sound", "{'action': 'wait', 'quiet-ms': 0,"
+                   " 'timeout-ms': 10000}");
+    g_assert(qdict_get_bool(ret, "matched"));
+    debug_summary_has(ret, "Heard 1 sound; the last one plays now");
+    qobject_unref(ret);
+    g_usleep(400 * 1000);
+    sound_beep(qts, false);
+    ret = debug_ok(qts, "sound", "{'action': 'wait', 'quiet-ms': 300,"
+                   " 'timeout-ms': 10000}");
+    g_assert(qdict_get_bool(ret, "matched"));
+    l = qdict_get_qlist(ret, "sounds");
+    g_assert_cmpint(qlist_size(l), ==, 1);
+    h = qobject_to(QDict, qlist_peek(l));
+    g_test_message("beep: %s", qdict_get_str(ret, "summary"));
+    g_assert_cmpint(qdict_get_int(h, "length-ms"), >=, 350);
+    g_assert_cmpint(qdict_get_int(h, "length-ms"), <, 3000);
+    g_assert_cmpfloat(qdict_get_double(h, "peak-db"), >, -10);
+    g_assert_cmpfloat(qdict_get_double(h, "average-db"), <=,
+                      qdict_get_double(h, "peak-db"));
+    g_assert(!qdict_haskey(h, "channel"));
+    g_assert(!qdict_haskey(h, "audiodev"));
+    debug_summary_has(ret, "Heard 1 sound, then quiet for ");
+    qobject_unref(ret);
+
+    /* nothing new since */
+    ret = debug_ok(qts, "sound", "{'action': 'wait', 'timeout-ms': 200}");
+    g_assert(!qdict_get_bool(ret, "matched"));
+    debug_summary_has(ret, "(It heard 1 sound before: stop lists them.)");
+    qobject_unref(ret);
+
+    ret = debug_ok(qts, "sound", "{'action': 'stop'}");
+    g_assert(!qdict_get_bool(ret, "listening"));
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "sounds")), ==, 1);
+    g_assert_cmpint(qdict_get_int(ret, "played-ms"), >=, 350);
+    debug_summary_has(ret, ": heard 1 sound:\nat ");
+    debug_summary_has(ret, "\nStopped listening.");
+    qobject_unref(ret);
+    debug_check_error(qts, "sound", "{'action': 'stop'}",
+                      "it is not listening");
+
+    /* wait listens by itself; a paused VM plays nothing */
+    qtest_qmp_assert_success(qts, "{'execute': 'stop'}");
+    ret = debug_ok(qts, "sound", "{'action': 'wait'}");
+    g_assert(qdict_get_bool(ret, "listening"));
+    g_assert(!qdict_get_bool(ret, "matched"));
+    debug_summary_has(ret, "The VM is paused, so it plays no sound");
+    debug_summary_has(ret, "(It was not listening before this call");
+    qobject_unref(ret);
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 /*
  * memory-write changes RAM and ROM but no device, and code made from
  * the old bytes goes away; debug-profile finds the loop
@@ -5103,6 +5213,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/search-refine",
                        test_memory_search_refine);
         qtest_add_func("/mcp/debug/coverage", test_debug_coverage);
+        qtest_add_func("/mcp/sound", test_sound);
         qtest_add_func("/mcp/debug/symbols", test_debug_symbols);
         qtest_add_func("/mcp/debug/condition", test_debug_condition);
         qtest_add_func("/mcp/debug/condition-hits",

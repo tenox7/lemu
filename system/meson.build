@@ -17,6 +17,7 @@ system_ss.add(files(
   'mcp-debug.c',
   'mcp-image.c',
   'mcp-serial.c',
+  'mcp-sound.c',
   'mcp-telnet.c',
   'ram-block-attributes.c',
   'ram-discard-manager.c',
