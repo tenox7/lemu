@@ -1,5 +1,5 @@
 /*
- * HP-UX 10.20 and 9.05 on PA-RISC 1.1: halt the vCPU in the idle loop
+ * HP-UX 9.05, 10.20 and 11.11 on PA-RISC 1.1: halt the vCPU in the idle loop
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -9,8 +9,9 @@
  * so every idle vCPU keeps a host core busy. This halts the vCPU instead,
  * until an interrupt comes or, with 10.20 on several CPUs, another vCPU
  * gives it work, which HP-UX does without an interrupt. The kernel of 9.05
- * has one CPU and its idle loop is simple, see helper_hpux9_idle() at the
- * end; the rest of this comment is about 10.20.
+ * has one CPU and its idle loop is simple, see helper_hpux9_idle(); 11.11
+ * works like 10.20, see helper_hpux11_idle(). The rest of this comment is
+ * about 10.20.
  *
  * The translator finds the loop by its instructions (gen_hpux_idle() in
  * translate.c; the B2352B kernel of 9 June 1996 is the only one known) and
@@ -190,10 +191,14 @@ static bool hpux_idle_nothing_to_do(CPUHPPAState *env)
 }
 
 /*
- * The idle loop has come to the check of its run queue. Halt the vCPU until
- * the next interrupt or bell, if there is nothing to do.
+ * Halt the vCPU of an idle loop that @nothing_to_do has found idle in more
+ * than HPUX_IDLE_SPIN_ROUNDS rounds in a row, until the next interrupt or
+ * bell. A bell names the processor structure @pcpu, and @id is the number
+ * that the owner of the scan of the others' queues has.
  */
-void HELPER(hpux_idle)(CPUHPPAState *env)
+static void hpux_idle_halt(CPUHPPAState *env,
+                           bool (*nothing_to_do)(CPUHPPAState *),
+                           uint32_t pcpu, uint32_t id)
 {
     HPPACPU *cpu = env_archcpu(env);
     CPUState *cs = env_cpu(env);
@@ -212,7 +217,7 @@ void HELPER(hpux_idle)(CPUHPPAState *env)
         cpu->hpux_idle_seen = cpu->hpux_idle_ints;
         cpu->hpux_idle_rounds = 0;
     }
-    if (!hpux_idle_nothing_to_do(env)) {
+    if (!nothing_to_do(env)) {
         cpu->hpux_idle_rounds = 0;
         return;
     }
@@ -227,10 +232,9 @@ void HELPER(hpux_idle)(CPUHPPAState *env)
      * and looks here second, this side the other way round, with a barrier
      * in between (qatomic_xchg() is one).
      */
-    qatomic_set(&cpu->hpux_idle_id, (uint32_t)env->gr[4]);
-    qatomic_set(&cpu->hpux_idle_pcpu, (uint32_t)env->gr[3]);
-    if (qatomic_xchg(&cpu->hpux_idle_wake, false) ||
-        !hpux_idle_nothing_to_do(env)) {
+    qatomic_set(&cpu->hpux_idle_id, id);
+    qatomic_set(&cpu->hpux_idle_pcpu, pcpu);
+    if (qatomic_xchg(&cpu->hpux_idle_wake, false) || !nothing_to_do(env)) {
         qatomic_set(&cpu->hpux_idle_pcpu, 0);
         return;
     }
@@ -238,6 +242,15 @@ void HELPER(hpux_idle)(CPUHPPAState *env)
     trace_hppa_hpux_idle(cs->cpu_index, env->iaoq_f);
     cs->halted = 1;
     HELPER(excp)(env, EXCP_HALTED);
+}
+
+/*
+ * The idle loop of 10.20 has come to the check of its run queue. Halt the
+ * vCPU until the next interrupt or bell, if there is nothing to do.
+ */
+void HELPER(hpux_idle)(CPUHPPAState *env)
+{
+    hpux_idle_halt(env, hpux_idle_nothing_to_do, env->gr[3], env->gr[4]);
 }
 
 /*
@@ -322,6 +335,147 @@ void HELPER(hpux9_idle)(CPUHPPAState *env, uint32_t runq)
     HELPER(excp)(env, EXCP_HALTED);
 }
 
+/*
+ * The idle loop of the HP-UX 11.11 kernel (pset_idle_loop(); the kernel of
+ * LEMU's 11i v1 kit, whose scheduler files come from the patches PHKL_30033
+ * and PHKL_30037 of December 2003; see hpux11_idle_loop[] in translate.c).
+ * With interrupts on, a round looks at the real-time queues of the processor
+ * set and of the kernel daemons, at two requests and at the run queue of this
+ * processor, and the owner of the scan at the run queues of the others. With
+ * r3 the number of the processor, r5 its run queue (%tr0 + 0x674), r7 the
+ * second half of its per-processor structure (%tr0 + 0x2000) and dp the
+ * kernel's data pointer:
+ *
+ *   r5[0x8] to r5[0x14]   threads on the run queue of this processor
+ *   r7[0xa6c]             the processor set; set[0x24] is its real-time queue
+ *   dp[0x34b6c]           the real-time queue of the kernel daemons
+ *   q[0x20]               threads on the real-time queue q
+ *   r7[0xa70]             not 0 while the processor is in the set
+ *   r7[0xaa4]             1 while the loop goes on
+ *   r7[0xaa8], r7[0xaac]  requests
+ *   set[0xa0]             the owner of the scan: the number of the one idle
+ *                         processor of the set that looks at the others (-1:
+ *                         nobody; the first one to get there takes it). It
+ *                         takes a thread from the queue of one that runs
+ *                         another: [%tr0 + 0x67c] > 0, [%tr0 + 0x10c] != -1.
+ *
+ * As on 10.20, a processor gets work from another without an interrupt
+ * (send_interrupt() only stops and syncs them): _setrq() adds one to a count
+ * of the processor's run queue, or to the count of a real-time queue. The
+ * translator finds these three stores and calls helper_hpux11_bell() after
+ * each. The words below must have the values they have in the idle loop, or
+ * the vCPU spins on.
+ */
+#define HPUX11_RUNQ         0x674   /* in the per-processor structure */
+#define HPUX11_RUNQ_COUNTS  0x008   /* in the run queue: four counts */
+#define HPUX11_THREAD       0x10c   /* -1 when the processor runs no thread */
+#define HPUX11_HI           0x2000  /* the second half (r7) */
+#define HPUX11_ACTIVE       0xa10   /* in it: 1 when the owner may look */
+#define HPUX11_PSET         0xa6c   /* the processor set */
+#define HPUX11_IN_PSET      0xa70
+#define HPUX11_LOOP_ON      0xaa4
+#define HPUX11_REQUEST_1    0xaa8
+#define HPUX11_REQUEST_2    0xaac
+#define HPUX11_STRIDE       0x2ad0  /* from one processor to the next */
+#define HPUX11_PSET_OWNER   0x0a0   /* in a processor set */
+#define HPUX11_PSET_RTQ     0x024
+#define HPUX11_RTQ_COUNT    0x020   /* in a real-time queue */
+#define HPUX11_DP_KD_RTQ    0x34b6c             /* kerndaemon_rtsched_infop */
+#define HPUX11_DP_PCPU      (-0x3800 + 0x128)   /* mpproc_info */
+#define HPUX11_DP_NCPU      (-0x3800 + 0x12c)   /* nmpinfo */
+#define HPUX11_DP_NO_SCAN   (-0x2000 + 0x180)   /* no_other_runqs */
+#define HPUX11_DP_RUN_AS_UP (-0x2000 + 0x18c)   /* run_as_up */
+
+static bool hpux11_idle_nothing_to_do(CPUHPPAState *env)
+{
+    CPUState *cs = env_cpu(env);
+    uint32_t id = env->gr[3];
+    uint32_t runq = env->gr[5];
+    uint32_t hi = env->gr[7];
+    uint32_t dp = env->gr[27];
+    uint32_t pset, q, val, owner, n, base, up;
+
+    if (icount_enabled() || !(env->psw & PSW_I) ||
+        (qatomic_read(&env->cr[CR_EIRR]) & env->cr[CR_EIEM]) ||
+        cpu_test_interrupt(cs, CPU_INTERRUPT_NMI)) {
+        return false;
+    }
+
+    /* Threads on the run queue of this processor */
+    for (int i = 0; i < 4; i++) {
+        if (!hpux_idle_ld(env, runq + HPUX11_RUNQ_COUNTS + 4 * i, &val) ||
+            val) {
+            return false;
+        }
+    }
+
+    /* The loop goes on, no request, nothing on the real-time queues */
+    if (!hpux_idle_ld(env, hi + HPUX11_IN_PSET, &val) || !val ||
+        !hpux_idle_ld(env, hi + HPUX11_LOOP_ON, &val) || val != 1 ||
+        !hpux_idle_ld(env, hi + HPUX11_REQUEST_1, &val) || val ||
+        !hpux_idle_ld(env, hi + HPUX11_REQUEST_2, &val) || val ||
+        !hpux_idle_ld(env, hi + HPUX11_PSET, &pset) ||
+        !hpux_idle_ld(env, pset + HPUX11_PSET_RTQ, &q) ||
+        !hpux_idle_ld(env, q + HPUX11_RTQ_COUNT, &val) || val ||
+        !hpux_idle_ld(env, dp + HPUX11_DP_KD_RTQ, &q) ||
+        !hpux_idle_ld(env, q + HPUX11_RTQ_COUNT, &val) || val) {
+        return false;
+    }
+
+    /*
+     * The owner of the scan (or the one that is about to be) takes a thread
+     * from the queue of a processor of the set that runs another one.
+     */
+    if (!hpux_idle_ld(env, pset + HPUX11_PSET_OWNER, &owner) ||
+        !hpux_idle_ld(env, dp + HPUX11_DP_NO_SCAN, &val)) {
+        return false;
+    }
+    if ((owner != id && owner != -1) || val) {
+        return true;
+    }
+    if (!hpux_idle_ld(env, dp + HPUX11_DP_NCPU, &n) ||
+        !hpux_idle_ld(env, dp + HPUX11_DP_PCPU, &base) ||
+        !hpux_idle_ld(env, dp + HPUX11_DP_RUN_AS_UP, &up) || n > 64) {
+        return false;
+    }
+    for (uint32_t j = 0; j < n; j++) {
+        uint32_t other = base + j * HPUX11_STRIDE;
+        uint32_t len, thread;
+
+        if (j == id) {
+            continue;
+        }
+        if (!hpux_idle_ld(env, other, &val)) {
+            return false;
+        }
+        if (!val) {
+            continue;
+        }
+        if (!hpux_idle_ld(env, other + HPUX11_HI + HPUX11_PSET, &val) ||
+            val != pset ||
+            !hpux_idle_ld(env, other + HPUX11_HI + HPUX11_LOOP_ON, &val) ||
+            val != 1 ||
+            !hpux_idle_ld(env, other + HPUX11_HI + HPUX11_ACTIVE, &val) ||
+            val != 1) {
+            continue;
+        }
+        if (!hpux_idle_ld(env, other + HPUX11_RUNQ + HPUX11_RUNQ_COUNTS,
+                          &len) ||
+            !hpux_idle_ld(env, other + HPUX11_THREAD, &thread) ||
+            ((int32_t)len > 0 && (thread != -1 || up))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The idle loop of 11.11 is at the top of a round: halt the vCPU there */
+void HELPER(hpux11_idle)(CPUHPPAState *env)
+{
+    hpux_idle_halt(env, hpux11_idle_nothing_to_do,
+                   env->gr[7] - HPUX11_HI, env->gr[3]);
+}
+
 /* Wake the vCPU @cs, if it waits for work and nobody has woken it yet */
 static bool hpux_idle_kick(CPUState *me, CPUState *cs)
 {
@@ -371,6 +525,46 @@ void HELPER(hpux_bell)(CPUHPPAState *env, target_ulong r24)
         }
     }
     if (woke || !hpux_idle_ld(env, (uint32_t)env->gr[27] + DP_OWNER, &owner)) {
+        return;
+    }
+    CPU_FOREACH(cs) {
+        if (cs != me &&
+            (owner == -1 ||
+             qatomic_read(&HPPA_CPU(cs)->hpux_idle_id) == owner) &&
+            hpux_idle_kick(me, cs)) {
+            return;
+        }
+    }
+}
+
+/*
+ * _setrq() of HP-UX 11.11 has just queued a thread: on the run queue @q of a
+ * processor (its structure + 0x674) or, with @rt, on the real-time queue @q
+ * of a processor set. Wake the vCPU that waits for that processor. If there
+ * is none, the processor runs another thread, and the owner of the scan of
+ * its set has to take the new one: wake that one. Any processor of the set
+ * takes a thread from its real-time queue: wake them all.
+ */
+void HELPER(hpux11_bell)(CPUHPPAState *env, target_ulong q, uint32_t rt)
+{
+    uint32_t pcpu = (uint32_t)q - HPUX11_RUNQ;
+    CPUState *me = env_cpu(env);
+    CPUState *cs;
+    uint32_t pset, owner;
+    bool woke = false;
+
+    /* The order of the stores and loads: see helper_hpux_bell() */
+    smp_mb();
+
+    CPU_FOREACH(cs) {
+        if (cs != me &&
+            (rt || qatomic_read(&HPPA_CPU(cs)->hpux_idle_pcpu) == pcpu)) {
+            woke |= hpux_idle_kick(me, cs);
+        }
+    }
+    if (woke || rt ||
+        !hpux_idle_ld(env, pcpu + HPUX11_HI + HPUX11_PSET, &pset) ||
+        !hpux_idle_ld(env, pset + HPUX11_PSET_OWNER, &owner)) {
         return;
     }
     CPU_FOREACH(cs) {

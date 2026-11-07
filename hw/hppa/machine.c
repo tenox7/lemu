@@ -1037,7 +1037,8 @@ static void hppa_machine_common_class_init(ObjectClass *oc, const void *data)
     object_class_property_add_bool(oc, "hpux-idle", hppa_get_hpux_idle,
                                    hppa_set_hpux_idle);
     object_class_property_set_description(oc, "hpux-idle",
-        "Halt the CPU in the HP-UX 9.05 and 10.20 idle loops instead of spinning");
+        "Halt the CPU in the HP-UX 9.05, 10.20 and 11.11 idle loops instead of "
+        "spinning");
     object_class_property_add_bool(oc, "hpux-x11-pace", hppa_get_hpux_x11_pace,
                                    hppa_set_hpux_x11_pace);
     object_class_property_set_description(oc, "hpux-x11-pace",

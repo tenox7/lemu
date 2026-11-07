@@ -299,7 +299,7 @@ struct ArchCPU {
     CPUHPPAState env;
     QEMUTimer *alarm_timer;
 
-    /* Halt in the HP-UX 10.20 idle loop, set by the board (hpux_idle.c) */
+    /* Halt in the HP-UX idle loop, set by the board (hpux_idle.c) */
     bool hpux_idle;
     /* Pace the timer calibration of the HP-UX X server (hpux_idle.c) */
     bool hpux_x11_pace;
