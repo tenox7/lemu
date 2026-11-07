@@ -5274,6 +5274,38 @@ static const uint32_t nt_idle_loop[][2] = {
 #define NT_IDLE_NEXT    10
 
 /*
+ * NT 3.51's KiIdleLoop has interrupts disabled while it checks its DPC
+ * list and its next thread. Interrupts are enabled only by
+ * HalProcessorIdle, after which the loop branches back to its top. This
+ * loop runs from the top to that back branch, where the helper goes.
+ */
+static const uint32_t nt351_idle_loop[][2] = {
+    { 0x7e200124, 0xffffffff },     /* mtmsr r17           disable */
+    { 0x80790000, 0xffffffff },     /* lwz   r3,0(r25)     DPC list */
+    { 0x7c03c800, 0xffffffff },     /* cmpw  r3,r25        empty */
+    { 0x41820000, 0xffff0003 },     /* beq   1f */
+    { 0x7f3fcb78, 0xffffffff },     /* mr    r31,r25 */
+    { 0x48000001, 0xfc000003 },     /* bl    KiProcessDpcList */
+    { 0x9ae00000, 0xffff0000 },     /* stb   r23,DispatchInterrupt */
+    { 0x83fd0000, 0xffff0000 },     /* 1: lwz r31,n(r29)   next thread */
+    { 0x2c1f0000, 0xffffffff },     /* cmpwi r31,0 */
+    { 0x41820000, 0xffff0003 },     /* beq   idle */
+    { 0x7e400124, 0xffffffff },     /* mtmsr r18           enable */
+    { 0x83dd0000, 0xffff0000 },     /* lwz   r30,n(r29)    this thread */
+    { 0x92fd0000, 0xffff0000 },     /* stw   r23,n(r29)    next thread */
+    { 0x93fd0000, 0xffff0000 },     /* stw   r31,n(r29)    this thread */
+    { 0x48000001, 0xfc000003 },     /* bl    SwapContext */
+    { 0x4bffffc4, 0xffffffff },     /* b     loop */
+    { 0x7e6903a6, 0xffffffff },     /* idle: mtctr r19     HalProcessorIdle */
+    { 0x7e82a378, 0xffffffff },     /* mr    r2,r20        its TOC */
+    { 0x4e800421, 0xffffffff },     /* bctrl */
+    { 0x4c00012c, 0xffffffff },     /* isync */
+    { 0x7e028378, 0xffffffff },     /* mr    r2,r16 */
+    { 0x4bffffac, 0xffffffff },     /* b     loop */
+};
+#define NT351_IDLE_NEXT 7
+
+/*
  * Solaris 2.5.1 checks disp_nrunnable and calls idle_cpu, a blr. This
  * loop and the next run from the branch target to the back branch, where
  * the helper goes.
@@ -5361,13 +5393,18 @@ static void gen_nt_idle(DisasContext *ctx, CPUPPCState *env, MemOp mo_endian)
     }
 }
 
-/* At the back branch of the Solaris or OS/2 idle loop, let a helper halt */
+/*
+ * At the back branch of the Solaris, OS/2 or NT 3.51 idle loop, let a
+ * helper halt
+ */
 static void gen_le_idle(DisasContext *ctx, CPUPPCState *env, uint32_t insn,
                         MemOp mo_endian)
 {
     const int sol_len = ARRAY_SIZE(sol_idle_loop);
     const int os2_len = ARRAY_SIZE(os2_idle_loop);
-    uint32_t w[ARRAY_SIZE(os2_idle_loop)];
+    const int nt351_len = ARRAY_SIZE(nt351_idle_loop);
+    uint32_t w[MAX_CONST(ARRAY_SIZE(os2_idle_loop),
+                         ARRAY_SIZE(nt351_idle_loop))];
     target_ulong start;
 
     if (insn == sol_idle_loop[sol_len - 1][0]) {
@@ -5393,6 +5430,14 @@ static void gen_le_idle(DisasContext *ctx, CPUPPCState *env, uint32_t insn,
                                  IDLE_RA(w[OS2_IDLE_PROC]) << 20),
                 tcg_constant_i32(extract32(w[0], 0, 16) |
                                  extract32(w[OS2_IDLE_GOT], 0, 16) << 16));
+        }
+    } else if (insn == nt351_idle_loop[nt351_len - 1][0]) {
+        start = ctx->cia - 4 * (nt351_len - 1);
+        if (idle_loop_match(ctx, env, mo_endian, start, nt351_idle_loop,
+                            nt351_len, w)) {
+            translator_io_start(&ctx->base);
+            gen_helper_nt_idle(tcg_env, tcg_constant_tl(start),
+                               tcg_constant_i32(IDLE_D(w[NT351_IDLE_NEXT])));
         }
     }
 }

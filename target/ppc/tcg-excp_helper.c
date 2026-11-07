@@ -572,7 +572,8 @@ void HELPER(aix_idle)(CPUPPCState *env, int32_t crbit, target_ulong start)
 }
 
 /*
- * Windows NT 4.0 has just enabled interrupts at the top of KiIdleLoop.
+ * Windows NT 4.0 has just enabled interrupts at the top of KiIdleLoop,
+ * or NT 3.51 is at its back branch after HalProcessorIdle enabled them.
  * Halt when the DPC list head at r25 points to itself and the processor
  * block at r29 has no next thread at offset next.
  */
