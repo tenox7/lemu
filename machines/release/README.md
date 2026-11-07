@@ -14,7 +14,7 @@ compiles the same code 15 times, with slightly different features.
 | qemu-system-alpha | nt31axp, nt40axp | `../jensen/release/pack.sh` |
 | qemu-system-mips64el | nt31mips, nt4-jazz, nt4-rm200, nt4-rm200-smp, nt4srv-rm300-smp4 | `../rm200/release/pack.sh` |
 | qemu-system-mips64 | sinixn545 | `../rm200/release/pack.sh` |
-| qemu-system-hppa | hpux1020b160l, hpux905-715, hpux907-715 | `../hppa/release/mkrelease.sh` |
+| qemu-system-hppa | hpux1020b160l, hpux905-715, hpux907-715, hpux11v1b160l | `../hppa/release/mkrelease.sh` |
 
 Run them on an Apple Silicon Mac with Homebrew and Docker. The Linux and
 Windows builds run in Docker.
@@ -68,6 +68,7 @@ these folders in place of their own build, for example:
     sh ../hppa/release/mkrelease.sh hpux1020 VMDIR STAGE/hppa hpux1020b160l-qemu.tar.lz
     sh ../hppa/release/mkrelease.sh hpux905 VMDIR STAGE/hppa hpux905-715-qemu.tar.lz
     sh ../hppa/release/mkrelease.sh hpux907 VMDIR STAGE/hppa hpux907-715-qemu.tar.lz
+    sh ../hppa/release/mkrelease.sh hpux11v1 VMDIR STAGE/hppa hpux11v1b160l-qemu.tar.lz
 
 - `VMDIR`, `SRCDIR` and `KITDIR` hold the guest files: disk, NVRAM and
   firmware. See each machine's notes.
