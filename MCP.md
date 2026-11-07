@@ -68,7 +68,7 @@ only when exactly one VM is running and you started it.
 | `debug-step` | Run one CPU an instruction at a time, and show each one |
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
-| `memory-search` | Find text or bytes in guest RAM and ROM |
+| `memory-search` | Find text, bytes or a number in guest RAM and ROM; search again among the places it found, to narrow down a value that changes |
 | `debug-symbols` | Load the names of the guest's functions and variables (from nm or a link map), to use in place of addresses |
 | `register-write` | Set a register of a stopped CPU, or move it to another instruction (`pc`) |
 | `hmp`, `qmp` | Run any QEMU monitor command: registers, memory, disassembly, pause and go on |
@@ -144,6 +144,8 @@ Use these:
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
 | Find a message, a value or a signature in memory | `memory-search` (`wide` for Windows NT's UTF-16 strings) |
+| Find the variable behind a number the guest shows (a counter, a score, a flag) | `memory-search` with `value`; let the number change, then `memory-search` with `refine` and the new `value`, until one place is left |
+| Find memory that changed, or did not, since the last search | `memory-search` with `refine` and nothing to find (`changed: false` for the ones that did not) |
 | Use function and variable names in place of addresses | `debug-symbols` with nm's output or a link map |
 | Change a register, or where the CPU goes on (the pc) | `register-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |

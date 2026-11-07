@@ -2221,11 +2221,15 @@
 # @symbol: a virtual @address as a symbol and an offset (jiffies),
 #     when @debug-symbols loaded one there
 #
+# @before: with @refine, what the place held at the last search, in
+#     hex
+#
 # Since: 11.2
 ##
 { 'struct': 'McpMemoryMatch',
   'data': { 'address': 'str', '*physical': 'str', 'region': 'str',
-            'bytes': 'str', 'text': 'str', '*symbol': 'str' } }
+            'bytes': 'str', 'text': 'str', '*symbol': 'str',
+            '*before': 'str' } }
 
 ##
 # @McpMemorySearchResult:
@@ -2234,16 +2238,20 @@
 # @matches: where it found them, in address order
 #
 # @count: how many it found, counting up to 100000; more than listed
-#     when there were more than @max
+#     when there were more than @max.  With @refine, how many places
+#     it kept.
 #
 # @searched: how many bytes it looked at
+#
+# @places: with @refine, how many places it looked at: the ones the
+#     last search found or kept
 #
 # Since: 11.2
 ##
 { 'struct': 'McpMemorySearchResult',
   'base': 'McpResult',
   'data': { 'matches': [ 'McpMemoryMatch' ], 'count': 'int',
-            'searched': 'int' } }
+            'searched': 'int', '*places': 'int' } }
 
 ##
 # @memory-search:
@@ -2252,14 +2260,33 @@
 #     reads RAM and ROM, never devices.  The guest may run while it
 #     searches, and change the memory under it: pause it first
 #     (vm-power) to see one moment.  To read what is around a match,
-#     use hmp ('xp', or 'x' for a virtual address).
+#     use hmp ('xp', or 'x' for a virtual address).  To find a
+#     variable, such as a counter or a flag: search for its value, let
+#     it change in the guest, then search for the new value with
+#     @refine.
 #
 # @bytes: the bytes in memory order, in hex, like "de ad be ef", up to
 #     256.  A big-endian guest (HP-UX, SunOS, AIX) stores the word
 #     0x12345678 as "12345678", a little-endian one (x86, Windows NT)
-#     as "78563412".  Give it or @text.
+#     as "78563412".  Give it, @text or @value.
 #
 # @text: text to find, up to 256 bytes (128 characters with @wide)
+#
+# @value: a number to find as the guest keeps it: @size bytes, in the
+#     byte order the CPU runs in.  Decimal, hex with 0x, or negative.
+#
+# @size: how many bytes @value takes: 1, 2, 4 or 8 (default: 4)
+#
+# @refine: look only at the places the last search found (or kept),
+#     and keep those that hold @bytes, @text or @value now.  With none
+#     of them, keep the places whose bytes changed since (see
+#     @changed).  The next @refine looks at the places this one kept.
+#     It takes no @address, @length, @physical or @cpu: each place is
+#     as the last search found it.  (default: false)
+#
+# @changed: with @refine and nothing to find: true keeps the places
+#     whose bytes changed, false the ones whose bytes did not
+#     (default: true)
 #
 # @wide: find @text as 16-bit characters (UTF-16) in the byte order
 #     the CPU runs in, as Windows NT keeps most of its strings
@@ -2293,9 +2320,11 @@
 # Since: 11.2
 ##
 { 'command': 'memory-search',
-  'data': { '*bytes': 'str', '*text': 'str', '*wide': 'bool',
-            '*ignore-case': 'bool', '*address': 'str', '*length': 'size',
-            '*physical': 'bool', '*cpu': 'int', '*max': 'int' },
+  'data': { '*bytes': 'str', '*text': 'str', '*value': 'str',
+            '*size': 'int', '*wide': 'bool', '*ignore-case': 'bool',
+            '*refine': 'bool', '*changed': 'bool', '*address': 'str',
+            '*length': 'size', '*physical': 'bool', '*cpu': 'int',
+            '*max': 'int' },
   'returns': 'McpMemorySearchResult',
   'features': [ 'mcp', 'mcp-read-only' ],
   'coroutine': true }

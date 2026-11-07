@@ -1316,9 +1316,327 @@ static char *mcp_search_bytes(const uint8_t *buf, size_t len)
     return g_string_free(s, false);
 }
 
+/*
+ * @value as @size bytes in the byte order the CPU runs in: decimal, hex
+ * with 0x, or negative
+ */
+static bool mcp_parse_value(const char *value, int64_t size, bool big_endian,
+                            McpPattern *p, Error **errp)
+{
+    const char *digits = value + (value[0] == '-');
+    int base = digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X') ?
+               16 : 10;
+    int bits = size * 8;
+    uint64_t v;
+    int i;
+
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        error_setg(errp, "size must be 1, 2, 4 or 8");
+        return false;
+    }
+    if (value[0] == '-') {
+        int64_t sv;
+
+        if (qemu_strtoi64(value, NULL, base, &sv) < 0) {
+            error_setg(errp, "value '%s' is not a number", value);
+            return false;
+        }
+        if (bits < 64 && sv < -(INT64_C(1) << (bits - 1))) {
+            error_setg(errp, "value %s does not fit in %" PRId64 " byte%s",
+                       value, size, size == 1 ? "" : "s");
+            return false;
+        }
+        v = sv;
+    } else {
+        if (qemu_strtou64(value, NULL, base, &v) < 0) {
+            error_setg(errp, "value '%s' is not a number", value);
+            return false;
+        }
+        if (bits < 64 && v >> bits) {
+            error_setg(errp, "value %s does not fit in %" PRId64 " byte%s",
+                       value, size, size == 1 ? "" : "s");
+            return false;
+        }
+    }
+    memset(p, 0, sizeof(*p));
+    for (i = 0; i < size; i++) {
+        int shift = big_endian ? (size - 1 - i) * 8 : i * 8;
+
+        mcp_pattern_add(p, v >> shift, false);
+    }
+    return true;
+}
+
+/*
+ * The places the last memory-search found, or the last refine kept, for
+ * the next refine
+ */
+static struct {
+    bool valid;
+    int cpu;                    /* whose MMU maps them, or -1: physical */
+    bool wide;                  /* text is shown as 16-bit characters */
+    bool capped;                /* the first search stopped counting */
+    size_t len;                 /* bytes at each place */
+    GArray *places;             /* uint64_t addresses */
+    GByteArray *held;           /* @len bytes for each: what it held */
+} mcp_search_last;
+
+static void mcp_search_forget(void)
+{
+    g_clear_pointer(&mcp_search_last.places, g_array_unref);
+    g_clear_pointer(&mcp_search_last.held, g_byte_array_unref);
+    mcp_search_last.valid = false;
+}
+
+static void mcp_search_remember(int cpu, bool wide, bool capped, size_t len,
+                                GArray *places, GByteArray *held)
+{
+    mcp_search_forget();
+    mcp_search_last.valid = true;
+    mcp_search_last.cpu = cpu;
+    mcp_search_last.wide = wide;
+    mcp_search_last.capped = capped;
+    mcp_search_last.len = len;
+    mcp_search_last.places = places;
+    mcp_search_last.held = held;
+}
+
+/* A match at @at, physical @pa in @region, with the bytes from there */
+static McpMemoryMatch *mcp_search_match(CPUState *virt, uint64_t at,
+                                        hwaddr pa, const char *region,
+                                        bool wide, bool big_endian)
+{
+    uint8_t shown[SEARCH_SHOWN * 2];
+    size_t got = mcp_scan_copy(virt, at, shown, SEARCH_SHOWN << wide, NULL);
+    McpMemoryMatch *m = g_new0(McpMemoryMatch, 1);
+
+    m->address = g_strdup_printf("0x%" PRIx64, at);
+    if (virt) {
+        m->physical = g_strdup_printf("0x%" HWADDR_PRIx, pa);
+        m->symbol = mcp_sym_name(at);
+    }
+    m->region = g_strdup(region);
+    m->bytes = mcp_search_bytes(shown, got);
+    m->text = mcp_search_text(shown, got, wide, big_endian);
+    return m;
+}
+
+/* A line for each match: "0x2000 (pc.ram): 48 65 ...  |He...|" */
+static void mcp_search_append_matches(GString *s, McpMemoryMatchList *list)
+{
+    for (; list; list = list->next) {
+        McpMemoryMatch *m = list->value;
+
+        g_string_append_printf(s, "%s%s%s%s (%s%s%s%s): %s  |%s|",
+                               m->address, m->symbol ? " <" : "",
+                               m->symbol ? m->symbol : "",
+                               m->symbol ? ">" : "",
+                               m->physical ? "physical " : "",
+                               m->physical ? m->physical : "",
+                               m->physical ? ", " : "", m->region, m->bytes,
+                               m->text);
+        if (m->before) {
+            g_string_append_printf(s, "  was %s", m->before);
+        }
+        g_string_append_c(s, '\n');
+    }
+}
+
+/*
+ * memory-search with refine: look again at the places the last search
+ * found or kept.  With a pattern, keep those that hold it now; else
+ * those whose bytes changed (@changed) or did not.
+ */
+static McpMemorySearchResult *coroutine_fn
+mcp_search_refine(const char *bytes, const char *text, const char *value,
+                  int64_t size, bool wide, bool ignore_case, bool changed,
+                  bool has_place, int64_t max, Error **errp)
+{
+    g_auto(QemuInputCtx) local = { 0 };
+    QemuInputCtx *ctx = mcp_current_input_ctx();
+    g_autoptr(GArray) spans = g_array_new(false, false, sizeof(McpSpan));
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GArray) places = g_array_new(false, false, sizeof(uint64_t));
+    g_autoptr(GByteArray) held = g_byte_array_new();
+    g_autoptr(GArray) old = NULL;
+    g_autoptr(GByteArray) was = NULL;
+    g_autofree char *what = NULL;
+    McpMemorySearchResult *res;
+    McpMemoryMatchList **tail;
+    McpPattern pat;
+    CPUState *virt = NULL, *cpu;
+    bool find = bytes || text || value;
+    bool capped = mcp_search_last.capped;
+    bool shown_wide, owide;
+    size_t olen = mcp_search_last.len, nlen;
+    int ocpu;
+    int64_t count = 0, listed = 0, slice;
+    uint64_t searched = 0;
+    guint i;
+
+    if (has_place) {
+        error_setg(errp, "refine looks where the last search found its"
+                   " bytes: give no address, length, physical or cpu");
+        return NULL;
+    }
+    if (!mcp_search_last.valid) {
+        error_setg(errp, "refine needs a memory-search before it: it looks"
+                   " again where that one found its bytes");
+        return NULL;
+    }
+    if (!mcp_search_last.places->len) {
+        error_setg(errp, "the last search found nothing to refine: search"
+                   " again without refine");
+        return NULL;
+    }
+    if (mcp_search_last.cpu >= 0) {
+        virt = qemu_get_cpu(mcp_search_last.cpu);
+        if (!virt) {
+            error_setg(errp, "CPU %d, whose memory the last search looked"
+                       " at, is gone", mcp_search_last.cpu);
+            return NULL;
+        }
+    }
+    /* the byte order the CPU runs in, for a value and for wide text */
+    cpu = virt ? virt : mcp_debug_cpu(false, 0, errp);
+    if (!cpu) {
+        return NULL;
+    }
+    cpu_synchronize_state(cpu);
+    if (value ? !mcp_parse_value(value, size, cpu_internal_is_big_endian(cpu),
+                                 &pat, errp)
+              : find && !mcp_parse_pattern(bytes, text, wide, ignore_case,
+                                           cpu_internal_is_big_endian(cpu),
+                                           &pat, errp)) {
+        return NULL;
+    }
+    if (!ctx) {
+        qemu_input_ctx_init(&local, NULL);
+        ctx = &local;
+    }
+    nlen = find ? pat.len : olen;
+    shown_wide = find ? wide : mcp_search_last.wide;
+    if (find) {
+        g_autofree char *hex = mcp_search_bytes(pat.bytes, pat.len);
+
+        what = value ? g_strdup_printf("%s (%s)", value, hex)
+             : text ? g_strdup_printf("\"%s\"", text)
+             : g_steal_pointer(&hex);
+    }
+
+    /* the places are this call's now; another search may come meanwhile */
+    ocpu = mcp_search_last.cpu;
+    owide = mcp_search_last.wide;
+    old = g_steal_pointer(&mcp_search_last.places);
+    was = g_steal_pointer(&mcp_search_last.held);
+    mcp_search_forget();
+
+    res = g_new0(McpMemorySearchResult, 1);
+    tail = &res->matches;
+    slice = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    for (i = 0; i < old->len; i++) {
+        uint64_t at = g_array_index(old, uint64_t, i);
+        const uint8_t *before = was->data + i * olen;
+        uint8_t now[SEARCH_MAX_BYTES];
+        const McpSpan *sp;
+        McpMemoryMatch *m;
+        size_t got;
+
+        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - slice >=
+            SEARCH_SLICE_MS) {
+            qemu_co_sleep_ns_wakeable(&ctx->sleep, QEMU_CLOCK_REALTIME,
+                                      SCALE_MS);
+            slice = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        }
+        if (ctx->cancelled) {
+            /* the places stay for the next refine, unless replaced */
+            if (!mcp_search_last.valid) {
+                mcp_search_remember(ocpu, owide, capped, olen,
+                                    g_steal_pointer(&old),
+                                    g_steal_pointer(&was));
+            }
+            qapi_free_McpMemorySearchResult(res);
+            error_setg(errp, "cancelled");
+            return NULL;
+        }
+        /* a place that is no longer RAM or ROM, or not mapped, goes */
+        got = mcp_scan_copy(virt, at, now, nlen, spans);
+        searched += got;
+        if (got < nlen ||
+            (find ? !mcp_pattern_at(&pat, now)
+                  : (memcmp(now, before, olen) == 0) == changed)) {
+            continue;
+        }
+        g_array_append_val(places, at);
+        g_byte_array_append(held, now, nlen);
+        if (++count > max) {
+            continue;
+        }
+        sp = &g_array_index(spans, McpSpan, 0);
+        m = mcp_search_match(virt, at, sp->pa, sp->region, shown_wide,
+                             cpu_internal_is_big_endian(cpu));
+        m->before = mcp_search_bytes(before, olen);
+        QAPI_LIST_APPEND(tail, m);
+        listed++;
+    }
+    res->count = count;
+    res->searched = searched;
+    res->has_places = true;
+    res->places = old->len;
+    mcp_search_remember(virt ? virt->cpu_index : -1, shown_wide, capped, nlen,
+                        g_steal_pointer(&places), g_steal_pointer(&held));
+
+    if (count) {
+        g_string_printf(s, "Kept %" PRId64 " of the %u place%s the last"
+                        " search found; %s ", count, old->len,
+                        old->len == 1 ? "" : "s", count == 1 ? "it" : "they");
+        if (what) {
+            g_string_append_printf(s, "hold%s %s now", count == 1 ? "s" : "",
+                                   what);
+        } else {
+            g_string_append(s, changed ? "changed" : "stayed the same");
+        }
+        if (listed < count) {
+            g_string_append_printf(s, ". The first %" PRId64, listed);
+        }
+        g_string_append(s, listed ? ":\n" : ".");
+    } else {
+        if (old->len == 1) {
+            g_string_assign(s, "The place the last search found ");
+        } else {
+            g_string_printf(s, "None of the %u places the last search found ",
+                            old->len);
+        }
+        if (what) {
+            g_string_append_printf(s, "%s %s now", old->len == 1 ?
+                                   "does not hold" : "holds", what);
+        } else if (old->len == 1) {
+            g_string_append(s, changed ? "did not change" : "changed");
+        } else {
+            g_string_append(s, changed ? "changed" : "stayed the same");
+        }
+        g_string_append(s, ". To start again, search without refine.");
+    }
+    mcp_search_append_matches(s, res->matches);
+    if (capped) {
+        g_string_append(s, s->str[s->len - 1] == '\n' ? "\n" : "\n\n");
+        g_string_append_printf(s, "The first search stopped counting at %d"
+                               " places, so the ones past those were not"
+                               " looked at.", SEARCH_COUNT_MAX);
+    }
+    if (count > 1) {
+        g_string_append(s, s->str[s->len - 1] == '\n' ? "\n" : "\n\n");
+        g_string_append(s, "Refine again when the value changes again.");
+    }
+    res->summary = g_strdup(g_strchomp(s->str));
+    return res;
+}
+
 McpMemorySearchResult *coroutine_fn
-qmp_memory_search(const char *bytes, const char *text, bool has_wide,
-                  bool wide, bool has_ignore_case, bool ignore_case,
+qmp_memory_search(const char *bytes, const char *text, const char *value,
+                  bool has_size, int64_t size, bool has_wide, bool wide,
+                  bool has_ignore_case, bool ignore_case, bool has_refine,
+                  bool refine, bool has_changed, bool changed,
                   const char *address, bool has_length, uint64_t length,
                   bool has_physical, bool physical, bool has_cpu,
                   int64_t cpu_index, bool has_max, int64_t max, Error **errp)
@@ -1327,34 +1645,57 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
     QemuInputCtx *ctx = mcp_current_input_ctx();
     g_autoptr(GArray) spans = g_array_new(false, false, sizeof(McpSpan));
     g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GArray) places = g_array_new(false, false, sizeof(uint64_t));
+    g_autoptr(GByteArray) held = g_byte_array_new();
     g_autofree uint8_t *buf = NULL;
     g_autofree char *where = NULL;
-    g_autofree char *size = NULL;
+    g_autofree char *amount = NULL;
     McpMemorySearchResult *res;
-    McpMemoryMatchList **tail, *ml;
+    McpMemoryMatchList **tail;
     McpPattern pat;
     CPUState *cpu = NULL, *virt = NULL;
     uint64_t start = 0, end = UINT64_MAX, pos, searched = 0;
     int64_t count = 0, listed = 0, slice;
     bool big_endian = target_big_endian();
+    int finds = !!bytes + !!text + !!value;
     size_t want;
 
     wide = has_wide && wide;
     ignore_case = has_ignore_case && ignore_case;
+    refine = has_refine && refine;
     physical = has_physical && physical;
     max = has_max ? max : SEARCH_LIST;
-    if (!bytes == !text) {
-        error_setg(errp, bytes ? "give bytes or text, not both" :
-                   "give bytes or text to find");
+    if (finds > 1) {
+        error_setg(errp, "give one of bytes, text and value, not more");
         return NULL;
     }
-    if (bytes && (wide || ignore_case)) {
-        error_setg(errp, "wide and ignore-case go with text, not bytes");
+    if (!finds && !refine) {
+        error_setg(errp, "give bytes, text or value to find");
+        return NULL;
+    }
+    if (!text && (wide || ignore_case)) {
+        error_setg(errp, "wide and ignore-case go with text");
+        return NULL;
+    }
+    if (has_size && !value) {
+        error_setg(errp, "size goes with value");
+        return NULL;
+    }
+    if (has_changed && (!refine || finds)) {
+        error_setg(errp, "changed goes with refine, when there is nothing"
+                   " to find");
         return NULL;
     }
     if (max < 0 || max > SEARCH_LIST_MAX) {
         error_setg(errp, "max must be 0 to %d", SEARCH_LIST_MAX);
         return NULL;
+    }
+    if (refine) {
+        return mcp_search_refine(bytes, text, value, has_size ? size : 4,
+                                 wide, ignore_case,
+                                 !has_changed || changed,
+                                 address || has_length || has_physical ||
+                                 has_cpu, max, errp);
     }
     if (address) {
         if (!mcp_parse_place(address, "address", false, &start, errp)) {
@@ -1377,7 +1718,8 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
         error_setg(errp, "length goes with address");
         return NULL;
     }
-    if ((address && !physical) || wide) {
+    /* the byte order the CPU runs in, for a value and for wide text */
+    if ((address && !physical) || wide || value) {
         cpu = mcp_debug_cpu(has_cpu, cpu_index, errp);
         if (!cpu) {
             return NULL;
@@ -1388,8 +1730,10 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
     if (address && !physical) {
         virt = cpu;
     }
-    if (!mcp_parse_pattern(bytes, text, wide, ignore_case, big_endian, &pat,
-                           errp)) {
+    if (value ? !mcp_parse_value(value, has_size ? size : 4, big_endian,
+                                 &pat, errp)
+              : !mcp_parse_pattern(bytes, text, wide, ignore_case,
+                                   big_endian, &pat, errp)) {
         return NULL;
     }
     if (!ctx) {
@@ -1434,11 +1778,13 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
         adv = full ? SEARCH_CHUNK : n;
         for (o = mcp_pattern_find(&pat, buf, 0, starts); o < starts;
              o = mcp_pattern_find(&pat, buf, o + 1, starts)) {
-            uint8_t shown[SEARCH_SHOWN * 2];
             const McpSpan *sp = NULL;
-            McpMemoryMatch *m;
-            size_t k, got;
+            uint64_t at = pos + o;
+            size_t k;
 
+            /* for a refine: where, and what it holds */
+            g_array_append_val(places, at);
+            g_byte_array_append(held, buf + o, pat.len);
             if (++count > max) {
                 if (count >= SEARCH_COUNT_MAX) {
                     break;
@@ -1450,19 +1796,10 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
                     sp = &g_array_index(spans, McpSpan, k);
                 }
             }
-            got = mcp_scan_copy(virt, pos + o, shown,
-                                SEARCH_SHOWN << wide, NULL);
-            m = g_new0(McpMemoryMatch, 1);
-            m->address = g_strdup_printf("0x%" PRIx64, pos + o);
-            if (virt) {
-                m->physical = g_strdup_printf("0x%" HWADDR_PRIx,
-                                              sp->pa + (o - sp->off));
-                m->symbol = mcp_sym_name(pos + o);
-            }
-            m->region = g_strdup(sp->region);
-            m->bytes = mcp_search_bytes(shown, got);
-            m->text = mcp_search_text(shown, got, wide, big_endian);
-            QAPI_LIST_APPEND(tail, m);
+            QAPI_LIST_APPEND(tail, mcp_search_match(virt, at,
+                                                    sp->pa + (o - sp->off),
+                                                    sp->region, wide,
+                                                    big_endian));
             listed++;
         }
         searched += adv;
@@ -1470,37 +1807,41 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
     }
     res->count = count;
     res->searched = searched;
+    mcp_search_remember(virt ? virt->cpu_index : -1, wide,
+                        count >= SEARCH_COUNT_MAX, pat.len,
+                        g_steal_pointer(&places), g_steal_pointer(&held));
 
-    size = size_to_str(searched);
+    amount = size_to_str(searched);
     if (!address) {
-        where = g_strdup_printf("all RAM and ROM (%s)", size);
+        where = g_strdup_printf("all RAM and ROM (%s)", amount);
     } else {
         where = g_strdup_printf("%s0x%" PRIx64 "..0x%" PRIx64 " (%s of it %s"
                                 "RAM or ROM)", virt ? "" : "physical ",
-                                start, end - 1, size, virt ? "mapped " : "");
+                                start, end - 1, amount, virt ? "mapped " : "");
+    }
+    if (value) {
+        g_autofree char *hex = mcp_search_bytes(pat.bytes, pat.len);
+
+        /* the byte order the CPU runs in */
+        g_string_printf(s, "%s is %s in memory. ", value, hex);
     }
     if (!count) {
-        g_string_printf(s, "Not found in %s", where);
+        g_string_append_printf(s, "Not found in %s", where);
     } else {
-        g_string_printf(s, "Found %" PRId64 "%s in %s", count,
-                        count >= SEARCH_COUNT_MAX ? " or more (counting stops"
-                        " there)" : "", where);
+        g_string_append_printf(s, "Found %" PRId64 "%s in %s", count,
+                               count >= SEARCH_COUNT_MAX ? " or more"
+                               " (counting stops there)" : "", where);
         if (listed < count) {
             g_string_append_printf(s, "; the first %" PRId64, listed);
         }
     }
     g_string_append(s, listed ? ":\n" : ".");
-    for (ml = res->matches; ml; ml = ml->next) {
-        McpMemoryMatch *m = ml->value;
-
-        g_string_append_printf(s, "%s%s%s%s (%s%s%s%s): %s  |%s|\n",
-                               m->address, m->symbol ? " <" : "",
-                               m->symbol ? m->symbol : "",
-                               m->symbol ? ">" : "",
-                               m->physical ? "physical " : "",
-                               m->physical ? m->physical : "",
-                               m->physical ? ", " : "", m->region, m->bytes,
-                               m->text);
+    mcp_search_append_matches(s, res->matches);
+    if (count > 1 && !text) {
+        g_string_append(s, listed ? "\n" : "\n\n");
+        g_string_append(s, "To narrow them down, let the guest change the"
+                        " value, then search for the new one with refine:"
+                        " true.");
     }
     res->summary = g_strdup(g_strchomp(s->str));
     return res;

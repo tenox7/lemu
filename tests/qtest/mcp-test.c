@@ -4109,9 +4109,9 @@ static void test_memory_search(void)
     g_assert_cmpint(qdict_get_int(ret, "searched"), ==, 0);
     qobject_unref(ret);
 
-    debug_check_error(qts, "memory-search", "{}", "give bytes or text");
+    debug_check_error(qts, "memory-search", "{}", "give bytes, text or value");
     debug_check_error(qts, "memory-search", "{'bytes': '00', 'text': 'a'}",
-                      "not both");
+                      "not more");
     debug_check_error(qts, "memory-search", "{'bytes': '00', 'wide': true}",
                       "go with text");
     debug_check_error(qts, "memory-search", "{'text': ''}", "empty");
@@ -4128,6 +4128,164 @@ static void test_memory_search(void)
                       "at most 4 GiB");
     big = g_strdup_printf("{'bytes': '%0514d'}", 0);
     debug_check_error(qts, "memory-search", big, "at most 256 bytes");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
+ * memory-search finds a number as the CPU keeps it, and refine narrows
+ * the places down to the ones whose value changed, or that hold a new one
+ */
+static void test_memory_search_refine(void)
+{
+    g_autofree char *bios = debug_bios();
+    QTestState *qts;
+    QDict *ret, *m;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+    debug_check_error(qts, "memory-search", "{'refine': true}",
+                      "needs a memory-search before it");
+    qtest_writel(qts, 0x4000, 0x12345678);
+    qtest_writel(qts, 0x5000, 0x12345678);
+    qtest_writel(qts, 0x6000, 0x12345678);
+
+    /* little-endian, as this CPU keeps it */
+    ret = debug_ok(qts, "memory-search", "{'value': '305419896'}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 3);
+    g_assert(!qdict_haskey(ret, "places"));
+    m = search_match(ret, 1);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x5000");
+    g_assert(g_str_has_prefix(qdict_get_str(m, "bytes"), "78 56 34 12 00"));
+    g_assert(!qdict_haskey(m, "before"));
+    debug_summary_has(ret, "305419896 is 78 56 34 12 in memory. Found 3 in"
+                      " all RAM and ROM");
+    debug_summary_has(ret, "search for the new one with refine: true.");
+    qobject_unref(ret);
+
+    /* nothing changed yet */
+    ret = debug_ok(qts, "memory-search", "{'refine': true, 'changed': false}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 3);
+    g_assert_cmpint(qdict_get_int(ret, "places"), ==, 3);
+    g_assert_cmpint(qdict_get_int(ret, "searched"), ==, 12);
+    debug_summary_has(ret, "Kept 3 of the 3 places the last search found;"
+                      " they stayed the same:\n0x4000 (pc.ram): 78 56 34 12");
+    debug_summary_has(ret, "|xV4.............|  was 78 56 34 12\n");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "memory-search", "{'refine': true}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 0);
+    debug_summary_has(ret, "None of the 3 places the last search found"
+                      " changed. To start again, search without refine.");
+    qobject_unref(ret);
+    debug_check_error(qts, "memory-search", "{'refine': true}",
+                      "found nothing to refine");
+
+    /* two of them change */
+    g_assert_cmpint(search_count(qts, "{'value': '0x12345678'}"), ==, 3);
+    qtest_writel(qts, 0x5000, 0x12345679);
+    qtest_writel(qts, 0x6000, 0x12345679);
+    ret = debug_ok(qts, "memory-search", "{'refine': true}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 2);
+    m = search_match(ret, 0);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x5000");
+    g_assert_cmpstr(qdict_get_str(m, "before"), ==, "78 56 34 12");
+    g_assert(g_str_has_prefix(qdict_get_str(m, "bytes"), "79 56 34 12 00"));
+    debug_summary_has(ret, "Kept 2 of the 3 places the last search found;"
+                      " they changed:\n");
+    debug_summary_has(ret, "Refine again when the value changes again.");
+    qobject_unref(ret);
+
+    /* one of those changes again: the new value finds the other */
+    qtest_writel(qts, 0x6000, 0x1234567a);
+    ret = debug_ok(qts, "memory-search", "{'refine': true,"
+                   " 'value': '0x12345679'}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    g_assert_cmpint(qdict_get_int(ret, "places"), ==, 2);
+    m = search_match(ret, 0);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x5000");
+    g_assert_cmpstr(qdict_get_str(m, "before"), ==, "79 56 34 12");
+    debug_summary_has(ret, "Kept 1 of the 2 places the last search found;"
+                      " it holds 0x12345679 (79 56 34 12) now:\n0x5000");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "memory-search", "{'refine': true, 'value': '7'}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 0);
+    g_assert_cmpint(qdict_get_int(ret, "places"), ==, 1);
+    debug_summary_has(ret, "The place the last search found does not hold 7"
+                      " (07 00 00 00) now.");
+    qobject_unref(ret);
+
+    /* a virtual search: refine looks through the same CPU's MMU */
+    ret = debug_ok(qts, "memory-search", "{'value': '0x12345679',"
+                   " 'address': '0x4000', 'length': 12288}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    qobject_unref(ret);
+    qtest_writel(qts, 0x5000, 0x1234567b);
+    ret = debug_ok(qts, "memory-search", "{'refine': true}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    m = search_match(ret, 0);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x5000");
+    g_assert_cmpstr(qdict_get_str(m, "physical"), ==, "0x5000");
+    g_assert(g_str_has_prefix(qdict_get_str(m, "bytes"), "7b 56 34 12"));
+    qobject_unref(ret);
+
+    /* text: a refine finds as many bytes as it is given */
+    qtest_memwrite(qts, 0x7000, "count 1", 7);
+    qtest_memwrite(qts, 0x7100, "count 1", 7);
+    g_assert_cmpint(search_count(qts, "{'text': 'count 1'}"), ==, 2);
+    qtest_memwrite(qts, 0x7106, "2", 1);
+    ret = debug_ok(qts, "memory-search", "{'refine': true,"
+                   " 'text': 'COUNT 2', 'ignore-case': true}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    m = search_match(ret, 0);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x7100");
+    g_assert_cmpstr(qdict_get_str(m, "before"), ==, "63 6f 75 6e 74 20 31");
+    debug_summary_has(ret, "it holds \"COUNT 2\" now");
+    qobject_unref(ret);
+
+    /* other sizes, and negative numbers */
+    qtest_writew(qts, 0x8000, 0xfffe);
+    ret = debug_ok(qts, "memory-search", "{'value': '-2', 'size': 2}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    g_assert_cmpstr(qdict_get_str(search_match(ret, 0), "address"), ==,
+                    "0x8000");
+    qobject_unref(ret);
+    qtest_writeq(qts, 0x9000, 0x1122334455667788ULL);
+    g_assert_cmpint(search_count(qts, "{'value': '0x1122334455667788',"
+                                 " 'size': 8}"), ==, 1);
+    g_assert_cmpint(search_count(qts, "{'value': '-128', 'size': 1,"
+                                 " 'address': '0x9000', 'length': 8}"), ==, 0);
+
+    /* the places a search stopped counting at */
+    g_assert_cmpint(search_count(qts, "{'bytes': 'f4f4', 'max': 0}"), ==,
+                    100000);
+    ret = debug_ok(qts, "memory-search", "{'refine': true, 'max': 0}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 0);
+    g_assert_cmpint(qdict_get_int(ret, "places"), ==, 100000);
+    debug_summary_has(ret, "stopped counting at 100000 places");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "memory-search", "{'value': '256', 'size': 1}",
+                      "does not fit in 1 byte");
+    debug_check_error(qts, "memory-search", "{'value': '-129', 'size': 1}",
+                      "does not fit in 1 byte");
+    debug_check_error(qts, "memory-search", "{'value': '4294967296'}",
+                      "does not fit in 4 bytes");
+    debug_check_error(qts, "memory-search", "{'value': '1', 'size': 3}",
+                      "size must be 1, 2, 4 or 8");
+    debug_check_error(qts, "memory-search", "{'value': '12ab'}",
+                      "not a number");
+    debug_check_error(qts, "memory-search", "{'text': 'a', 'size': 2}",
+                      "size goes with value");
+    debug_check_error(qts, "memory-search", "{'value': '1', 'wide': true}",
+                      "go with text");
+    debug_check_error(qts, "memory-search", "{'value': '1', 'bytes': '01'}",
+                      "not more");
+    debug_check_error(qts, "memory-search", "{'text': 'a', 'changed': true}",
+                      "changed goes with refine");
+    debug_check_error(qts, "memory-search", "{'refine': true, 'value': '1',"
+                      " 'changed': true}", "changed goes with refine");
+    debug_check_error(qts, "memory-search", "{'refine': true,"
+                      " 'address': '0x1000'}", "give no address");
     qtest_quit(qts);
     unlink(bios);
 }
@@ -4785,6 +4943,8 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/run", test_debug_run);
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
         qtest_add_func("/mcp/debug/search", test_memory_search);
+        qtest_add_func("/mcp/debug/search-refine",
+                       test_memory_search_refine);
         qtest_add_func("/mcp/debug/symbols", test_debug_symbols);
         qtest_add_func("/mcp/debug/condition", test_debug_condition);
         qtest_add_func("/mcp/debug/condition-hits",
