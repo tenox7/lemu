@@ -1343,7 +1343,7 @@ static void artist_draw_cursor(ARTISTState *s)
             if (cursor_pos_y + cy < 0 ||
                 cursor_pos_x + cx < 0 ||
                 cursor_pos_y + cy > buf->height - 1 ||
-                cursor_pos_x + cx > buf->width) {
+                cursor_pos_x + cx > buf->width - 1) {
                 continue;
             }
 
