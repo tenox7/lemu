@@ -93,6 +93,8 @@ typedef struct DisasContext {
     bool insn_start_updated;
     bool hpux_idle;
     bool hpux_x11_pace;
+    /* The chained exits (goto_tb 0 and 1) this TB has emitted. */
+    uint8_t goto_tb_used;
 
     MemOp mo_align;
 } DisasContext;
@@ -815,7 +817,18 @@ static void gen_goto_tb(DisasContext *ctx, int which,
                         const DisasIAQE *f, const DisasIAQE *b)
 {
     install_iaq_entries(ctx, f, b);
-    if (use_goto_tb(ctx, f, b)) {
+    /*
+     * Each chained exit may be emitted only once per TB.  do_cbranch()
+     * uses both when the branch itself may be nullified, and the TB end
+     * then asks for exit 0 again for the nullified path.  The TB keeps
+     * the place of the last goto_tb of each number only, so the first is
+     * never patched: on an AArch64 host it stays a branch to itself and
+     * the vCPU hangs (HP-UX 11.11 boot); on an x86 host it goes to the
+     * main loop, which then chains the other one to the wrong TB.  An
+     * exit whose number is taken does without chaining.
+     */
+    if (use_goto_tb(ctx, f, b) && !(ctx->goto_tb_used & (1 << which))) {
+        ctx->goto_tb_used |= 1 << which;
         tcg_gen_goto_tb(which);
         tcg_gen_exit_tb(ctx->base.tb, which);
     } else {
