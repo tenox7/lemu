@@ -6,7 +6,7 @@
 
 /*
  * Windows NT for Alpha spins when it is idle. KiIdleLoop checks its DPC
- * queue and its next thread over and over; in NT 4.0 it also calls
+ * queue and its next thread over and over; in NT 3.51 and 4.0 it also calls
  * HalProcessorIdle, which just enables interrupts and returns. The
  * translator finds the loop (gen_nt_idle()) and calls helper_nt_idle() with
  * interrupts enabled, which halts the vCPU until the next interrupt when

@@ -3863,12 +3863,16 @@ static bool trans_bgt(DisasContext *s, arg_bgt *a)
 #define NT_IDLE_NEXT    0xa20b0008      /* ldl a0,8(s2) */
 
 /*
- * NT 4.0 enables interrupts at the top of the loop and disables them for
- * the checks, so the helper runs at the di.
+ * NT 3.51 and 4.0 disable interrupts for the checks, so the helper runs at
+ * the di. NT 4.0 enables them again at the top of the loop, an ei just
+ * before the di; NT 3.51's loop starts at the di and HalProcessorIdle
+ * enables them.
  */
+static const uint32_t nt40_idle_ei[][2] = {
+    { 0x00000009, 0xffffffff },     /* NT 4.0 loop: call_pal ei */
+};
 static const uint32_t nt40_idle_loop[][2] = {
-    { 0x00000009, 0xffffffff },     /* loop: call_pal ei */
-    { 0x00000008, 0xffffffff },     /* call_pal di */
+    { 0x00000008, 0xffffffff },     /* NT 3.51 loop: call_pal di */
     { 0xa0290000, 0xffff0000 },     /* ldl   t0,n(s0)       DPC count */
     { 0xe4200000, 0xffe00000 },     /* beq   t0,1f */
 };
@@ -3937,14 +3941,14 @@ static void gen_nt_idle(DisasContext *s, CPUAlphaState *env, vaddr pc,
                         uint32_t insn)
 {
     uint32_t dpc, list;
-    vaddr t, u;
+    vaddr t, u, loop;
 
     /* Off RAM, translator_ldl_end() would record these words as code */
     if (tb_page_addr0(s->base.tb) == -1) {
         return;
     }
     if (insn == NT_IDLE_DI) {
-        if (!nt_idle_match(s, env, pc - 4, nt40_idle_loop,
+        if (!nt_idle_match(s, env, pc, nt40_idle_loop,
                            ARRAY_SIZE(nt40_idle_loop))) {
             return;
         }
@@ -3955,8 +3959,15 @@ static void gen_nt_idle(DisasContext *s, CPUAlphaState *env, vaddr pc,
         }
         u = nt_idle_target(s, env, t + 4);
         if (!nt_idle_match(s, env, u, nt40_idle_hal,
-                           ARRAY_SIZE(nt40_idle_hal)) ||
-            nt_idle_target(s, env, u + 4) != pc - 4) {
+                           ARRAY_SIZE(nt40_idle_hal))) {
+            return;
+        }
+        /* The loop goes back to the di (NT 3.51) or to an ei before it */
+        loop = nt_idle_target(s, env, u + 4);
+        if (loop != pc &&
+            (loop != pc - 4 ||
+             !nt_idle_match(s, env, pc - 4, nt40_idle_ei,
+                            ARRAY_SIZE(nt40_idle_ei)))) {
             return;
         }
         dpc = translator_ldl_end(env, &s->base, pc + 4, MO_LE);
