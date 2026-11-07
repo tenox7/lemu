@@ -66,6 +66,7 @@ these folders in place of their own build, for example:
     sh ../jensen/release/pack.sh nt40 SRCDIR STAGE/alpha nt40axp-qemu.tar.lz
     sh ../rm200/release/pack.sh KITDIR qemu-system-mips64el STAGE/mips nt4-rm200-qemu.tar.lz
     sh ../hppa/release/mkrelease.sh hpux1020 VMDIR STAGE/hppa hpux1020b160l-qemu.tar.lz
+    sh ../hppa/release/mkrelease.sh hpux905 VMDIR STAGE/hppa hpux905-715-qemu.tar.lz
 
 - `VMDIR`, `SRCDIR` and `KITDIR` hold the guest files: disk, NVRAM and
   firmware. See each machine's notes.
