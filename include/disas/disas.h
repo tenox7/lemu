@@ -20,6 +20,12 @@ char *plugin_disas(CPUState *cpu, const DisasContextBase *db,
 /* Look up symbol for debugging purpose.  Returns "" if unknown. */
 const char *lookup_symbol(uint64_t orig_addr);
 
+/*
+ * LEMU: a name for @addr in the monitor's disassembly, such as
+ * "panic+0x1c", or NULL.  Set while the MCP debug tools have symbols.
+ */
+extern char *(*monitor_disas_symbol)(uint64_t addr);
+
 struct syminfo;
 struct elf32_sym;
 struct elf64_sym;

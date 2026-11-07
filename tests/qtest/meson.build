@@ -186,7 +186,8 @@ qtests_mips = \
 
 qtests_mipsel = qtests_mips
 qtests_mips64 = qtests_mips
-qtests_mips64el = qtests_mips
+qtests_mips64el = qtests_mips + \
+  (pixman.found() ? ['mcp-test'] : [])
 
 qtests_ppc = \
   qtests_filter + \

@@ -5,6 +5,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
+#include "qemu/ctype.h"
 #include "disas/dis-asm.h"
 #include "disas/capstone.h"
 
@@ -167,13 +168,87 @@ static void cap_dump_insn_units(disassemble_info *info, cs_insn *insn,
     }
 }
 
-static void cap_dump_insn(disassemble_info *info, cs_insn *insn)
+/*
+ * LEMU: the operands of an instruction, with a name at the end of each
+ * operand that holds an address with one, as in "0x80123400 <panic>".
+ * @branch: the instruction jumps or calls, so its numbers are places,
+ * and a place in a symbol gets a name too, "panic+0x1c".  Elsewhere a
+ * number may be no place, so only a symbol's own address gets one.
+ * Numbers are 0x1234, or $1234 in Motorola's syntax; not a displacement
+ * from a register, "0x10(%eax)", nor an immediate in AT&T's, "$0x10".
+ * A 64-bit MIPS prints 0xffffffffbfc00000 as -0x40400000.
+ */
+static char *cap_name_numbers(const char *op_str, bool branch,
+                              bool motorola, char *(*name)(uint64_t))
+{
+    GString *s = g_string_new(NULL);
+    g_autofree char *pending = NULL;
+    const char *p = op_str, *digits, *q;
+
+    for (;;) {
+        bool word = p > op_str && (qemu_isalnum(p[-1]) || p[-1] == '_');
+
+        if ((!*p || *p == ',') && pending) {
+            g_string_append_printf(s, " <%s>", pending);
+            g_clear_pointer(&pending, g_free);
+        }
+        if (!*p) {
+            break;
+        }
+        if (!word && p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
+            (p == op_str || p[-1] != '$')) {
+            digits = p + 2;
+        } else if (!word && motorola && p[0] == '$' && qemu_isxdigit(p[1])) {
+            digits = p + 1;
+        } else {
+            g_string_append_c(s, *p++);
+            continue;
+        }
+        for (q = digits; qemu_isxdigit(*q); q++) {
+            /* the digits */
+        }
+        g_string_append_len(s, p, q - p);
+        if (q > digits && *q != '(' && !qemu_isalnum(*q) && *q != '_' &&
+            !pending) {
+            uint64_t addr = g_ascii_strtoull(digits, NULL, 16);
+
+            pending = name(p > op_str && p[-1] == '-' ? -addr : addr);
+            if (pending && !branch && strstr(pending, "+0x")) {
+                g_clear_pointer(&pending, g_free);
+            }
+        }
+        p = q;
+    }
+    return g_string_free(s, false);
+}
+
+/*
+ * One instruction.  With @name (LEMU, for the monitor), its address
+ * and the addresses in it get names.
+ */
+static void cap_dump_insn_named(disassemble_info *info, cs_insn *insn,
+                                csh handle, char *(*name)(uint64_t))
 {
     fprintf_function print = info->fprintf_func;
     FILE *stream = info->stream;
+    g_autofree char *at = name ? name(insn->address) : NULL;
+    g_autofree char *ops = NULL;
     int i, n, split;
 
-    print(stream, "0x%08" PRIx64 ": ", insn->address);
+    if (name) {
+        /*
+         * Capstone 5 gives MIPS jal no group, but a call goes to a
+         * function's own address, which gets its name anyway.
+         */
+        bool branch = insn->detail &&
+            (cs_insn_group(handle, insn, CS_GRP_JUMP) ||
+             cs_insn_group(handle, insn, CS_GRP_CALL));
+
+        ops = cap_name_numbers(insn->op_str, branch,
+                               info->cap_arch == CS_ARCH_M68K, name);
+    }
+    print(stream, "0x%08" PRIx64 "%s%s%s: ", insn->address, at ? " <" : "",
+          at ? at : "", at ? ">" : "");
 
     n = insn->size;
     split = info->cap_insn_split;
@@ -189,7 +264,7 @@ static void cap_dump_insn(disassemble_info *info, cs_insn *insn)
     }
 
     /* Print the actual instruction.  */
-    print(stream, "  %-8s %s\n", insn->mnemonic, insn->op_str);
+    print(stream, "  %-8s %s\n", insn->mnemonic, ops ? ops : insn->op_str);
 
     /* Dump any remaining part of the insn on subsequent lines.  */
     for (i = split; i < n; i += split) {
@@ -197,6 +272,11 @@ static void cap_dump_insn(disassemble_info *info, cs_insn *insn)
         cap_dump_insn_units(info, insn, i, MIN(n, i + split));
         print(stream, "\n");
     }
+}
+
+static void cap_dump_insn(disassemble_info *info, cs_insn *insn)
+{
+    cap_dump_insn_named(info, insn, 0, NULL);
 }
 
 /* Disassemble SIZE bytes at PC for the target.  */
@@ -288,18 +368,27 @@ bool cap_disas_host(disassemble_info *info, const void *code, size_t size)
     return true;
 }
 
-/* Disassemble COUNT insns at PC for the target.  */
-bool cap_disas_monitor(disassemble_info *info, uint64_t pc, int count)
+/*
+ * Disassemble COUNT insns at PC for the target.  LEMU: with @name,
+ * addresses get names (see monitor_disas_symbol).
+ */
+bool cap_disas_monitor(disassemble_info *info, uint64_t pc, int count,
+                       char *(*name)(uint64_t addr))
 {
     uint8_t cap_buf[32];
     csh handle;
-    cs_insn *insn;
+    cs_insn *insn, *own = NULL;
     size_t csize = 0;
 
     if (cap_disas_start(info, &handle) != CS_ERR_OK) {
         return false;
     }
     insn = cap_insn;
+    /* the groups tell a jump or a call; cap_insn has no room for them */
+    if (name && cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON) == CS_ERR_OK) {
+        own = cs_malloc(handle);
+        insn = own ? own : insn;
+    }
 
     while (1) {
         /*
@@ -323,7 +412,7 @@ bool cap_disas_monitor(disassemble_info *info, uint64_t pc, int count)
             csize += tsize;
 
             if (cs_disasm_iter(handle, &cbuf, &csize, &pc, insn)) {
-                cap_dump_insn(info, insn);
+                cap_dump_insn_named(info, insn, handle, name);
                 if (--count <= 0) {
                     break;
                 }
@@ -334,6 +423,9 @@ bool cap_disas_monitor(disassemble_info *info, uint64_t pc, int count)
                                "0x%08" PRIx64 ": unable to read memory\n", pc);
             break;
         }
+    }
+    if (own) {
+        cs_free(own, 1);
     }
 
     cs_close(&handle);

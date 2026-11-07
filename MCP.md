@@ -69,6 +69,7 @@ only when exactly one VM is running and you started it.
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
 | `memory-search` | Find text or bytes in guest RAM and ROM |
+| `debug-symbols` | Load the names of the guest's functions and variables (from nm or a link map), to use in place of addresses |
 | `register-write` | Set a register of a stopped CPU, or move it to another instruction (`pc`) |
 | `hmp`, `qmp` | Run any QEMU monitor command: registers, memory, disassembly, pause and go on |
 | `steps` | Run several of these tools in one call, in order; stop at the first wait that is not met |
@@ -140,6 +141,7 @@ Use these:
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
 | Find a message, a value or a signature in memory | `memory-search` (`wide` for Windows NT's UTF-16 strings) |
+| Use function and variable names in place of addresses | `debug-symbols` with nm's output or a link map |
 | Change a register, or where the CPU goes on (the pc) | `register-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |
 | Pause and go on | `vm-power` `pause` and `resume`, or `hmp` `stop` and `cont` |
@@ -211,6 +213,15 @@ Use these:
   Addresses are virtual, as the CPU sees them (on x86: the CS base plus
   EIP). These tools need TCG, the default for the old CPUs, and no GDB
   stub.
+- **Names for addresses:** give `debug-symbols` the guest's symbol
+  list: nm's output (in the guest or on the host), a System.map, or a
+  link map, as `text` or a `file`. Then every address a debug tool
+  takes can be a name, such as `panic` or `panic+0x1c`, and stops,
+  history, profiles, search matches and disassembly (also `hmp`
+  `x /i`) show `0x80123456 <panic+0x1c>`. `base` moves a list to where
+  a module or a DLL was loaded; `lookup` turns names into addresses and
+  back. A 32-bit list works as it is on a 64-bit CPU that extends
+  addresses with the sign (NT on MIPS and Alpha).
 - **Memory at a register:** a `memory` address can add and take away
   registers, read when the CPU stops: `sp+16`, `r26`, or
   `0x657500000000+r26` when the register holds only the offset in a

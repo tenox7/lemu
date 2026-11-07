@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "disas/disas.h"
 #include "exec/gdbstub.h"
 #include "exec/replay-core.h"
 #include "exec/target_page.h"
@@ -88,6 +89,691 @@ static CPUState *mcp_debug_cpu(bool has_cpu, int64_t index, Error **errp)
         error_setg(errp, "this VM has no CPU");
     }
     return cpu;
+}
+
+/*
+ * Symbols from debug-symbols: names for guest addresses.  Only the main
+ * loop uses them.
+ */
+
+#define SYM_MAX                 2000000
+#define SYM_FILE_MAX            (256 * MiB)
+#define SYM_NEAR                (64 * KiB)  /* past one of no size */
+#define SYM_LOOKUPS_MAX         64
+#define SYM_LINE_SHOWN          80
+
+typedef struct McpSym {
+    uint64_t addr;
+    uint64_t size;              /* 0 when the list did not say */
+    char type;                  /* nm's letter, or '?' */
+    char name[];
+} McpSym;
+
+static struct {
+    GPtrArray *all;             /* McpSym, in the order loaded */
+    GPtrArray *by_addr;         /* the ones shown for an address, sorted */
+    GHashTable *by_name;        /* the first McpSym of each name */
+    int64_t dup_names;          /* names given at several addresses */
+} mcp_syms;
+
+static bool mcp_sym_is_code(const McpSym *s)
+{
+    return s->type == 'T' || s->type == 't' || s->type == 'W' ||
+           s->type == 'w';
+}
+
+/* Which of several at one address to show: global code first */
+static int mcp_sym_rank(const McpSym *s)
+{
+    return (qemu_isupper(s->type) ? 2 : 0) + mcp_sym_is_code(s);
+}
+
+static gint mcp_sym_cmp(gconstpointer a, gconstpointer b)
+{
+    const McpSym *x = *(McpSym *const *)a;
+    const McpSym *y = *(McpSym *const *)b;
+
+    if (x->addr != y->addr) {
+        return x->addr < y->addr ? -1 : 1;
+    }
+    return mcp_sym_rank(y) - mcp_sym_rank(x);
+}
+
+static int64_t mcp_syms_count(void)
+{
+    return mcp_syms.all ? mcp_syms.all->len : 0;
+}
+
+/*
+ * A 64-bit CPU that runs a 32-bit system may extend its addresses with
+ * the sign: 0x80123400 in the system's symbol list is 0xffffffff80123400
+ * on the CPU.
+ */
+static bool mcp_is_sext32(uint64_t addr)
+{
+    return addr >> 31 == 0x1ffffffffULL;
+}
+
+/* Seen a CPU run at such an address */
+static bool mcp_sext_seen;
+
+/*
+ * The 32-bit address @addr as the CPUs use it: extended with the sign
+ * if the guest's MMU maps only that, or if a CPU has run at one; else
+ * as it is.  Other CPUs extend with zeros, or have 32-bit addresses.
+ */
+static uint64_t mcp_sym_cpu_addr(uint64_t addr)
+{
+    uint64_t sext = (uint64_t)(int64_t)(int32_t)addr;
+    bool maps = false, maps_sext = false;
+    TranslateForDebugResult t;
+    CPUState *cpu;
+
+    if (addr >> 31 != 1 || target_long_bits() < 64) {
+        return addr;
+    }
+    CPU_FOREACH(cpu) {
+        maps |= cpu_translate_for_debug(cpu, addr, &t);
+        maps_sext |= cpu_translate_for_debug(cpu, sext, &t);
+        mcp_sext_seen |= mcp_is_sext32(cpu->cc->get_pc(cpu));
+    }
+    if (maps) {
+        return addr;
+    }
+    return maps_sext || mcp_sext_seen ? sext : addr;
+}
+
+/* Where the symbol is, as the CPUs use it; absolute ones are numbers */
+static uint64_t mcp_sym_place(const McpSym *s)
+{
+    return s->type == 'A' || s->type == 'a' ? s->addr
+                                            : mcp_sym_cpu_addr(s->addr);
+}
+
+/* "panic+0x1c" for @addr, or NULL when no symbol is there */
+static char *mcp_sym_name_at(uint64_t addr)
+{
+    GPtrArray *a = mcp_syms.by_addr;
+    const McpSym *s;
+    uint64_t size;
+    guint lo = 0, hi, i;
+
+    if (!a || !a->len) {
+        return NULL;
+    }
+    /* the first symbol past @addr */
+    hi = a->len;
+    while (lo < hi) {
+        guint mid = lo + (hi - lo) / 2;
+
+        if (((McpSym *)g_ptr_array_index(a, mid))->addr <= addr) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if (!lo) {
+        return NULL;
+    }
+    /* of the ones at that address, the best comes first */
+    i = lo - 1;
+    s = g_ptr_array_index(a, i);
+    size = s->size;
+    while (i > 0 &&
+           ((McpSym *)g_ptr_array_index(a, i - 1))->addr == s->addr) {
+        s = g_ptr_array_index(a, --i);
+        size = MAX(size, s->size);
+    }
+    if (addr - s->addr >= (size ? size : SYM_NEAR)) {
+        return NULL;
+    }
+    if (addr == s->addr) {
+        return g_strdup(s->name);
+    }
+    return g_strdup_printf("%s+0x%" PRIx64, s->name, addr - s->addr);
+}
+
+/* "panic+0x1c" for @addr, or NULL; also for an address with its sign */
+static char *mcp_sym_name(uint64_t addr)
+{
+    char *name = mcp_sym_name_at(addr);
+
+    if (!name && mcp_is_sext32(addr)) {
+        name = mcp_sym_name_at((uint32_t)addr);
+    }
+    return name;
+}
+
+/* "0x80123456 <panic+0x1c>", or "0x80123456" when no symbol is there */
+static char *mcp_addr_str(uint64_t addr)
+{
+    g_autofree char *name = mcp_sym_name(addr);
+
+    if (name) {
+        return g_strdup_printf("0x%" PRIx64 " <%s>", addr, name);
+    }
+    return g_strdup_printf("0x%" PRIx64, addr);
+}
+
+/*
+ * The symbol called @name, else _name, else .name, as compilers put
+ * those in front.  @code: a function goes before data of that name.
+ */
+static const McpSym *mcp_sym_find(const char *name, bool code)
+{
+    static const char *const prefix[] = { "", "_", "." };
+    const McpSym *found = NULL;
+    size_t i;
+
+    if (!mcp_syms.by_name) {
+        return NULL;
+    }
+    for (i = 0; i < ARRAY_SIZE(prefix); i++) {
+        g_autofree char *n = g_strconcat(prefix[i], name, NULL);
+        const McpSym *s = g_hash_table_lookup(mcp_syms.by_name, n);
+
+        if (s && (!code || mcp_sym_is_code(s))) {
+            return s;
+        }
+        found = found ? found : s;
+    }
+    return found;
+}
+
+/*
+ * A symbol with an offset, such as panic, panic+0x1c or panic-4: its
+ * symbol into *@sym, and the address.  The offset is hex with 0x, or
+ * decimal.
+ */
+static bool mcp_sym_resolve(const char *s, bool code, const McpSym **sym,
+                            uint64_t *addr)
+{
+    g_autofree char *name = NULL;
+    const char *p;
+    uint64_t off;
+
+    *sym = mcp_sym_find(s, code);
+    if (*sym) {
+        *addr = mcp_sym_place(*sym);
+        return true;
+    }
+    for (p = s + strlen(s); p > s && p[-1] != '+' && p[-1] != '-'; p--) {
+        /* to the last + or - */
+    }
+    if (p <= s + 1) {
+        return false;
+    }
+    name = g_strstrip(g_strndup(s, p - 1 - s));
+    while (qemu_isspace(*p)) {
+        p++;
+    }
+    if (qemu_strtou64(p, NULL, p[0] == '0' && (p[1] == 'x' || p[1] == 'X')
+                      ? 16 : 10, &off) < 0) {
+        return false;
+    }
+    *sym = mcp_sym_find(name, code);
+    if (!*sym) {
+        return false;
+    }
+    *addr = mcp_sym_place(*sym);
+    *addr = p[-1] == '-' ? *addr - off : *addr + off;
+    return true;
+}
+
+/*
+ * An address: a number (hex with 0x, or decimal), or a symbol with an
+ * offset.  @code: it is code, so a function goes before data.
+ */
+static bool mcp_parse_place(const char *s, const char *what, bool code,
+                            uint64_t *addr, Error **errp)
+{
+    const McpSym *sym;
+
+    if (qemu_isdigit(s[0])) {
+        return mcp_parse_address(s, what, addr, errp);
+    }
+    if (!mcp_syms_count()) {
+        error_setg(errp, "%s '%s' is not a number: write hex with 0x, or"
+                   " decimal; for names, load symbols with debug-symbols",
+                   what, s);
+        return false;
+    }
+    if (!mcp_sym_resolve(s, code, &sym, addr)) {
+        error_setg(errp, "%s '%s' is not a number or a symbol: write hex"
+                   " with 0x, decimal, or a name that debug-symbols loaded,"
+                   " as in panic+0x1c", what, s);
+        return false;
+    }
+    return true;
+}
+
+static void mcp_syms_clear(void)
+{
+    monitor_disas_symbol = NULL;
+    g_clear_pointer(&mcp_syms.by_name, g_hash_table_unref);
+    g_clear_pointer(&mcp_syms.by_addr, g_ptr_array_unref);
+    g_clear_pointer(&mcp_syms.all, g_ptr_array_unref);
+    mcp_syms.dup_names = 0;
+}
+
+/* False when it has that symbol already */
+static bool mcp_sym_add(uint64_t addr, uint64_t size, char type,
+                        const char *name)
+{
+    size_t len = strlen(name);
+    McpSym *s, *old;
+
+    if (!mcp_syms.all) {
+        mcp_syms.all = g_ptr_array_new_with_free_func(g_free);
+        mcp_syms.by_addr = g_ptr_array_new();
+        mcp_syms.by_name = g_hash_table_new(g_str_hash, g_str_equal);
+    }
+    old = g_hash_table_lookup(mcp_syms.by_name, name);
+    if (old && old->addr == addr) {
+        return false;
+    }
+    s = g_malloc(sizeof(*s) + len + 1);
+    s->addr = addr;
+    s->size = size;
+    s->type = type;
+    memcpy(s->name, name, len + 1);
+    g_ptr_array_add(mcp_syms.all, s);
+    /* absolute symbols are numbers, not places */
+    if (type != 'A' && type != 'a') {
+        g_ptr_array_add(mcp_syms.by_addr, s);
+    }
+    if (old) {
+        mcp_syms.dup_names++;
+    } else {
+        g_hash_table_insert(mcp_syms.by_name, s->name, s);
+    }
+    return true;
+}
+
+/* Hex, with or without 0x */
+static bool mcp_sym_hex(const char *s, uint64_t *v)
+{
+    const char *p = s;
+
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+    if (!*p || strlen(p) > 16 || strspn(p, "0123456789abcdefABCDEF") !=
+        strlen(p)) {
+        return false;
+    }
+    *v = g_ascii_strtoull(p, NULL, 16);
+    return true;
+}
+
+/*
+ * Whether @num is the address and @other the name, when @num is hex: a
+ * name such as "add" or "cafe" is hex too, but nm pads addresses with
+ * zeros, so the longer one is the address.
+ */
+static bool mcp_sym_addr_first(const char *num, const char *other)
+{
+    uint64_t v;
+
+    return !mcp_sym_hex(other, &v) || strlen(num) >= strlen(other);
+}
+
+/* nm's letter for the kind of symbol */
+static bool mcp_sym_letter(const char *s)
+{
+    return s[0] && !s[1] && (qemu_isalpha(s[0]) || s[0] == '?' ||
+                             s[0] == '-');
+}
+
+/* "0001:00000a10": a segment and an offset, in a Microsoft link map */
+static bool mcp_sym_segoff(const char *s)
+{
+    const char *colon = strchr(s, ':');
+    g_autofree char *seg = colon ? g_strndup(s, colon - s) : NULL;
+    uint64_t v;
+
+    return colon && mcp_sym_hex(seg, &v) && mcp_sym_hex(colon + 1, &v);
+}
+
+typedef enum {
+    SYM_LINE_OK,
+    SYM_LINE_UNDEFINED,         /* or not a place: a file, a section */
+    SYM_LINE_UNKNOWN,
+} McpSymLineKind;
+
+typedef struct McpSymLine {
+    uint64_t addr;
+    uint64_t size;
+    char type;
+    const char *name;
+} McpSymLine;
+
+/*
+ * A System V nm table line, with hex values (nm -x):
+ * "[45] | 0x10004000 | 0x120 | FUNC | GLOB | 0 | 1 | panic", or the
+ * HP-UX one, "panic | 0x00012345 | extern | entry | $CODE$"
+ */
+static McpSymLineKind mcp_sym_table_line(char **col, int n, McpSymLine *l)
+{
+    bool local = false, found = false, sized = false;
+    char type = '?';
+    int i;
+
+    for (i = 0; i < n; i++) {
+        const char *c = col[i];
+
+        /* the value, then the size, if the table has one */
+        if (!found && g_str_has_prefix(c, "0x") && mcp_sym_hex(c, &l->addr)) {
+            found = true;
+        } else if (found && !sized && g_str_has_prefix(c, "0x") &&
+                   mcp_sym_hex(c, &l->size)) {
+            sized = true;
+        } else if (!g_ascii_strcasecmp(c, "undef") ||
+                   !g_ascii_strcasecmp(c, "file") ||
+                   !g_ascii_strcasecmp(c, "sect")) {
+            return SYM_LINE_UNDEFINED;
+        } else if (!g_ascii_strcasecmp(c, "func") ||
+                   !g_ascii_strcasecmp(c, "entry") ||
+                   !g_ascii_strcasecmp(c, "code") ||
+                   !g_ascii_strcasecmp(c, "millicode")) {
+            type = 'T';
+        } else if (!g_ascii_strcasecmp(c, "objt") ||
+                   !g_ascii_strcasecmp(c, "data")) {
+            type = 'D';
+        } else if (!g_ascii_strcasecmp(c, "abs") ||
+                   !g_ascii_strcasecmp(c, "absolute")) {
+            type = type == '?' ? 'A' : type;
+        } else if (!g_ascii_strcasecmp(c, "locl") ||
+                   !g_ascii_strcasecmp(c, "local") ||
+                   !g_ascii_strcasecmp(c, "static")) {
+            local = true;
+        }
+    }
+    l->name = col[0][0] == '[' ? col[n - 1] : col[0];
+    if (!found || !*l->name || strchr(l->name, ' ')) {
+        return SYM_LINE_UNKNOWN;
+    }
+    l->type = local ? g_ascii_tolower(type) : type;
+    return SYM_LINE_OK;
+}
+
+/* One line of a symbol list: see debug-symbols in qapi/mcp.json */
+static McpSymLineKind mcp_sym_line(char *line, McpSymLine *l)
+{
+    char *f[7];
+    char *p = line;
+    int n = 0;
+
+    memset(l, 0, sizeof(*l));
+    l->type = '?';
+    if (strchr(line, '|')) {
+        g_auto(GStrv) col = g_strsplit(line, "|", 0);
+        McpSymLineKind k = SYM_LINE_UNKNOWN;
+
+        for (n = 0; col[n]; n++) {
+            g_strstrip(col[n]);
+        }
+        if (n >= 3) {
+            k = mcp_sym_table_line(col, n, l);
+        }
+        /* the name is in @col, which goes with this call */
+        if (k == SYM_LINE_OK) {
+            l->name = strcpy(line, l->name);
+        }
+        return k;
+    }
+    /* the fields, split in place */
+    while (n < ARRAY_SIZE(f)) {
+        p += strspn(p, " \t");
+        if (!*p) {
+            break;
+        }
+        f[n++] = p;
+        p += strcspn(p, " \t");
+        if (*p) {
+            *p++ = '\0';
+        }
+    }
+    if (n >= 3 && mcp_sym_hex(f[0], &l->addr) && mcp_sym_letter(f[1]) &&
+        mcp_sym_addr_first(f[0], f[2])) {
+        /* ADDR TYPE NAME */
+        l->type = f[1][0];
+        l->name = f[2];
+    } else if (n >= 4 && mcp_sym_hex(f[0], &l->addr) &&
+               mcp_sym_hex(f[1], &l->size) && mcp_sym_letter(f[2])) {
+        /* ADDR SIZE TYPE NAME */
+        l->type = f[2][0];
+        l->name = f[3];
+    } else if (n >= 3 && mcp_sym_letter(f[1]) &&
+               mcp_sym_hex(f[2], &l->addr)) {
+        /* NAME TYPE ADDR [SIZE] */
+        l->type = f[1][0];
+        l->name = f[0];
+        if (n >= 4 && !mcp_sym_hex(f[3], &l->size)) {
+            l->size = 0;
+        }
+    } else if (n >= 3 && mcp_sym_segoff(f[0]) &&
+               mcp_sym_hex(f[2], &l->addr)) {
+        /* a link map: SEG:OFF NAME ADDR [f] [OBJECT] */
+        l->type = n >= 4 && !strcmp(f[3], "f") ? 'T' : 'D';
+        l->name = f[1];
+    } else if (n == 2 && mcp_sym_letter(f[0])) {
+        /* "U name" */
+        return SYM_LINE_UNDEFINED;
+    } else if (n == 2 && mcp_sym_hex(f[0], &l->addr) &&
+               mcp_sym_addr_first(f[0], f[1])) {
+        /* ADDR NAME */
+        l->name = f[1];
+    } else if (n == 2 && mcp_sym_hex(f[1], &l->addr)) {
+        /* NAME ADDR */
+        l->name = f[0];
+    } else {
+        return SYM_LINE_UNKNOWN;
+    }
+    if (l->type == 'U' || l->type == 'N' || l->type == '-' ||
+        (!l->addr && (l->type == 'w' || l->type == 'v'))) {
+        return SYM_LINE_UNDEFINED;
+    }
+    return SYM_LINE_OK;
+}
+
+typedef struct McpSymLoad {
+    int64_t loaded, undefined, had, unknown;
+    char *first_unknown;        /* the first line not understood */
+    bool full;
+} McpSymLoad;
+
+static void mcp_syms_load(const char *text, uint64_t base, McpSymLoad *ld)
+{
+    const char *line, *end;
+
+    for (line = text; *line; line = *end ? end + 1 : end) {
+        g_autofree char *copy = NULL;
+        McpSymLine l;
+        McpSymLineKind k;
+
+        end = qemu_strchrnul(line, '\n');
+        copy = g_strstrip(g_strndup(line, end - line));
+        if (!*copy || copy[0] == '#') {
+            continue;
+        }
+        if (mcp_syms_count() >= SYM_MAX) {
+            ld->full = true;
+            break;
+        }
+        k = mcp_sym_line(copy, &l);
+        if (k == SYM_LINE_UNKNOWN) {
+            if (!ld->unknown++) {
+                /* mcp_sym_line() has cut @copy up */
+                g_autofree char *orig = g_strstrip(g_strndup(line,
+                                                             end - line));
+
+                ld->first_unknown = g_strndup(orig, SYM_LINE_SHOWN);
+            }
+            continue;
+        }
+        if (k == SYM_LINE_UNDEFINED) {
+            ld->undefined++;
+        } else if (mcp_sym_add(l.addr + base, l.size, l.type, l.name)) {
+            ld->loaded++;
+        } else {
+            ld->had++;
+        }
+    }
+    if (mcp_syms.by_addr) {
+        g_ptr_array_sort(mcp_syms.by_addr, mcp_sym_cmp);
+    }
+    monitor_disas_symbol = mcp_syms_count() ? mcp_sym_name : NULL;
+}
+
+/* "panic = 0x80123400 (T, 0x120 bytes)", "0x80123456 = panic+0x56" */
+static char *mcp_sym_lookup(const char *q)
+{
+    const McpSym *sym;
+    g_autofree char *name = NULL;
+    g_autofree char *size = NULL;
+    uint64_t addr;
+
+    if (qemu_isdigit(q[0])) {
+        if (mcp_parse_address(q, "address", &addr, NULL)) {
+            name = mcp_sym_name(addr);
+            return name ? g_strdup_printf("0x%" PRIx64 " = %s", addr, name)
+                        : g_strdup_printf("0x%" PRIx64 ": no symbol there",
+                                          addr);
+        }
+        return g_strdup_printf("%s: not a number (hex with 0x, or decimal)",
+                               q);
+    }
+    if (!mcp_sym_resolve(q, false, &sym, &addr)) {
+        return g_strdup_printf("%s: no such symbol", q);
+    }
+    if (sym->size) {
+        size = g_strdup_printf(", 0x%" PRIx64 " bytes", sym->size);
+    }
+    /* "panic+0x10 = 0x80123410 (panic: T, 0x120 bytes)" */
+    return g_strdup_printf("%s = 0x%" PRIx64 " (%s%s%c%s)", q, addr,
+                           strcmp(q, sym->name) ? sym->name : "",
+                           strcmp(q, sym->name) ? ": " : "", sym->type,
+                           size ? size : "");
+}
+
+McpSymbols *qmp_debug_symbols(const char *file, const char *text,
+                              const char *base, bool has_clear, bool clear,
+                              bool has_lookup, strList *lookup,
+                              Error **errp)
+{
+    g_autofree char *contents = NULL;
+    g_autoptr(GString) s = g_string_new(NULL);
+    McpSymLoad ld = { 0 };
+    McpSymbols *res;
+    strList *l, **tail;
+    uint64_t off = 0;
+    int n;
+
+    if (file && text) {
+        error_setg(errp, "give file or text, not both");
+        return NULL;
+    }
+    if (base && !file && !text) {
+        error_setg(errp, "base goes with file or text");
+        return NULL;
+    }
+    if (base && !mcp_parse_address(base, "base", &off, errp)) {
+        return NULL;
+    }
+    for (l = lookup, n = 0; l; l = l->next) {
+        if (++n > SYM_LOOKUPS_MAX) {
+            error_setg(errp, "look up at most %d at a time", SYM_LOOKUPS_MAX);
+            return NULL;
+        }
+    }
+    if (file) {
+        g_autoptr(GError) err = NULL;
+        struct stat st;
+        gsize len;
+
+        if (stat(file, &st) == 0 && st.st_size > SYM_FILE_MAX) {
+            error_setg(errp, "%s is over 256 MiB: that is no symbol list",
+                       file);
+            return NULL;
+        }
+        if (!g_file_get_contents(file, &contents, &len, &err)) {
+            error_setg(errp, "can't read the symbol list: %s", err->message);
+            return NULL;
+        }
+        text = contents;
+    }
+    if (has_clear && clear) {
+        mcp_syms_clear();
+    }
+    if (text) {
+        mcp_syms_load(text, off, &ld);
+    }
+
+    res = g_new0(McpSymbols, 1);
+    res->loaded = ld.loaded;
+    res->count = mcp_syms_count();
+    res->skipped = ld.undefined + ld.had + ld.unknown;
+    if (text) {
+        g_string_printf(s, "Loaded %" PRId64 " symbol%s%s%s", ld.loaded,
+                        ld.loaded == 1 ? "" : "s", file ? " from " : "",
+                        file ? file : "");
+        if (ld.full) {
+            g_string_append_printf(s, ", and stopped at %d", SYM_MAX);
+        }
+        g_string_append_printf(s, "; %" PRId64 " in all", res->count);
+    } else if (has_clear && clear) {
+        g_string_assign(s, "Forgot all symbols");
+    } else {
+        g_string_printf(s, "%" PRId64 " symbol%s", res->count,
+                        res->count == 1 ? "" : "s");
+    }
+    if (mcp_syms.by_addr && mcp_syms.by_addr->len) {
+        GPtrArray *a = mcp_syms.by_addr;
+
+        g_string_append_printf(s, ", from 0x%" PRIx64 " to 0x%" PRIx64,
+                               ((McpSym *)g_ptr_array_index(a, 0))->addr,
+                               ((McpSym *)g_ptr_array_index(a, a->len - 1))
+                               ->addr);
+    }
+    g_string_append_c(s, '.');
+    if (ld.undefined || ld.had || ld.unknown) {
+        g_string_append(s, " Skipped:");
+        if (ld.undefined) {
+            g_string_append_printf(s, " %" PRId64 " undefined (not in this"
+                                   " file) or not a place;", ld.undefined);
+        }
+        if (ld.had) {
+            g_string_append_printf(s, " %" PRId64 " loaded before;", ld.had);
+        }
+        if (ld.unknown) {
+            g_string_append_printf(s, " %" PRId64 " line%s not understood,"
+                                   " such as \"%s\";", ld.unknown,
+                                   ld.unknown == 1 ? "" : "s",
+                                   ld.first_unknown ? ld.first_unknown : "");
+        }
+        s->str[s->len - 1] = '.';
+    }
+    g_free(ld.first_unknown);
+    if (mcp_syms.dup_names) {
+        g_string_append_printf(s, " %" PRId64 " name%s given again at another"
+                               " address: a name finds the first.",
+                               mcp_syms.dup_names,
+                               mcp_syms.dup_names == 1 ? " is" : "s are");
+    }
+    if (!res->count) {
+        g_string_append(s, " Load a list from nm with file or text.");
+    }
+    tail = &res->lookups;
+    for (l = lookup; l; l = l->next) {
+        char *line = mcp_sym_lookup(l->value);
+
+        g_string_append_printf(s, "\n%s", line);
+        QAPI_LIST_APPEND(tail, line);
+    }
+    res->has_lookups = !!lookup;
+    res->summary = g_strdup(s->str);
+    return res;
 }
 
 static char *mcp_hex(const uint8_t *buf, size_t len)
@@ -206,7 +892,7 @@ McpMemoryWriteResult *qmp_memory_write(const char *address,
     size_t done, n;
 
     physical = has_physical && physical;
-    if (!mcp_parse_address(address, "address", &addr, errp)) {
+    if (!mcp_parse_place(address, "address", false, &addr, errp)) {
         return NULL;
     }
     data = mcp_parse_bytes(bytes, errp);
@@ -648,7 +1334,7 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
         return NULL;
     }
     if (address) {
-        if (!mcp_parse_address(address, "address", &start, errp)) {
+        if (!mcp_parse_place(address, "address", false, &start, errp)) {
             return NULL;
         }
         length = has_length ? length : SEARCH_LENGTH;
@@ -748,6 +1434,7 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
             if (virt) {
                 m->physical = g_strdup_printf("0x%" HWADDR_PRIx,
                                               sp->pa + (o - sp->off));
+                m->symbol = mcp_sym_name(pos + o);
             }
             m->region = g_strdup(sp->region);
             m->bytes = mcp_search_bytes(shown, got);
@@ -783,7 +1470,10 @@ qmp_memory_search(const char *bytes, const char *text, bool has_wide,
     for (ml = res->matches; ml; ml = ml->next) {
         McpMemoryMatch *m = ml->value;
 
-        g_string_append_printf(s, "%s (%s%s%s%s): %s  |%s|\n", m->address,
+        g_string_append_printf(s, "%s%s%s%s (%s%s%s%s): %s  |%s|\n",
+                               m->address, m->symbol ? " <" : "",
+                               m->symbol ? m->symbol : "",
+                               m->symbol ? ">" : "",
                                m->physical ? "physical " : "",
                                m->physical ? m->physical : "",
                                m->physical ? ", " : "", m->region, m->bytes,
@@ -1121,7 +1811,7 @@ static void mcp_debug_append_addrs(GString *s, McpBreak *b, const char *conj)
     int i;
 
     for (i = 0; i < b->n_addrs; i++) {
-        g_ptr_array_add(items, g_strdup_printf("0x%" PRIx64, b->addrs[i]));
+        g_ptr_array_add(items, mcp_addr_str(b->addrs[i]));
     }
     mcp_append_list(s, items, conj);
     if (b->has_mask) {
@@ -1488,9 +2178,10 @@ typedef struct McpMem {
 } McpMem;
 
 /*
- * A memory address: numbers and registers of the CPU that stops, added
- * and taken away, such as 0x1000, sp, sp+16 or 0x657500000000+r26 (a
- * space or segment base and an offset).  @cpu is one like that CPU.
+ * A memory address: numbers, registers of the CPU that stops and
+ * symbols, added and taken away, such as 0x1000, sp, sp+16, jiffies+4
+ * or 0x657500000000+r26 (a space or segment base and an offset).  @cpu
+ * is one like that CPU.
  */
 static bool mcp_parse_mem_address(CPUState *cpu, const char *s, McpMem *m,
                                   Error **errp)
@@ -1503,6 +2194,7 @@ static bool mcp_parse_mem_address(CPUState *cpu, const char *s, McpMem *m,
         McpAddrTerm *t = &m->term[m->n_terms];
         size_t len;
         g_autofree char *word = NULL;
+        const McpSym *sym;
         const char *name;
 
         if (m->n_terms++ == ADDR_TERMS_MAX) {
@@ -1525,17 +2217,22 @@ static bool mcp_parse_mem_address(CPUState *cpu, const char *s, McpMem *m,
         } else if (!cpu) {
             error_setg(errp, "memory address '%s': this VM has no CPU", s);
             return false;
-        } else if (!*name || strlen(name) >= REG_NAME_MAX ||
-                   (mcp_reg_number(cpu, name) < 0 &&
-                    g_ascii_strcasecmp(name, "pc"))) {
-            g_autofree char *names = mcp_reg_names(cpu);
-
-            error_setg(errp, "memory address '%s': '%s' is not a number or"
-                       " a register; the registers are %s", s, word, names);
-            return false;
-        } else {
+        } else if (*name && strlen(name) < REG_NAME_MAX &&
+                   (mcp_reg_number(cpu, name) >= 0 ||
+                    !g_ascii_strcasecmp(name, "pc"))) {
             pstrcpy(t->reg, sizeof(t->reg), name);
             m->has_reg = true;
+        } else {
+            sym = *word ? mcp_sym_find(word, false) : NULL;
+            if (!sym) {
+                g_autofree char *names = mcp_reg_names(cpu);
+
+                error_setg(errp, "memory address '%s': '%s' is not a number,"
+                           " a register or a symbol (debug-symbols loads"
+                           " them); the registers are %s", s, word, names);
+                return false;
+            }
+            t->num = mcp_sym_place(sym);
         }
         while (qemu_isspace(*p)) {
             p++;
@@ -1826,10 +2523,11 @@ static void mcp_debug_show(GString *s, CPUState *cpu, McpMem *mem, int n)
                                    cpu->cpu_index, bad);
             continue;
         }
-        where = g_strdup_printf("%s%s%s0x%" PRIx64,
-                                mem[i].has_reg ? mem[i].text : "",
-                                mem[i].has_reg ? " = " : "",
-                                mem[i].physical ? "physical " : "", addr);
+        g_autofree char *at = mem[i].physical ?
+            g_strdup_printf("physical 0x%" PRIx64, addr) : mcp_addr_str(addr);
+
+        where = g_strdup_printf("%s%s%s", mem[i].has_reg ? mem[i].text : "",
+                                mem[i].has_reg ? " = " : "", at);
         if (!mem[i].physical && !mcp_debug_mapped(cpu, addr)) {
             g_string_append_printf(s, "\n%s at %s: not mapped for CPU %d now"
                                    " (step on until the guest uses it).%s"
@@ -1927,9 +2625,12 @@ static bool mcp_debug_retry(CPUState *cpu, uint64_t pc)
 
 static void mcp_debug_set_cpu(McpDebugStop *res, CPUState *cpu)
 {
+    uint64_t pc = cpu->cc->get_pc(cpu);
+
     res->has_cpu = true;
     res->cpu = cpu->cpu_index;
-    res->pc = g_strdup_printf("0x%" PRIx64, (uint64_t)cpu->cc->get_pc(cpu));
+    res->pc = g_strdup_printf("0x%" PRIx64, pc);
+    res->symbol = mcp_sym_name(pc);
     mcp_debug_last_cpu = cpu->cpu_index;
 }
 
@@ -1956,9 +2657,9 @@ static void mcp_debug_append_watches(GString *s, McpBreak *b,
         g_autofree char *len = with_len ?
             g_strdup_printf(" (%" PRIu64 " byte%s)", a->len,
                             a->len == 1 ? "" : "s") : NULL;
+        g_autofree char *at = mcp_addr_str(a->addr);
 
-        g_ptr_array_add(items, g_strdup_printf("%s 0x%" PRIx64 "%s",
-                                               verb[a->flags], a->addr,
+        g_ptr_array_add(items, g_strdup_printf("%s %s%s", verb[a->flags], at,
                                                len ? len : ""));
     }
     mcp_append_list(s, items, conj);
@@ -2149,11 +2850,15 @@ static strList *mcp_history_lines(CPUState *cpu, int n)
             NULL;
         g_autofree char *rep = e->repeat > 1 ?
             g_strdup_printf(" x%" PRIu32, e->repeat) : NULL;
+        g_autofree char *name = mcp_sym_name(e->pc);
 
-        QAPI_LIST_APPEND(tail, g_strdup_printf("0x%" PRIx64 "%s%s",
+        QAPI_LIST_APPEND(tail, g_strdup_printf("0x%" PRIx64 "%s%s%s%s%s",
                                                (uint64_t)e->pc,
                                                end ? end : "",
-                                               rep ? rep : ""));
+                                               rep ? rep : "",
+                                               name ? " <" : "",
+                                               name ? name : "",
+                                               name ? ">" : ""));
     }
     return list;
 }
@@ -2296,7 +3001,7 @@ static bool mcp_parse_addrs(McpAddresses *address, McpBreak *b, Error **errp)
         uint64_t a;
         int i;
 
-        if (!mcp_parse_address(l->value, "address", &a, errp)) {
+        if (!mcp_parse_place(l->value, "address", true, &a, errp)) {
             return false;
         }
         /* the same address twice is one breakpoint */
@@ -2411,16 +3116,18 @@ static bool mcp_run_parse(McpRun *r, McpAddresses *address,
  */
 static void mcp_run_append_hit(GString *s, McpRun *r)
 {
+    g_autofree char *at = mcp_addr_str(r->by_watch ? r->seen.addr :
+                                       r->by_excp ? r->excp.from :
+                                       mcp_debug_reached(&r->b, r->at));
+
     if (r->by_watch) {
-        g_string_append_printf(s, "%s 0x%" PRIx64,
-                               r->seen.write ? "wrote to" : "read",
-                               r->seen.addr);
+        g_string_append_printf(s, "%s %s", r->seen.write ? "wrote to" : "read",
+                               at);
     } else if (r->by_excp) {
-        g_string_append_printf(s, "took exception %" PRId32 " at 0x%" PRIx64,
-                               r->excp.number, r->excp.from);
+        g_string_append_printf(s, "took exception %" PRId32 " at %s",
+                               r->excp.number, at);
     } else {
-        g_string_append_printf(s, "reached 0x%" PRIx64,
-                               mcp_debug_reached(&r->b, r->at));
+        g_string_append_printf(s, "reached %s", at);
     }
 }
 
@@ -2561,12 +3268,12 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         }
         if (r.by_excp) {
             g_autofree char *insn = mcp_debug_insn(at, r.excp.from);
+            g_autofree char *handler = mcp_addr_str(r.excp.to);
 
             g_string_append_printf(s, "; the VM is stopped at the first"
                                    " instruction of the guest's handler"
-                                   " for it, 0x%" PRIx64 ". The"
-                                   " instruction that took it:\n%s",
-                                   r.excp.to, insn ? insn : "");
+                                   " for it, %s. The instruction that took"
+                                   " it:\n%s", handler, insn ? insn : "");
             break;
         }
         g_string_append(s, "; the VM is stopped");
@@ -2783,6 +3490,7 @@ static void mcp_trace_log(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
     McpTracer *t = container_of(r, McpTracer, r);
     uint64_t pc = seen ? seen->pc : excp ? excp->from :
                   mcp_debug_reached(&r->b, cpu);
+    g_autofree char *at = NULL;
     McpTraceCount *c = NULL;
     McpTraceEntry *e;
     strList **vtail, *l;
@@ -2832,29 +3540,32 @@ static void mcp_trace_log(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
     e->hit = r->n_hits;
     e->cpu = cpu->cpu_index;
     e->pc = g_strdup_printf("0x%" PRIx64, pc);
+    at = mcp_addr_str(pc);
     g_string_append_printf(t->text, "#%" PRId64 " CPU %d at %s", e->hit,
-                           cpu->cpu_index, e->pc);
+                           cpu->cpu_index, at);
     if (seen) {
+        g_autofree char *addr = mcp_addr_str(seen->addr);
+
         e->watch = g_new0(McpWatchHit, 1);
         e->watch->address = g_strdup_printf("0x%" PRIx64, seen->addr);
         e->watch->access = g_strdup(seen->write ? "write" : "read");
         e->watch->pc = g_strdup(e->pc);
         e->value = mcp_read_words(cpu, seen->addr & ~3ULL, 1, false);
         g_string_append_printf(t->text, " %s %s",
-                               seen->write ? "wrote to" : "read",
-                               e->watch->address);
+                               seen->write ? "wrote to" : "read", addr);
         if (e->value) {
             g_string_append_printf(t->text, " (now %s)", e->value);
         }
     }
     if (excp) {
+        g_autofree char *handler = mcp_addr_str(excp->to);
+
         e->exception = g_new0(McpExceptionHit, 1);
         e->exception->number = excp->number;
         e->exception->pc = g_strdup(e->pc);
         e->exception->handler = g_strdup_printf("0x%" PRIx64, excp->to);
         g_string_append_printf(t->text, " took exception %" PRId32 ", went"
-                               " to %s", excp->number,
-                               e->exception->handler);
+                               " to %s", excp->number, handler);
     }
     if (retry) {
         e->has_retry = true;
@@ -3080,6 +3791,7 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
         for (i = 0; i < sorted->len; i++) {
             McpTraceExcp *x = g_ptr_array_index(sorted, i);
             McpExceptionCount *xc = g_new0(McpExceptionCount, 1);
+            g_autofree char *handler = mcp_addr_str(x->handler);
 
             xc->number = x->number;
             xc->count = x->count;
@@ -3087,7 +3799,7 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
             QAPI_LIST_APPEND(xtail, xc);
             g_string_append_printf(s, "%8" PRId64 " x exception %" PRId32
                                    ", handler %s\n", x->count, x->number,
-                                   xc->handler);
+                                   handler);
         }
         if (t.n_other_excps) {
             g_string_append_printf(s, "%8" PRId64 " x other exceptions"
@@ -3225,11 +3937,11 @@ McpDebugStop *coroutine_fn qmp_debug_step(bool has_count, int64_t count,
             break;
         }
         if (interrupted && insn) {
+            g_autofree char *to = mcp_addr_str(cpu->cc->get_pc(cpu));
             char *old = insn;
 
             insn = g_strdup_printf("%s  -> it took an interruption: the CPU"
-                                   " went to 0x%" PRIx64 "\n", old,
-                                   (uint64_t)cpu->cc->get_pc(cpu));
+                                   " went to %s\n", old, to);
             g_free(old);
         }
         g_free(*slot);
@@ -3482,6 +4194,7 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
                                                     1, phys) : NULL;
 
         e->pc = g_strdup_printf("0x%" PRIx64, c->pc);
+        e->symbol = mcp_sym_name(c->pc);
         if (phys) {
             e->physical = g_strdup_printf("0x%" PRIx64, c->pa);
         }
@@ -3513,9 +4226,13 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
                                res->paused_percent);
     }
     if (res->top) {
-        g_string_append_printf(s, "; most at %s (%.1f%%)",
-                               res->top->value->pc,
-                               res->top->value->count * 100.0 / p->ran);
+        McpProfileEntry *e = res->top->value;
+
+        g_string_append_printf(s, "; most at %s%s%s%s (%.1f%%)", e->pc,
+                               e->symbol ? " <" : "",
+                               e->symbol ? e->symbol : "",
+                               e->symbol ? ">" : "",
+                               e->count * 100.0 / p->ran);
     } else {
         g_string_append(s, "; no CPU ran");
     }

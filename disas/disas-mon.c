@@ -37,6 +37,19 @@ physical_read_memory(bfd_vma memaddr, bfd_byte *myaddr, int length,
     return res == MEMTX_OK ? 0 : EIO;
 }
 
+char *(*monitor_disas_symbol)(uint64_t addr);
+
+/* An address in an instruction, such as where it jumps, and its name */
+static void monitor_print_address(bfd_vma addr, struct disassemble_info *info)
+{
+    g_autofree char *name = monitor_disas_symbol(addr);
+
+    info->fprintf_func(info->stream, "0x%" PRIx64, (uint64_t)addr);
+    if (name) {
+        info->fprintf_func(info->stream, " <%s>", name);
+    }
+}
+
 /* Disassembler for the monitor.  */
 void monitor_disas(MonitorHMP *hmp, CPUState *cpu, uint64_t pc,
                    int nb_insn, bool is_physical)
@@ -49,6 +62,9 @@ void monitor_disas(MonitorHMP *hmp, CPUState *cpu, uint64_t pc,
     s.info.fprintf_func = disas_gstring_printf;
     s.info.stream = (FILE *)ds;  /* abuse this slot */
     s.info.show_opcodes = true;
+    if (monitor_disas_symbol && !is_physical) {
+        s.info.print_address_func = monitor_print_address;
+    }
 
     if (is_physical) {
         s.info.read_memory_func = physical_read_memory;
@@ -57,7 +73,9 @@ void monitor_disas(MonitorHMP *hmp, CPUState *cpu, uint64_t pc,
     }
     s.info.buffer_vma = pc;
 
-    if (s.info.cap_arch >= 0 && cap_disas_monitor(&s.info, pc, nb_insn)) {
+    if (s.info.cap_arch >= 0 &&
+        cap_disas_monitor(&s.info, pc, nb_insn,
+                          is_physical ? NULL : monitor_disas_symbol)) {
         monitor_puts(MONITOR(hmp), ds->str);
         return;
     }
@@ -69,7 +87,12 @@ void monitor_disas(MonitorHMP *hmp, CPUState *cpu, uint64_t pc,
     }
 
     for (i = 0; i < nb_insn; i++) {
-        g_string_append_printf(ds, "0x%08" PRIx64 ":  ", pc);
+        g_autofree char *name = monitor_disas_symbol && !is_physical ?
+                                monitor_disas_symbol(pc) : NULL;
+
+        g_string_append_printf(ds, "0x%08" PRIx64 "%s%s%s:  ", pc,
+                               name ? " <" : "", name ? name : "",
+                               name ? ">" : "");
         count = s.info.print_insn(pc, &s.info);
         g_string_append_c(ds, '\n');
         if (count < 0) {

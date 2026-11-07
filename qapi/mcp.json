@@ -1466,14 +1466,16 @@
 # @McpDebugMemory:
 #     Guest memory that a debug tool shows when the CPU stops.
 #
-# @address: the first address: hex with 0x, or decimal.  It may add
-#     and take away registers of the CPU that stopped, with their
-#     values then: sp, sp+16, r30-0x20, or 0x657500000000+r26 when a
-#     register holds only the offset in a space or a segment.  The
-#     names are GDB's (an unknown one gets the list); pc is where the
-#     CPU is.  CPUs whose registers have no names there (alpha, hppa,
-#     mips) take rN, GDB's register N, which on most CPUs is the
-#     general register N.
+# @address: the first address: hex with 0x, or decimal, or a symbol
+#     that @debug-symbols loaded.  It may add and take away registers
+#     of the CPU that stopped, with their values then: sp, sp+16,
+#     r30-0x20, or 0x657500000000+r26 when a register holds only the
+#     offset in a space or a segment; and symbols: jiffies,
+#     proc_table+0x40.  The register names are GDB's (an unknown one
+#     gets the list), and a name that is a register is not taken for a
+#     symbol; pc is where the CPU is.  CPUs whose registers have no
+#     names there (alpha, hppa, mips) take rN, GDB's register N, which
+#     on most CPUs is the general register N.
 #
 # @words: how many 32-bit words, up to 256 (default: 8)
 #
@@ -1503,6 +1505,9 @@
 #
 # @pc: its program counter, in hex
 #
+# @symbol: where @pc is, as a symbol and an offset (panic+0x1c), when
+#     @debug-symbols loaded one there
+#
 # @hits: how often a CPU got to an address or touched watched memory
 #     (debug-run)
 #
@@ -1531,6 +1536,7 @@
 { 'struct': 'McpDebugStop',
   'base': 'McpResult',
   'data': { 'reached': 'bool', '*cpu': 'int', '*pc': 'str',
+            '*symbol': 'str',
             '*hits': 'int', '*steps': 'int', 'running': 'bool',
             '*retry': 'bool', '*watch': 'McpWatchHit',
             '*exception': 'McpExceptionHit', '*history': [ 'str' ] },
@@ -1681,11 +1687,11 @@
 #     when the call begins first steps past it, so the call stops at
 #     the next arrival.
 #
-# @address: where to stop: hex with 0x, or decimal, or a list of up
-#     to 64 of them, to stop at whichever a CPU gets to first.  A
-#     virtual address as the CPU sees it (on x86 the linear address:
-#     CS base plus EIP).  Give it, @watch, @exception, or more of
-#     them.
+# @address: where to stop: hex with 0x, or decimal, or a symbol that
+#     @debug-symbols loaded (panic, panic+0x1c), or a list of up to 64
+#     of them, to stop at whichever a CPU gets to first.  A virtual
+#     address as the CPU sees it (on x86 the linear address: CS base
+#     plus EIP).  Give it, @watch, @exception, or more of them.
 #
 # @address-mask: compare only the bits of each address that are set
 #     in this number, written as an address: a CPU stops at any
@@ -1922,11 +1928,14 @@
 # @instruction: the instruction there, read at @physical when there
 #     is one, as the mapping may have changed since
 #
+# @symbol: @pc as a symbol and an offset (idle+0x8), when
+#     @debug-symbols loaded one there
+#
 # Since: 11.2
 ##
 { 'struct': 'McpProfileEntry',
   'data': { 'pc': 'str', 'count': 'int', 'percent': 'int',
-            '*physical': 'str', '*instruction': 'str' },
+            '*physical': 'str', '*instruction': 'str', '*symbol': 'str' },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -2002,7 +2011,8 @@
 #     variable.  Devices are never written.  It returns the old bytes,
 #     so you can put them back.  To read memory, use hmp ('x', 'xp').
 #
-# @address: where to write: hex with 0x, or decimal
+# @address: where to write: hex with 0x, or decimal, or a symbol that
+#     @debug-symbols loaded (panic, panic+0x1c)
 #
 # @bytes: the bytes in memory order, in hex, like "08000240" or
 #     "de ad be ef", up to 1024.  A big-endian guest (HP-UX, SunOS,
@@ -2046,11 +2056,14 @@
 # @text: those bytes as text, with a dot for each one that is not a
 #     printable character; with @wide, as 16-bit characters
 #
+# @symbol: a virtual @address as a symbol and an offset (jiffies),
+#     when @debug-symbols loaded one there
+#
 # Since: 11.2
 ##
 { 'struct': 'McpMemoryMatch',
   'data': { 'address': 'str', '*physical': 'str', 'region': 'str',
-            'bytes': 'str', 'text': 'str' } }
+            'bytes': 'str', 'text': 'str', '*symbol': 'str' } }
 
 ##
 # @McpMemorySearchResult:
@@ -2093,9 +2106,10 @@
 # @ignore-case: letters A to Z in @text match in either case
 #     (default: false)
 #
-# @address: search from here on: hex with 0x, or decimal; a virtual
-#     address through the CPU's MMU, unless @physical.  Without it, it
-#     searches all RAM and ROM by physical address.
+# @address: search from here on: hex with 0x, or decimal, or a symbol
+#     that @debug-symbols loaded; a virtual address through the CPU's
+#     MMU, unless @physical.  Without it, it searches all RAM and ROM
+#     by physical address.
 #
 # @length: how many bytes from @address (default: 1048576, 1 MiB);
 #     virtual memory at most 4 GiB at a time
@@ -2123,6 +2137,92 @@
   'returns': 'McpMemorySearchResult',
   'features': [ 'mcp', 'mcp-read-only' ],
   'coroutine': true }
+
+##
+# @McpSymbols:
+#     What @debug-symbols did.
+#
+# @loaded: symbols it added in this call
+#
+# @count: symbols there are now
+#
+# @skipped: lines it left out: ones it did not understand, undefined
+#     symbols, and symbols it had already
+#
+# @lookups: the answer to each @lookup, in order, such as
+#     "panic = 0x80123400 (T, 0x120 bytes)" or "0x80123456 =
+#     panic+0x56"
+#
+# Since: 11.2
+##
+{ 'struct': 'McpSymbols',
+  'base': 'McpResult',
+  'data': { 'loaded': 'int', 'count': 'int', 'skipped': 'int',
+            '*lookups': [ 'str' ] } }
+
+##
+# @debug-symbols:
+#     Load names for guest addresses, such as the functions and
+#     variables of a kernel, from a symbol list.  Then the debug
+#     tools take a name wherever they take an address (panic,
+#     panic+0x1c, jiffies), and show the name next to the addresses
+#     they print, also in disassembly (and in hmp's x /i).  Get the
+#     list from nm in the guest or on the host, from a System.map, or
+#     from a link map.  Its addresses are virtual ones, as the
+#     guest's MMU maps them.  The names stay until @clear, also when
+#     the guest reboots.  With no arguments, it says how many there
+#     are.
+#
+#     Each line is one symbol: "ADDR TYPE NAME" (BSD nm,
+#     System.map), "ADDR SIZE TYPE NAME" (nm -S), "NAME TYPE ADDR
+#     [SIZE]" (nm -P), "ADDR NAME", "NAME ADDR", a line of a System V
+#     nm table ("[45] | 0x10004000 | 0x120 | FUNC | GLOB | ... |
+#     panic", or the HP-UX one, "panic | 0x00012345 | extern | entry
+#     | $CODE$"), or a line of a Microsoft link map ("0001:00000a10
+#     _main 00401a10 f main.obj").  Addresses are hex, with or
+#     without 0x; System V nm prints decimal unless given -x.  TYPE is
+#     nm's letter: undefined symbols (U) are left out, and absolute
+#     ones (A) are found by name but never shown for an address.
+#     Other lines are skipped.
+#
+#     A name finds that symbol, else _name, else .name (a.out, COFF
+#     and AIX put those in front).  Where code is wanted, as for a
+#     breakpoint, a function goes before data of the same name.
+#
+#     A 64-bit CPU that runs a 32-bit system may extend addresses
+#     with the sign, as MIPS and Alpha do: 0x80123400 in the list is
+#     0xffffffff80123400 there.  The tools see that by themselves, so
+#     give the list as it is.
+#
+#     In disassembly, a jump or a call gets the name of the place it
+#     goes to, also inside a function (panic+0x1c); other
+#     instructions get a name only for a symbol's own address.
+#
+# @file: a file on the host with the list
+#
+# @text: the list itself, one symbol to a line
+#
+# @base: add this to each address in the list, as for a module or a
+#     DLL loaded somewhere else than the list says: hex with 0x, or
+#     decimal (default: 0)
+#
+# @clear: forget the symbols loaded before (default: false)
+#
+# @lookup: up to 64 names or addresses to look up, after loading
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# @mcp-read-only: does not change the VM
+#
+# Since: 11.2
+##
+{ 'command': 'debug-symbols',
+  'data': { '*file': 'str', '*text': 'str', '*base': 'str',
+            '*clear': 'bool', '*lookup': [ 'str' ] },
+  'returns': 'McpSymbols',
+  'features': [ 'mcp', 'mcp-read-only' ] }
 
 ##
 # @McpRegisterWriteResult:

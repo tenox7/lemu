@@ -2152,14 +2152,15 @@ static void test_debug_registers(void)
     qobject_unref(ret);
 
     debug_check_error(qts, "debug-step", "{'memory': [{'address': 'foo'}]}",
-                      "'foo' is not a number or a register; the registers"
-                      " are pc, eax, ecx");
+                      "'foo' is not a number, a register or a symbol"
+                      " (debug-symbols loads them); the registers are pc,"
+                      " eax, ecx");
     debug_check_error(qts, "debug-step",
                       "{'memory': [{'address': 'esp+0xzz'}]}",
                       "'0xzz' is not a number");
     debug_check_error(qts, "debug-step",
                       "{'memory': [{'address': 'esp+'}]}",
-                      "'' is not a number or a register");
+                      "'' is not a number, a register or a symbol");
     debug_check_error(qts, "debug-step",
                       "{'memory': [{'address': '1+2+3+4+5'}]}",
                       "more than 4 parts");
@@ -2992,6 +2993,275 @@ static QDict *search_match(QDict *ret, int i)
     g_assert_not_reached();
 }
 
+/* The lookups of a debug-symbols result, one to a line */
+static char *symbols_lookups(QDict *ret)
+{
+    GString *s = g_string_new(NULL);
+    QListEntry *e;
+
+    QLIST_FOREACH_ENTRY(qdict_get_qlist(ret, "lookups"), e) {
+        g_string_append_printf(s, "%s\n",
+                               qstring_get_str(qobject_to(QString,
+                                                          qlist_entry_obj(e))));
+    }
+    return g_string_free(s, false);
+}
+
+static char *hmp(QTestState *qts, const char *cmd)
+{
+    QDict *rsp = qtest_qmp(qts, "{'execute': 'human-monitor-command',"
+                           " 'arguments': {'command-line': %s}}", cmd);
+    char *out = g_strdup(qdict_get_str(rsp, "return"));
+
+    qobject_unref(rsp);
+    return out;
+}
+
+/*
+ * debug-symbols reads nm and link map lines; the tools then take names
+ * for addresses, and show names next to the addresses they print
+ */
+static void test_debug_symbols(void)
+{
+    static const char list[] =
+        "Symbols from bios:\n"
+        "fffffff0 T reset_loop\n"
+        "fffffff1 t loop_jump\n"
+        "         U printf\n"
+        "00001000 00000010 D counter\n"
+        "sized_fn T 5000 20\n"
+        "[45]\t|0x00002000|0x00000010|OBJT |GLOB |0    |3      |sysv_obj\n"
+        "hpux_func           |0x00003000|extern|entry  |$CODE$\n"
+        " 0001:00000000       _ms_main          00004000 f   main.obj\n"
+        "6000 plain\n"
+        "_under T 7000\n"
+        ".dot T 8000\n"
+        "dot D 9000\n"
+        "add T 00001100 00000008\n"
+        "00001200 T cafe\n"
+        "beef 00001300\n"
+        "00000400 A KERNBASE\n";
+    static const char want[] =
+        "reset_loop = 0xfffffff0 (T)\n"
+        "loop_jump+1 = 0xfffffff2 (loop_jump: t)\n"
+        "0xfffffff2 = loop_jump+0x1\n"
+        "counter = 0x1000 (D, 0x10 bytes)\n"
+        "0x100f = counter+0xf\n"
+        "0x1010: no symbol there\n"
+        "sized_fn = 0x5000 (T, 0x20 bytes)\n"
+        "sysv_obj = 0x2000 (D, 0x10 bytes)\n"
+        "hpux_func = 0x3000 (T)\n"
+        "ms_main = 0x4000 (_ms_main: T)\n"
+        "plain = 0x6000 (?)\n"
+        "under = 0x7000 (_under: T)\n"
+        "dot = 0x9000 (D)\n"
+        "add = 0x1100 (T, 0x8 bytes)\n"
+        "cafe = 0x1200 (T)\n"
+        "beef = 0x1300 (?)\n"
+        "KERNBASE = 0x400 (A)\n"
+        "0x400: no symbol there\n"
+        "nope: no such symbol\n";
+    g_autofree char *bios = debug_bios();
+    g_autofree char *path = NULL;
+    g_autofree char *args = NULL;
+    g_autofree char *got = NULL;
+    g_autofree char *out = NULL;
+    g_autofree char *many = NULL;
+    GString *l;
+    QTestState *qts;
+    QDict *ret, *top;
+    int fd, i;
+
+    fd = g_file_open_tmp("mcp-syms-XXXXXX", &path, NULL);
+    g_assert(fd >= 0);
+    g_assert_cmpint(write(fd, list, strlen(list)), ==, strlen(list));
+    close(fd);
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    args = g_strdup_printf("{'file': '%s', 'lookup': ['reset_loop',"
+                           " 'loop_jump+1', '0xfffffff2', 'counter', '0x100f',"
+                           " '0x1010', 'sized_fn', 'sysv_obj', 'hpux_func',"
+                           " 'ms_main', 'plain', 'under', 'dot', 'add',"
+                           " 'cafe', 'beef', 'KERNBASE', '0x400', 'nope']}",
+                           path);
+    ret = debug_ok(qts, "debug-symbols", args);
+    g_assert_cmpint(qdict_get_int(ret, "loaded"), ==, 15);
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 15);
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 2);
+    g_assert(strstr(qdict_get_str(ret, "summary"),
+                    "such as \"Symbols from bios:\""));
+    got = symbols_lookups(ret);
+    g_assert_cmpstr(got, ==, want);
+    qobject_unref(ret);
+
+    /* again: nothing new; and a module at a base */
+    ret = debug_ok(qts, "debug-symbols", args);
+    g_assert_cmpint(qdict_get_int(ret, "loaded"), ==, 0);
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 15);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-symbols", "{'text': '0 T mod_start\\n"
+                   "10 t mod_fn\\n', 'base': '0x20000',"
+                   " 'lookup': ['mod_fn']}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 17);
+    g_free(got);
+    got = symbols_lookups(ret);
+    g_assert_cmpstr(got, ==, "mod_fn = 0x20010 (t)\n");
+    qobject_unref(ret);
+
+    /* names in the disassembly, also hmp's, and for the pc */
+    ret = debug_ok(qts, "debug-step", "{'count': 2}");
+    g_assert(strstr(qdict_get_str(ret, "summary"),
+                    "0xfffffff1 <loop_jump>:  "));
+    g_assert_cmpstr(qdict_get_str(ret, "symbol"), ==, "reset_loop");
+    qobject_unref(ret);
+    out = hmp(qts, "x /1i 0xfffffff1");
+    g_assert(strstr(out, "0xfffffff1 <loop_jump>:  "));
+
+    /*
+     * Elsewhere only a symbol's own address gets its name: not an
+     * immediate, nor a place inside a symbol (mov ax, [0x1000]; mov ax,
+     * 0x1000; mov ax, [0x1004])
+     */
+    ret = debug_ok(qts, "memory-write", "{'address': '0x2000',"
+                   " 'bytes': 'a1 00 10 b8 00 10 a1 04 10'}");
+    qobject_unref(ret);
+    g_free(out);
+    out = hmp(qts, "x /3i 0x2000");
+    g_assert(strstr(out, "0x1000 <counter>, %ax"));
+    g_assert(strstr(out, "$0x1000, %ax"));
+    g_assert(strstr(out, "0x1004, %ax"));
+
+    /* names for addresses to stop at and memory to show */
+    ret = debug_ok(qts, "debug-run", "{'address': 'loop_jump',"
+                   " 'memory': [{'address': 'counter+4', 'words': 1}]}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xfffffff1");
+    g_assert_cmpstr(qdict_get_str(ret, "symbol"), ==, "loop_jump");
+    g_assert(strstr(qdict_get_str(ret, "summary"),
+                    "reached 0xfffffff1 <loop_jump>"));
+    g_assert(strstr(qdict_get_str(ret, "summary"),
+                    "Memory at 0x1004 <counter+0x4>:"));
+    qobject_unref(ret);
+
+    /* a name to stop at is code: .dot, not the data called dot */
+    ret = debug_ok(qts, "debug-run", "{'address': 'dot', 'timeout-ms': 100}");
+    g_assert(strstr(qdict_get_str(ret, "summary"),
+                    "no CPU reached 0x8000 <.dot>"));
+    qobject_unref(ret);
+
+    /* the profile names the loop */
+    ret = debug_ok(qts, "debug-profile", "{'interval-ms': 300}");
+    top = qobject_to(QDict, qlist_peek(qdict_get_qlist(ret, "top")));
+    g_free(out);
+    out = g_strdup_printf("most at %s <%s>", qdict_get_str(top, "pc"),
+                          !strcmp(qdict_get_str(top, "pc"), "0xfffffff0") ?
+                          "reset_loop" : "loop_jump");
+    g_assert(strstr(qdict_get_str(ret, "summary"), out));
+    qobject_unref(ret);
+
+    /* memory-write and memory-search take names too */
+    ret = debug_ok(qts, "memory-write", "{'address': 'counter',"
+                   " 'bytes': '48 69'}");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "memory-search", "{'text': 'Hi',"
+                   " 'address': 'counter', 'length': 16}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    g_assert_cmpstr(qdict_get_str(search_match(ret, 0), "symbol"), ==,
+                    "counter");
+    g_assert(strstr(qdict_get_str(ret, "summary"), "0x1000 <counter> ("));
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-run", "{'address': 'nope'}",
+                      "'nope' is not a number or a symbol");
+    debug_check_error(qts, "debug-symbols", "{'file': 'x', 'text': 'y'}",
+                      "not both");
+    debug_check_error(qts, "debug-symbols", "{'base': '1'}",
+                      "base goes with file or text");
+    debug_check_error(qts, "debug-symbols",
+                      "{'file': '/nonexistent/lemu-syms'}",
+                      "can't read the symbol list");
+    l = g_string_new("{'lookup': [");
+    for (i = 0; i < 65; i++) {
+        g_string_append_printf(l, "%s'x'", i ? ", " : "");
+    }
+    g_string_append(l, "]}");
+    many = g_string_free(l, false);
+    debug_check_error(qts, "debug-symbols", many, "at most 64");
+
+    /* forgotten: names are errors again, with a hint */
+    ret = debug_ok(qts, "debug-symbols", "{'clear': true}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 0);
+    qobject_unref(ret);
+    debug_check_error(qts, "debug-run", "{'address': 'reset_loop'}",
+                      "load symbols with debug-symbols");
+    g_free(out);
+    out = hmp(qts, "x /1i 0xfffffff1");
+    g_assert(!strstr(out, "<"));
+    qtest_quit(qts);
+    unlink(path);
+    unlink(bios);
+}
+
+/*
+ * For a 64-bit MIPS, which starts at 0xffffffffbfc00000: addiu $t0,
+ * $t0, 1, then b back to it, with a nop in its delay slot.  The words
+ * are big-endian: Malta swaps them for a little-endian CPU.
+ */
+static char *debug_bios_mips(void)
+{
+    static const uint8_t code[] = {
+        0x25, 0x08, 0x00, 0x01, 0x10, 0x00, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x00,
+    };
+    g_autofree uint8_t *rom = g_malloc0(64 * KiB);
+    char *path = NULL;
+    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    memcpy(rom, code, sizeof(code));
+    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
+    close(fd);
+    return path;
+}
+
+/*
+ * A 64-bit CPU that runs a 32-bit system may extend its addresses with
+ * the sign, as MIPS does: a 32-bit symbol list still names them
+ */
+static void test_debug_symbols_sign(void)
+{
+    g_autofree char *bios = debug_bios_mips();
+    g_autofree char *got = NULL;
+    g_autofree char *out = NULL;
+    const char *back;
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine malta -nodefaults -bios %s -S",
+                      bios);
+    ret = debug_ok(qts, "debug-symbols", "{'text': 'bfc00000 T loop\\n"
+                   "bfc00004 t loop_back\\n', 'lookup': ['loop_back+4',"
+                   " '0xffffffffbfc00008', '0xbfc00008']}");
+    got = symbols_lookups(ret);
+    g_assert_cmpstr(got, ==,
+                    "loop_back+4 = 0xffffffffbfc00008 (loop_back: t)\n"
+                    "0xffffffffbfc00008 = loop_back+0x4\n"
+                    "0xbfc00008 = loop_back+0x4\n");
+    qobject_unref(ret);
+
+    ret = debug_ok(qts, "debug-run", "{'address': 'loop_back'}");
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xffffffffbfc00004");
+    g_assert_cmpstr(qdict_get_str(ret, "symbol"), ==, "loop_back");
+    qobject_unref(ret);
+    out = hmp(qts, "x /2i 0xffffffffbfc00000");
+    g_assert(strstr(out, "0xffffffffbfc00000 <loop>:"));
+    back = strstr(out, "0xffffffffbfc00004 <loop_back>:");
+    g_assert(back);
+    /* the branch to loop, however the disassembler writes the address */
+    g_assert(strstr(back, " <loop>"));
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 static int64_t search_count(QTestState *qts, const char *args)
 {
     QDict *ret = debug_ok(qts, "memory-search", args);
@@ -3735,6 +4005,15 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
 
+    /* the rest is the same on every CPU, and its guest code is for x86 */
+    if (!strcmp(qtest_get_arch(), "mips64el")) {
+        if (qtest_has_accel("tcg")) {
+            qtest_add_func("/mcp/debug/symbols-sign",
+                           test_debug_symbols_sign);
+        }
+        return g_test_run();
+    }
+
     qtest_add_func("/mcp/bridge", test_bridge);
 
     qtest_add_func("/mcp/keys", test_keys);
@@ -3770,6 +4049,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/run", test_debug_run);
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
         qtest_add_func("/mcp/debug/search", test_memory_search);
+        qtest_add_func("/mcp/debug/symbols", test_debug_symbols);
         qtest_add_func("/mcp/steps/debug", test_steps_debug);
         qtest_add_func("/mcp/debug/retry", test_debug_retry);
         qtest_add_func("/mcp/debug/registers", test_debug_registers);
