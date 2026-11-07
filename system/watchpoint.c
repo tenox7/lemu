@@ -51,7 +51,8 @@ int cpu_watchpoint_insert(CPUState *cpu, vaddr addr, vaddr len,
     }
 
     in_page = -(addr | TARGET_PAGE_MASK);
-    if (len <= in_page) {
+    /* LEMU: any virtual page may map a physical address */
+    if (len <= in_page && !(flags & BP_PHYS)) {
         tlb_flush_page(cpu, addr);
     } else {
         tlb_flush(cpu);
@@ -84,7 +85,11 @@ void cpu_watchpoint_remove_by_ref(CPUState *cpu, CPUWatchpoint *watchpoint)
 {
     QTAILQ_REMOVE(&cpu->watchpoints, watchpoint, entry);
 
-    tlb_flush_page(cpu, watchpoint->vaddr);
+    if (watchpoint->flags & BP_PHYS) {
+        tlb_flush(cpu);
+    } else {
+        tlb_flush_page(cpu, watchpoint->vaddr);
+    }
 
     g_free(watchpoint);
 }

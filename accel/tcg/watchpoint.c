@@ -58,7 +58,23 @@ int cpu_watchpoint_address_matches(CPUState *cpu, vaddr addr, vaddr len)
     int ret = 0;
 
     QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
-        if (watchpoint_address_matches(wp, addr, len)) {
+        if (!(wp->flags & BP_PHYS) &&
+            watchpoint_address_matches(wp, addr, len)) {
+            ret |= wp->flags;
+        }
+    }
+    return ret;
+}
+
+/* LEMU: the same for the watchpoints on physical addresses */
+int cpu_watchpoint_phys_matches(CPUState *cpu, uint64_t paddr, uint64_t len)
+{
+    CPUWatchpoint *wp;
+    int ret = 0;
+
+    QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
+        if ((wp->flags & BP_PHYS) &&
+            watchpoint_address_matches(wp, paddr, len)) {
             ret |= wp->flags;
         }
     }
@@ -68,6 +84,18 @@ int cpu_watchpoint_address_matches(CPUState *cpu, vaddr addr, vaddr len)
 /* Generate a debug exception if a watchpoint has been hit.  */
 void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
                           MemTxAttrs attrs, int flags, uintptr_t ra)
+{
+    /* the physical address is not known: only virtual watchpoints match */
+    cpu_check_watchpoint_phys(cpu, addr, UINT64_MAX, len, attrs, flags, ra);
+}
+
+/*
+ * LEMU: the same, with the physical address of @addr, which watchpoints
+ * on physical addresses (BP_PHYS) compare; UINT64_MAX when not known
+ */
+void cpu_check_watchpoint_phys(CPUState *cpu, vaddr addr, uint64_t paddr,
+                               vaddr len, MemTxAttrs attrs, int flags,
+                               uintptr_t ra)
 {
     CPUWatchpoint *wp;
 
@@ -92,8 +120,11 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
     assert((flags & ~BP_MEM_ACCESS) == 0);
     QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
         int hit_flags = wp->flags & flags;
+        bool phys = wp->flags & BP_PHYS;
+        vaddr at = phys ? paddr : addr;
 
-        if (hit_flags && watchpoint_address_matches(wp, addr, len)) {
+        if (hit_flags && (!phys || paddr != UINT64_MAX) &&
+            watchpoint_address_matches(wp, at, len)) {
             if (replay_running_debug()) {
                 /*
                  * replay_breakpoint reads icount.
@@ -114,7 +145,7 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
             }
 
             wp->flags |= hit_flags << BP_HIT_SHIFT;
-            wp->hitaddr = MAX(addr, wp->vaddr);
+            wp->hitaddr = MAX(at, wp->vaddr);
             wp->hitattrs = attrs;
 
             if (wp->flags & BP_CPU

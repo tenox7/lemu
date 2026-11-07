@@ -304,6 +304,23 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
                           MemTxAttrs attrs, int flags, uintptr_t ra);
 
 /**
+ * cpu_check_watchpoint_phys:
+ * @cpu: cpu context
+ * @addr: guest virtual address
+ * @paddr: the physical address of @addr
+ * @len: access length
+ * @attrs: memory access attributes
+ * @flags: watchpoint access type
+ * @ra: unwind return address
+ *
+ * LEMU: cpu_check_watchpoint() that also checks the watchpoints on
+ * physical addresses (BP_PHYS) against [paddr, paddr+len).
+ */
+void cpu_check_watchpoint_phys(CPUState *cpu, vaddr addr, uint64_t paddr,
+                               vaddr len, MemTxAttrs attrs, int flags,
+                               uintptr_t ra);
+
+/**
  * cpu_watchpoint_address_matches:
  * @cpu: cpu context
  * @addr: guest virtual address
@@ -311,8 +328,20 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
  *
  * Return the watchpoint flags that apply to [addr, addr+len).
  * If no watchpoint is registered for the range, the result is 0.
+ * Watchpoints on physical addresses (BP_PHYS) do not count.
  */
 int cpu_watchpoint_address_matches(CPUState *cpu, vaddr addr, vaddr len);
+
+/**
+ * cpu_watchpoint_phys_matches:
+ * @cpu: cpu context
+ * @paddr: guest physical address
+ * @len: access length
+ *
+ * LEMU: the flags of the watchpoints on physical addresses (BP_PHYS)
+ * that apply to [paddr, paddr+len), or 0.
+ */
+int cpu_watchpoint_phys_matches(CPUState *cpu, uint64_t paddr, uint64_t len);
 
 /*
  * Common pointer_wrap implementations.

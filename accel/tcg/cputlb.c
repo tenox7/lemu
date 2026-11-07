@@ -1104,7 +1104,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     }
 
     wp_flags = cpu_watchpoint_address_matches(cpu, addr_page,
-                                              TARGET_PAGE_SIZE);
+                                              TARGET_PAGE_SIZE) |
+               cpu_watchpoint_phys_matches(cpu, paddr_page,
+                                           TARGET_PAGE_SIZE);
 
     index = tlb_index(cpu, mmu_idx, addr_page);
     te = tlb_entry(cpu, mmu_idx, addr_page);
@@ -1497,8 +1499,10 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
         if (flags & TLB_WATCHPOINT) {
             int wp_access = (access_type == MMU_DATA_STORE
                              ? BP_MEM_WRITE : BP_MEM_READ);
-            cpu_check_watchpoint(env_cpu(env), addr, size,
-                                 full->attrs, wp_access, retaddr);
+            cpu_check_watchpoint_phys(env_cpu(env), addr,
+                                      full->phys_addr |
+                                      (addr & ~TARGET_PAGE_MASK), size,
+                                      full->attrs, wp_access, retaddr);
         }
 
         /* Handle clean RAM pages.  */
@@ -1699,7 +1703,9 @@ static void mmu_watch_or_dirty(CPUState *cpu, MMULookupPageData *data,
     /* On watchpoint hit, this will longjmp out.  */
     if (flags & TLB_WATCHPOINT) {
         int wp = access_type == MMU_DATA_STORE ? BP_MEM_WRITE : BP_MEM_READ;
-        cpu_check_watchpoint(cpu, addr, size, full->attrs, wp, ra);
+        cpu_check_watchpoint_phys(cpu, addr,
+                                  full->phys_addr | (addr & ~TARGET_PAGE_MASK),
+                                  size, full->attrs, wp, ra);
         flags &= ~TLB_WATCHPOINT;
     }
 
@@ -1889,8 +1895,9 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
         if (full->slow_flags[MMU_DATA_LOAD] & TLB_WATCHPOINT) {
             wp_flags |= BP_MEM_READ;
         }
-        cpu_check_watchpoint(cpu, addr, size,
-                             full->attrs, wp_flags, retaddr);
+        cpu_check_watchpoint_phys(cpu, addr,
+                                  full->phys_addr | (addr & ~TARGET_PAGE_MASK),
+                                  size, full->attrs, wp_flags, retaddr);
     }
 
     return hostaddr;
