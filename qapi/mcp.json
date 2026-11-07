@@ -318,6 +318,10 @@
 #
 # @serial: serial ports
 #
+# @net: network backends, as "type info, NIC model MAC", such as
+#     "vmnet-bridged ifname=en0,lemu-vmnet pid 812, NIC pcnet
+#     52:54:00:12:34:57".  vmnet-bridged puts the VM on the LAN.
+#
 # @device-status: status codes that devices show, such as front
 #     panel LEDs, as "device: text"
 #
@@ -329,14 +333,14 @@
             'running': 'bool', 'consoles': [ 'McpConsoleInfo' ],
             '*default-console': 'int', '*pointer': 'McpPointer',
             'disks': [ 'McpDiskInfo' ], 'serial': [ 'str' ],
-            'device-status': [ 'str' ] } }
+            'net': [ 'str' ], 'device-status': [ 'str' ] } }
 
 ##
 # @vm-info:
 #     Describe the VM: name, machine, run state, consoles (index,
 #     size, mouse type), where the pointer is thought to be, disks
-#     (file, read-only, snapshot, tray) and serial ports.  Use it
-#     first.
+#     (file, read-only, snapshot, tray), serial ports and networks.
+#     Use it first.
 #
 # Features:
 #

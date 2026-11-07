@@ -77,6 +77,12 @@ const char mcp_instructions[] =
     " VM paused.\n"
     "- vm-info tells you whether disks are snapshot or read-only. If"
     " changes will persist, ask the user before risky steps.\n"
+    "- Networks: -nic user is NAT and needs nothing (hostfwd for ports)."
+    " On macOS, -nic vmnet-bridged,ifname=en0 puts the VM on the user's"
+    " LAN. It needs no sudo when /usr/local/bin/lemu-vmnet is installed:"
+    " run it to check, and it lists the interfaces. Give each bridged VM"
+    " its own mac=52:54:00:xx:xx:xx; a VM whose MAC another VM already"
+    " uses does not start. vm-info lists the networks.\n"
     "- VMs not started by you belong to the user. Touch them only when"
     " the user asked. Never stop or reset them.\n";
 

@@ -14,6 +14,7 @@
 #include "hw/core/status-text.h"
 #include "migration/snapshot.h"
 #include "monitor/mcp.h"
+#include "net/net.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block.h"
 #include "qapi/qapi-commands-control.h"
@@ -111,6 +112,46 @@ static McpDiskInfoList *mcp_disks(bool removable_only, int *count)
     return head;
 }
 
+/*
+ * One line per network backend, such as "vmnet-bridged ifname=en0,
+ * lemu-vmnet pid 812, NIC pcnet 52:54:00:12:34:57"; the types go into
+ * @types for the summary
+ */
+static void mcp_net_list(strList **tail, GString *types)
+{
+    int i, n = qemu_find_net_clients_except(NULL, NULL,
+                                            NET_CLIENT_DRIVER_NIC, 0);
+    g_autofree NetClientState **ncs = g_new0(NetClientState *, n + 1);
+
+    n = qemu_find_net_clients_except(NULL, ncs, NET_CLIENT_DRIVER_NIC, n);
+    for (i = 0; i < n; i++) {
+        NetClientState *nc = ncs[i], *peer = nc->peer;
+        const char *type = NetClientDriver_str(nc->info->type);
+        GString *s;
+
+        if (nc->info->type == NET_CLIENT_DRIVER_HUBPORT) {
+            continue;
+        }
+        s = g_string_new(type);
+        if (nc->info_str[0]) {
+            g_string_append_printf(s, " %s", nc->info_str);
+        }
+        if (peer && peer->info->type == NET_CLIENT_DRIVER_NIC) {
+            g_autofree char *mac =
+                qemu_mac_strdup_printf(qemu_get_nic(peer)->conf->macaddr.a);
+
+            g_string_append_printf(s, ", NIC %s %s",
+                                   peer->model ? peer->model : peer->name,
+                                   mac);
+        }
+        if (nc->link_down) {
+            g_string_append(s, ", link down");
+        }
+        QAPI_LIST_APPEND(tail, g_string_free(s, false));
+        g_string_append_printf(types, ", net %s", type);
+    }
+}
+
 static void mcp_status_one(Object *obj, const char *text, void *opaque)
 {
     strList ***tail = opaque;
@@ -127,6 +168,7 @@ McpVmInfo *qmp_vm_info(Error **errp)
     strList **stail = &vi->serial;
     strList **dtail = &vi->device_status, *d;
     g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GString) nets = g_string_new(NULL);
     QemuConsole *con, *dflt = qemu_console_lookup_default();
     int i, ndisks;
 
@@ -160,6 +202,7 @@ McpVmInfo *qmp_vm_info(Error **errp)
     }
     vi->disks = mcp_disks(false, &ndisks);
     mcp_serial_list(stail);
+    mcp_net_list(&vi->net, nets);
     status_text_foreach(mcp_status_one, &dtail);
 
     g_string_printf(s, "%s, machine %s, %s", *vi->name ? vi->name : "VM",
@@ -170,6 +213,7 @@ McpVmInfo *qmp_vm_info(Error **errp)
                                qemu_console_get_height(dflt, 0));
     }
     g_string_append_printf(s, ", %d disk%s", ndisks, ndisks == 1 ? "" : "s");
+    g_string_append(s, nets->str);
     for (d = vi->device_status; d; d = d->next) {
         g_string_append_printf(s, "; %s", d->value);
     }

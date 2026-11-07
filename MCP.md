@@ -326,6 +326,40 @@ Use these:
   [rsh-mcp](https://github.com/tenox7/rsh-mcp) runs commands and copies
   files over the network, which is faster.
 
+## Networking
+
+- **NAT, the default.** `-nic user,model=e1000` needs nothing. The guest
+  reaches the Internet but not the LAN. `hostfwd=tcp::2323-:23` gives
+  the host a port into the guest.
+- **On the LAN (macOS).**
+  `-nic vmnet-bridged,ifname=en0,model=e1000,mac=52:54:00:12:34:56`
+  bridges the VM to the Mac's `en0`. The guest gets its address from the
+  LAN, like any other computer there.
+- **No sudo.** Only root may use vmnet. When QEMU is not root, it starts
+  the setuid helper `/usr/local/bin/lemu-vmnet`. The user installs it
+  once from a LEMU build or kit:
+  `sudo install -o root -g admin -m 4750 build/lemu-vmnet /usr/local/bin/`
+  After that, everyone in group admin (the Mac's administrators), and
+  the agents they run, can start bridged VMs without a password.
+  `vmnet-shared` (NAT by macOS) and `vmnet-host` work the same way.
+- **Check it.** Run `/usr/local/bin/lemu-vmnet`. It says whether it is
+  ready and lists the interfaces you can bridge.
+- **One MAC address per VM.** Two VMs with one MAC address break each
+  other's network. A VM whose MAC address another vmnet VM already uses
+  stops at start, with an error that suggests a free address. When you
+  start a copy of the user's VM, give the copy its own `mac=`.
+- **`vm-info` lists the networks,** such as
+  `vmnet-bridged ifname=en0,lemu-vmnet pid 812, NIC e1000 52:54:00:12:34:56`.
+  `lemu-vmnet stopped` and `link down` there mean that the helper
+  stopped: the VM runs on with its network cable unplugged.
+- **How the helper works.** It starts the vmnet interface as root, gives
+  up root for good, and then passes the frames between QEMU and vmnet.
+  It stops when QEMU stops. It logs each start and stop:
+  `log show --last 1h --predicate 'process == "lemu-vmnet"'`.
+  The source is [lemu-vmnet.c](lemu-vmnet.c). The installed helper keeps
+  working with new LEMU builds. Only a change of its protocol needs a
+  new install, and QEMU then says so.
+
 ## Safety
 
 - **Other people's VMs.** `vm-list` shows which VMs an agent started

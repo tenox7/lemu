@@ -18,6 +18,10 @@ It emulates **old computers**, and it is made to be used **with AI agents**.
 - **Ready-to-run kits.** One portable folder per guest: LEMU for macOS,
   Linux and Windows, the disk, the firmware and `run.sh` / `run.cmd`.
   The scripts that build the kits are in [machines/](machines).
+- **Bridged networking without sudo (macOS).** Install the setuid helper
+  `lemu-vmnet` once, and VMs can use `vmnet-bridged`, `vmnet-shared` and
+  `vmnet-host` without sudo or a password. See
+  [MCP.md](MCP.md#networking).
 - **Seamless mouse for Windows NT.** [machines/vmmouse](machines/vmmouse)
   is a mouse driver for NT 3.1 to 4.0 on the PC, the Magnum, the RM200,
   the Jensen and the 40P. The window stops grabbing the mouse, and
