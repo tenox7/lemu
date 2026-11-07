@@ -1196,6 +1196,15 @@ static int cirrus_get_bpp(VGACommonState *s1)
     return ret;
 }
 
+/*
+ * SR7 bit 0 selects packed pixels at get_bpp() depth. The chip then ignores
+ * the shift mode in GR05: SNI's NT 3.51 driver for the RM200 leaves GR05 at 0.
+ */
+static bool cirrus_native_mode(VGACommonState *s)
+{
+    return s->sr[0x07] & 0x01;
+}
+
 static void cirrus_get_resolution(VGACommonState *s, int *pwidth, int *pheight)
 {
     int width, height;
@@ -2949,6 +2958,7 @@ void cirrus_init_common(CirrusVGAState *s, Object *owner,
     s->linear_mmio_mask = s->real_vram_size - 256;
 
     s->vga.get_bpp = cirrus_get_bpp;
+    s->vga.native_mode = cirrus_native_mode;
     s->vga.get_params = cirrus_get_params;
     s->vga.get_resolution = cirrus_get_resolution;
     s->vga.cursor_invalidate = cirrus_cursor_invalidate;
