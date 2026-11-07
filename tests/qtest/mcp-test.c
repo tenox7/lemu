@@ -4291,6 +4291,163 @@ static void test_memory_search_refine(void)
 }
 
 /*
+ * A BIOS that waits in a loop for the word at 0x500 to be other than
+ * 0, then clears it and counts at 0x502, in a block of its own
+ */
+static char *debug_bios_cover(void)
+{
+    static const uint8_t code[] = {
+        0xa1, 0x00, 0x05,                   /* f0100: mov ax, [0x500] */
+        0x85, 0xc0,                         /* f0103: test ax, ax */
+        0x75, 0x02,                         /* f0105: jnz f0109 */
+        0xeb, 0xf7,                         /* f0107: jmp f0100 */
+        0xc7, 0x06, 0x00, 0x05, 0x00, 0x00, /* f0109: mov [0x500], 0 */
+        0xff, 0x06, 0x02, 0x05,             /* f010f: inc [0x502] */
+        0xeb, 0xeb,                         /* f0113: jmp f0100 */
+    };
+    static const uint8_t reset[] = {
+        0xea, 0x00, 0x01, 0x00, 0xf0,       /* jmp f000:0100 */
+    };
+    g_autofree uint8_t *rom = g_malloc(64 * KiB);
+    char *path = NULL;
+    int fd = g_file_open_tmp("mcp-bios-XXXXXX", &path, NULL);
+
+    g_assert(fd >= 0);
+    memset(rom, 0xf4, 64 * KiB);
+    memcpy(rom + 0x100, code, sizeof(code));
+    memcpy(rom + 0xfff0, reset, sizeof(reset));
+    g_assert_cmpint(write(fd, rom, 64 * KiB), ==, 64 * KiB);
+    close(fd);
+    return path;
+}
+
+/* Write the word that BIOS waits for, and wait till it counted it */
+static void cover_poke(QTestState *qts)
+{
+    uint16_t count = qtest_readw(qts, 0x502);
+    int i;
+
+    qtest_writew(qts, 0x500, 1);
+    for (i = 0; i < 10000 && qtest_readw(qts, 0x502) == count; i++) {
+        g_usleep(1000);
+    }
+    g_assert_cmpint(qtest_readw(qts, 0x502), ==, (uint16_t)(count + 1));
+}
+
+static QDict *cover_range(QDict *ret)
+{
+    return qobject_to(QDict, qlist_peek(qdict_get_qlist(ret, "ranges")));
+}
+
+/*
+ * debug-coverage leaves out the code that runs anyway and finds the
+ * block that handles the word; refine keeps it or drops it
+ */
+static void test_debug_coverage(void)
+{
+    g_autofree char *bios = debug_bios_cover();
+    QTestState *qts;
+    QDict *ret, *r;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s", bios);
+    debug_check_error(qts, "debug-coverage", "{'action': 'stop'}",
+                      "nothing is recording");
+    ret = debug_ok(qts, "debug-coverage", "{'action': 'start',"
+                   " 'quiet-ms': 0}");
+    g_assert(qdict_get_bool(ret, "recording"));
+    g_assert(!qdict_haskey(ret, "ran"));
+    debug_summary_has(ret, "No quiet part. Recording now");
+    qobject_unref(ret);
+    debug_check_error(qts, "debug-coverage", "{'action': 'stop',"
+                      " 'refine': true}", "stop once without refine first");
+    qobject_unref(debug_ok(qts, "debug-coverage", "{'action': 'stop'}"));
+
+    /* once the loop runs, it is all that runs while quiet */
+    cover_poke(qts);
+    ret = debug_ok(qts, "debug-coverage", "{'action': 'start',"
+                   " 'quiet-ms': 300}");
+    g_assert(qdict_get_bool(ret, "recording"));
+    g_assert_cmpint(qdict_get_int(ret, "ran"), ==, 2);
+    g_assert_cmpint(qdict_get_int(ret, "milliseconds"), >=, 300);
+    debug_summary_has(ret, " ms), 2 blocks of code ran; stop leaves them"
+                      " out. Recording now");
+    qobject_unref(ret);
+    cover_poke(qts);
+    ret = debug_ok(qts, "debug-coverage", "{'action': 'stop'}");
+    g_assert(!qdict_get_bool(ret, "recording"));
+    g_assert_cmpint(qdict_get_int(ret, "ran"), ==, 3);
+    g_assert_cmpint(qdict_get_int(ret, "quiet"), ==, 2);
+    g_assert_cmpint(qdict_get_int(ret, "blocks"), ==, 1);
+    r = cover_range(ret);
+    g_assert_cmpstr(qdict_get_str(r, "address"), ==, "0xf0109");
+    g_assert_cmpstr(qdict_get_str(r, "end"), ==, "0xf0114");
+    g_assert_cmpstr(qdict_get_str(r, "physical"), ==, "0xf0109");
+    g_assert_cmpint(qdict_get_int(r, "blocks"), ==, 1);
+    g_assert_cmpint(qdict_get_int(r, "runs"), ==, 1);
+    debug_summary_has(ret, "3 blocks of code ran; 2 of them ran in the quiet"
+                      " part too and are left out.\nOn the list: 1 block,"
+                      " in 1 range by address:\n0xf0109..0xf0114"
+                      " (physical 0xf0109): 1 block, ran 1 time\n");
+    debug_summary_has(ret, "give its address to debug-run.");
+    qobject_unref(ret);
+
+    /* the same again: it stays */
+    qobject_unref(debug_ok(qts, "debug-coverage", "{'action': 'start',"
+                           " 'quiet-ms': 0}"));
+    cover_poke(qts);
+    cover_poke(qts);
+    ret = debug_ok(qts, "debug-coverage", "{'action': 'stop',"
+                   " 'refine': true}");
+    g_assert(!qdict_haskey(ret, "quiet"));
+    g_assert_cmpint(qdict_get_int(ret, "blocks"), ==, 1);
+    g_assert_cmpint(qdict_get_int(cover_range(ret), "runs"), ==, 2);
+    debug_summary_has(ret, "Of the 1 block on the list, 1 ran again: it"
+                      " stays on the list, in 1 range by address:\n");
+    qobject_unref(ret);
+
+    /* nothing happens: it did not run, so it stays */
+    qobject_unref(debug_ok(qts, "debug-coverage", "{'action': 'start',"
+                           " 'quiet-ms': 0}"));
+    ret = debug_ok(qts, "debug-coverage", "{'action': 'stop',"
+                   " 'refine': true, 'ran': false}");
+    g_assert_cmpint(qdict_get_int(ret, "blocks"), ==, 1);
+    debug_summary_has(ret, "Of the 1 block on the list, 1 did not run: it"
+                      " stays on the list");
+    qobject_unref(ret);
+
+    /* it runs: it goes */
+    qobject_unref(debug_ok(qts, "debug-coverage", "{'action': 'start',"
+                           " 'quiet-ms': 0}"));
+    cover_poke(qts);
+    ret = debug_ok(qts, "debug-coverage", "{'action': 'stop',"
+                   " 'refine': true, 'ran': false}");
+    g_assert_cmpint(qdict_get_int(ret, "blocks"), ==, 0);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "ranges")), ==, 0);
+    debug_summary_has(ret, "Of the 1 block on the list, every one ran. The"
+                      " list is empty");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-coverage", "{'action': 'stop'}",
+                      "nothing is recording");
+    debug_check_error(qts, "debug-coverage", "{'action': 'start',"
+                      " 'quiet-ms': 60001}", "quiet-ms must be 0 to 60000");
+    debug_check_error(qts, "debug-coverage", "{'action': 'start',"
+                      " 'max': 5}", "go with stop");
+    debug_check_error(qts, "debug-coverage", "{'action': 'stop',"
+                      " 'quiet-ms': 5}", "quiet-ms goes with start");
+    debug_check_error(qts, "debug-coverage", "{'action': 'stop',"
+                      " 'ran': false}", "ran goes with refine");
+    debug_check_error(qts, "debug-coverage", "{'action': 'stop',"
+                      " 'max': 501}", "max must be 0 to 500");
+    qtest_qmp_assert_success(qts, "{'execute': 'stop'}");
+    debug_check_error(qts, "debug-coverage", "{'action': 'start'}",
+                      "the VM is paused");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
  * memory-write changes RAM and ROM but no device, and code made from
  * the old bytes goes away; debug-profile finds the loop
  */
@@ -4945,6 +5102,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/search", test_memory_search);
         qtest_add_func("/mcp/debug/search-refine",
                        test_memory_search_refine);
+        qtest_add_func("/mcp/debug/coverage", test_debug_coverage);
         qtest_add_func("/mcp/debug/symbols", test_debug_symbols);
         qtest_add_func("/mcp/debug/condition", test_debug_condition);
         qtest_add_func("/mcp/debug/condition-hits",

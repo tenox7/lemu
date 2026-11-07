@@ -39,6 +39,7 @@
 #include "exec/debug-cond.h"
 #include "exec/excp-watch.h"
 #include "exec/tb-flush.h"
+#include "exec/tb-cover.h"
 #include "exec/tb-history.h"
 #include "exec/watchpoint.h"
 #include "qemu/bitops.h"
@@ -6768,6 +6769,546 @@ McpProfile *coroutine_fn qmp_debug_profile(bool has_interval_ms,
     res->summary = g_strdup(s->str);
     mcp_profile_unref(p);
     return res;
+}
+
+/*
+ * debug-coverage.  While it records, each CPU notes every block of
+ * translated code it enters, in a table of its own (tb-cover.h); that
+ * keeps its blocks from chaining.  The tables are swapped with the
+ * vCPUs paused.  A block is known by where its code is in RAM, so one
+ * address in two processes is two blocks.
+ */
+
+#define COVER_QUIET_MS          2000
+#define COVER_QUIET_MAX_MS      60000
+#define COVER_LIMIT_MS          (10 * 60 * 1000)
+#define COVER_LIST              20
+#define COVER_LIST_MAX          500
+#define COVER_GAP               64      /* most bytes between blocks of a
+                                           range */
+
+typedef struct McpCoverBlock {
+    uint64_t key;               /* as in CPUTBCoverEntry; first, for the
+                                   hash table */
+    uint64_t pc;
+    uint32_t size;
+    uint64_t runs;
+} McpCoverBlock;
+
+static struct {
+    bool on;                    /* the CPUs note the blocks they run */
+    bool busy;                  /* a start is in its quiet part */
+    bool timed_out;             /* the time limit stopped the recording */
+    int64_t since;              /* when the recording began, realtime ms */
+    int64_t ms;                 /* how long it recorded, once stopped */
+    uint64_t lost;              /* runs the tables had no room for */
+    GHashTable *quiet;          /* McpCoverBlock by key: the quiet part */
+    GHashTable *rec;            /* the same: the recording, once stopped */
+    GHashTable *list;           /* the same: what the last stop kept */
+    QEMUTimer *limit;
+} mcp_cover;
+
+static GHashTable *mcp_cover_blocks(void)
+{
+    return g_hash_table_new_full(g_int64_hash, g_int64_equal, NULL, g_free);
+}
+
+/*
+ * Take the CPUs' tables, and give them new ones if @again.  The vCPUs
+ * pause for it if the VM runs.
+ */
+static GPtrArray *mcp_cover_swap(bool again)
+{
+    GPtrArray *tables = g_ptr_array_new();
+    bool running = runstate_is_running();
+    CPUState *cpu;
+
+    if (running) {
+        pause_all_vcpus();
+    }
+    CPU_FOREACH(cpu) {
+        if (cpu->tb_cover) {
+            g_ptr_array_add(tables, cpu->tb_cover);
+        }
+        cpu->tb_cover = again ? cpu_tb_cover_new() : NULL;
+        tcg_update_cflags(cpu);
+    }
+    if (running) {
+        resume_all_vcpus();
+    }
+    return tables;
+}
+
+/* The blocks in @tables, which it frees, by key */
+static GHashTable *mcp_cover_merge(GPtrArray *tables)
+{
+    GHashTable *t = mcp_cover_blocks();
+    guint i;
+
+    for (i = 0; i < tables->len; i++) {
+        CPUTBCover *c = g_ptr_array_index(tables, i);
+        uint32_t j;
+
+        for (j = 0; j <= c->mask; j++) {
+            CPUTBCoverEntry *e = &c->e[j];
+            McpCoverBlock *b;
+
+            if (!e->runs) {
+                continue;
+            }
+            b = g_hash_table_lookup(t, &e->key);
+            if (!b) {
+                b = g_new0(McpCoverBlock, 1);
+                b->key = e->key;
+                b->pc = e->pc;
+                g_hash_table_insert(t, &b->key, b);
+            }
+            b->size = MAX(b->size, e->size);
+            b->runs += e->runs;
+        }
+        mcp_cover.lost += c->lost;
+        cpu_tb_cover_free(c);
+    }
+    g_ptr_array_unref(tables);
+    return t;
+}
+
+static void mcp_cover_end_recording(void)
+{
+    mcp_cover.rec = mcp_cover_merge(mcp_cover_swap(false));
+    mcp_cover.on = false;
+    mcp_cover.ms = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - mcp_cover.since;
+    timer_del(mcp_cover.limit);
+}
+
+/* A recording nobody stops ends by itself, so the guest runs fast again */
+static void mcp_cover_limit(void *opaque)
+{
+    if (mcp_cover.on && !mcp_cover.busy) {
+        mcp_cover_end_recording();
+        mcp_cover.timed_out = true;
+    }
+}
+
+typedef struct McpRamPhys {
+    uint64_t ram;
+    hwaddr pa;
+    bool found;
+} McpRamPhys;
+
+static bool mcp_ram_phys_range(Int128 start, Int128 len,
+                               const MemoryRegion *mr, hwaddr off,
+                               void *opaque)
+{
+    McpRamPhys *r = opaque;
+    ram_addr_t base = memory_region_get_ram_addr(mr);
+
+    if (base == RAM_ADDR_INVALID) {
+        return false;
+    }
+    base += off;
+    if (r->ram >= base && r->ram - base < int128_get64(len)) {
+        r->pa = int128_get64(start) + (r->ram - base);
+        r->found = true;
+        return true;
+    }
+    return false;
+}
+
+/* Where code at @ram in RAM or ROM shows in physical memory, the lowest */
+static bool mcp_ram_phys(uint64_t ram, hwaddr *pa)
+{
+    McpRamPhys r = { .ram = ram };
+
+    if (ram & TB_COVER_NOT_RAM) {
+        return false;
+    }
+    WITH_RCU_READ_LOCK_GUARD() {
+        flatview_for_each_range(address_space_to_flatview(&address_space_memory),
+                                mcp_ram_phys_range, &r);
+    }
+    *pa = r.pa;
+    return r.found;
+}
+
+static gint mcp_cover_by_key(gconstpointer a, gconstpointer b)
+{
+    const McpCoverBlock *x = *(McpCoverBlock * const *)a;
+    const McpCoverBlock *y = *(McpCoverBlock * const *)b;
+
+    return x->key < y->key ? -1 : x->key > y->key;
+}
+
+typedef struct McpCoverSpan {
+    uint64_t key;               /* where it is, to sort the same pc */
+    uint64_t pc, end;           /* the first and the last byte */
+    int64_t blocks;
+    uint64_t runs;
+} McpCoverSpan;
+
+static gint mcp_cover_span_cmp(gconstpointer a, gconstpointer b)
+{
+    const McpCoverSpan *x = a, *y = b;
+
+    if (x->pc != y->pc) {
+        return x->pc < y->pc ? -1 : 1;
+    }
+    return x->key < y->key ? -1 : x->key > y->key;
+}
+
+/*
+ * The blocks of @t as ranges of code close together: in RAM, and at
+ * addresses that stay as far apart, so the same code mapped twice or
+ * two processes don't mix.  By address.
+ */
+static GArray *mcp_cover_spans(GHashTable *t)
+{
+    g_autoptr(GPtrArray) all = g_ptr_array_new();
+    GArray *spans = g_array_new(false, false, sizeof(McpCoverSpan));
+    McpCoverSpan *sp = NULL;
+    const McpCoverBlock *prev = NULL;
+    GHashTableIter iter;
+    gpointer value;
+    guint i;
+
+    g_hash_table_iter_init(&iter, t);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        g_ptr_array_add(all, value);
+    }
+    g_ptr_array_sort(all, mcp_cover_by_key);
+    for (i = 0; i < all->len; i++) {
+        const McpCoverBlock *b = g_ptr_array_index(all, i);
+        uint64_t last = b->pc + MAX(b->size, 1) - 1;
+
+        if (!prev || b->key - b->pc != prev->key - prev->pc ||
+            b->key > sp->key + (sp->end - sp->pc) + 1 + COVER_GAP) {
+            McpCoverSpan n = { .key = b->key, .pc = b->pc, .end = last };
+
+            g_array_append_val(spans, n);
+            sp = &g_array_index(spans, McpCoverSpan, spans->len - 1);
+        }
+        sp->end = MAX(sp->end, last);
+        sp->blocks++;
+        sp->runs += b->runs;
+        prev = b;
+    }
+    g_array_sort(spans, mcp_cover_span_cmp);
+    return spans;
+}
+
+/* "250 ms", "2.5 s" */
+static void mcp_cover_append_time(GString *s, int64_t ms)
+{
+    if (ms < 1000) {
+        g_string_append_printf(s, "%" PRId64 " ms", ms);
+    } else {
+        g_string_append_printf(s, "%.1f s", ms / 1000.0);
+    }
+}
+
+static McpCoverage *mcp_cover_start(bool has_quiet_ms, int64_t quiet_ms,
+                                    Error **errp)
+{
+    g_auto(QemuInputCtx) local = { 0 };
+    QemuInputCtx *ctx = mcp_current_input_ctx();
+    g_autoptr(GString) s = g_string_new(NULL);
+    McpCoverage *res;
+    bool was_on = mcp_cover.on;
+    int64_t start, now;
+
+    quiet_ms = has_quiet_ms ? quiet_ms : COVER_QUIET_MS;
+    if (quiet_ms < 0 || quiet_ms > COVER_QUIET_MAX_MS) {
+        error_setg(errp, "quiet-ms must be 0 to %d", COVER_QUIET_MAX_MS);
+        return NULL;
+    }
+    if (quiet_ms && !runstate_is_running()) {
+        error_setg(errp, "the VM is paused, so nothing would run in the"
+                   " quiet part: resume it (vm-power), or give quiet-ms 0");
+        return NULL;
+    }
+    if (!ctx) {
+        qemu_input_ctx_init(&local, NULL);
+        ctx = &local;
+    }
+    if (!mcp_cover.limit) {
+        mcp_cover.limit = timer_new_ms(QEMU_CLOCK_REALTIME, mcp_cover_limit,
+                                       NULL);
+    }
+
+    /* what an earlier start recorded goes; the list stays */
+    if (mcp_cover.on) {
+        g_hash_table_unref(mcp_cover_merge(mcp_cover_swap(false)));
+        mcp_cover.on = false;
+        timer_del(mcp_cover.limit);
+    }
+    g_clear_pointer(&mcp_cover.rec, g_hash_table_unref);
+    g_clear_pointer(&mcp_cover.quiet, g_hash_table_unref);
+    mcp_cover.timed_out = false;
+    mcp_cover.lost = 0;
+
+    res = g_new0(McpCoverage, 1);
+    start = now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (quiet_ms) {
+        GPtrArray *tables;
+
+        mcp_cover.busy = true;
+        g_ptr_array_unref(mcp_cover_swap(true));
+        while (now < start + quiet_ms && !ctx->cancelled) {
+            qemu_co_sleep_ns_wakeable(&ctx->sleep, QEMU_CLOCK_REALTIME,
+                                      (start + quiet_ms - now) * SCALE_MS);
+            now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        }
+        /* the quiet part's tables, and new ones for the recording */
+        tables = mcp_cover_swap(!ctx->cancelled);
+        mcp_cover.busy = false;
+        mcp_cover.quiet = mcp_cover_merge(tables);
+        if (ctx->cancelled) {
+            g_clear_pointer(&mcp_cover.quiet, g_hash_table_unref);
+            qapi_free_McpCoverage(res);
+            error_setg(errp, "cancelled");
+            return NULL;
+        }
+        res->has_milliseconds = true;
+        res->milliseconds = now - start;
+        res->has_ran = true;
+        res->ran = g_hash_table_size(mcp_cover.quiet);
+        g_string_assign(s, "In the quiet part (");
+        mcp_cover_append_time(s, res->milliseconds);
+        g_string_append_printf(s, "), %" PRId64 " block%s of code ran; stop"
+                               " leaves %s out. ", res->ran,
+                               res->ran == 1 ? "" : "s",
+                               res->ran == 1 ? "it" : "them");
+    } else {
+        g_ptr_array_unref(mcp_cover_swap(true));
+        g_string_assign(s, "No quiet part. ");
+    }
+    mcp_cover.on = true;
+    mcp_cover.since = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    timer_mod(mcp_cover.limit, mcp_cover.since + COVER_LIMIT_MS);
+    res->recording = true;
+    g_string_append(s, "Recording now: do the thing, then call"
+                    " debug-coverage with action stop. The guest runs slower"
+                    " until then.");
+    if (was_on) {
+        g_string_append(s, " (The recording that was under way is thrown"
+                        " away.)");
+    }
+    res->summary = g_strdup(s->str);
+    return res;
+}
+
+static McpCoverage *mcp_cover_stop(bool refine, bool ran, int64_t max,
+                                   Error **errp)
+{
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GHashTable) rec = NULL;
+    g_autoptr(GHashTable) quiet = NULL;
+    g_autoptr(GHashTable) old = NULL;
+    g_autoptr(GArray) spans = NULL;
+    GHashTable *list;
+    GHashTableIter iter;
+    gpointer value;
+    McpCoverage *res;
+    McpCoverageRangeList **tail;
+    int64_t nquiet = 0, listed = 0;
+    guint before = 0;
+    guint i;
+
+    if (mcp_cover.busy) {
+        error_setg(errp, "debug-coverage start is still in its quiet part");
+        return NULL;
+    }
+    if (!mcp_cover.on && !mcp_cover.rec) {
+        error_setg(errp, "nothing is recording: call debug-coverage with"
+                   " action start first");
+        return NULL;
+    }
+    if (refine && !mcp_cover.list) {
+        error_setg(errp, "refine looks at the blocks the stop before kept:"
+                   " stop once without refine first");
+        return NULL;
+    }
+    if (mcp_cover.on) {
+        mcp_cover_end_recording();
+    }
+    rec = g_steal_pointer(&mcp_cover.rec);
+    quiet = g_steal_pointer(&mcp_cover.quiet);
+
+    res = g_new0(McpCoverage, 1);
+    res->has_milliseconds = true;
+    res->milliseconds = mcp_cover.ms;
+    res->has_ran = true;
+    res->ran = g_hash_table_size(rec);
+
+    /* what ran, less what ran in the quiet part */
+    list = mcp_cover_blocks();
+    g_hash_table_iter_init(&iter, rec);
+    while (g_hash_table_iter_next(&iter, NULL, &value)) {
+        McpCoverBlock *b = value;
+
+        if (quiet && g_hash_table_contains(quiet, &b->key)) {
+            nquiet++;
+        } else if (!refine || (ran && g_hash_table_contains(mcp_cover.list,
+                                                            &b->key))) {
+            g_hash_table_iter_steal(&iter);
+            g_hash_table_insert(list, &b->key, b);
+        }
+    }
+    if (refine) {
+        old = g_steal_pointer(&mcp_cover.list);
+        before = g_hash_table_size(old);
+    }
+    if (refine && !ran) {
+        /* the blocks on the list that did not run at all */
+        g_hash_table_iter_init(&iter, old);
+        while (g_hash_table_iter_next(&iter, NULL, &value)) {
+            McpCoverBlock *b = value;
+
+            if (!g_hash_table_contains(rec, &b->key) &&
+                !(quiet && g_hash_table_contains(quiet, &b->key))) {
+                g_hash_table_iter_steal(&iter);
+                g_hash_table_insert(list, &b->key, b);
+            }
+        }
+    }
+    g_clear_pointer(&mcp_cover.list, g_hash_table_unref);
+    mcp_cover.list = list;
+    res->has_quiet = !!quiet;
+    res->quiet = nquiet;
+    res->has_blocks = true;
+    res->blocks = g_hash_table_size(list);
+
+    spans = mcp_cover_spans(list);
+    res->has_ranges = true;
+    tail = &res->ranges;
+    for (i = 0; i < spans->len && i < max; i++) {
+        McpCoverSpan *sp = &g_array_index(spans, McpCoverSpan, i);
+        McpCoverageRange *r = g_new0(McpCoverageRange, 1);
+        hwaddr pa;
+
+        r->address = g_strdup_printf("0x%" PRIx64, sp->pc);
+        r->end = g_strdup_printf("0x%" PRIx64, sp->end);
+        if (mcp_ram_phys(sp->key, &pa)) {
+            r->physical = g_strdup_printf("0x%" HWADDR_PRIx, pa);
+        }
+        r->symbol = mcp_sym_name(sp->pc);
+        r->blocks = sp->blocks;
+        r->runs = sp->runs;
+        QAPI_LIST_APPEND(tail, r);
+        listed++;
+    }
+
+    g_string_assign(s, "Recorded ");
+    mcp_cover_append_time(s, res->milliseconds);
+    g_string_append_printf(s, ": %" PRId64 " block%s of code ran", res->ran,
+                           res->ran == 1 ? "" : "s");
+    if (quiet) {
+        g_string_append_printf(s, "; %" PRId64 " of them ran in the quiet"
+                               " part too and %s left out", nquiet,
+                               nquiet == 1 ? "is" : "are");
+    }
+    g_string_append(s, ".\n");
+    if (refine) {
+        g_string_append_printf(s, "Of the %u block%s on the list, ",
+                               before, before == 1 ? "" : "s");
+        if (!res->blocks) {
+            g_string_append_printf(s, "%s. The list is empty: to begin"
+                                   " again, start, and stop without"
+                                   " refine.", ran ? "none ran again"
+                                                   : "every one ran");
+        } else {
+            g_string_append_printf(s, "%" PRId64 " %s: %s on the list",
+                                   res->blocks,
+                                   ran ? "ran again" : "did not run",
+                                   res->blocks == 1 ? "it stays" :
+                                   "they stay");
+        }
+    } else if (!res->blocks) {
+        g_string_append(s, "The list is empty.");
+    } else {
+        g_string_append_printf(s, "On the list: %" PRId64 " block%s",
+                               res->blocks, res->blocks == 1 ? "" : "s");
+    }
+    if (res->blocks) {
+        g_string_append_printf(s, ", in %u range%s by address", spans->len,
+                               spans->len == 1 ? "" : "s");
+        if (listed < spans->len) {
+            g_string_append_printf(s, "; the first %" PRId64, listed);
+        }
+        g_string_append(s, listed ? ":\n" : ".");
+    }
+    for (tail = &res->ranges; *tail; tail = &(*tail)->next) {
+        McpCoverageRange *r = (*tail)->value;
+
+        g_string_append_printf(s, "%s..%s%s%s%s", r->address, r->end,
+                               r->symbol ? " <" : "",
+                               r->symbol ? r->symbol : "",
+                               r->symbol ? ">" : "");
+        if (r->physical) {
+            g_string_append_printf(s, " (physical %s)", r->physical);
+        }
+        g_string_append_printf(s, ": %" PRId64 " block%s, ran %" PRId64
+                               " time%s\n", r->blocks,
+                               r->blocks == 1 ? "" : "s", r->runs,
+                               r->runs == 1 ? "" : "s");
+    }
+    if (mcp_cover.timed_out) {
+        g_string_append_printf(s, "\nRecording had stopped by itself after"
+                               " %d minutes.", COVER_LIMIT_MS / 60000);
+    }
+    if (mcp_cover.lost) {
+        g_string_append_printf(s, "\nThe CPUs ran more blocks than it could"
+                               " note: %" PRIu64 " were not noted.",
+                               mcp_cover.lost);
+    }
+    if (spans->len > 1) {
+        g_string_append(s, "\nTo narrow the list down: start again, do the"
+                        " same thing, and stop with refine: true; or do"
+                        " something else (or nothing), and stop with"
+                        " refine: true and ran: false.");
+    }
+    if (res->blocks) {
+        g_string_append(s, "\nTo stop at a block, give its address to"
+                        " debug-run.");
+    }
+    res->summary = g_strdup(g_strchomp(s->str));
+    return res;
+}
+
+McpCoverage *coroutine_fn qmp_debug_coverage(McpCoverageAction action,
+                                             bool has_quiet_ms,
+                                             int64_t quiet_ms,
+                                             bool has_refine, bool refine,
+                                             bool has_ran, bool ran,
+                                             bool has_max, int64_t max,
+                                             Error **errp)
+{
+    if (!tcg_enabled()) {
+        error_setg(errp, "debug-coverage needs TCG (-accel tcg)");
+        return NULL;
+    }
+    refine = has_refine && refine;
+    if (has_ran && !refine) {
+        error_setg(errp, "ran goes with refine");
+        return NULL;
+    }
+    if (action == MCP_COVERAGE_ACTION_START) {
+        if (has_refine || has_max) {
+            error_setg(errp, "refine, ran and max go with stop");
+            return NULL;
+        }
+        return mcp_cover_start(has_quiet_ms, quiet_ms, errp);
+    }
+    if (has_quiet_ms) {
+        error_setg(errp, "quiet-ms goes with start");
+        return NULL;
+    }
+    max = has_max ? max : COVER_LIST;
+    if (max < 0 || max > COVER_LIST_MAX) {
+        error_setg(errp, "max must be 0 to %d", COVER_LIST_MAX);
+        return NULL;
+    }
+    return mcp_cover_stop(refine, !has_ran || ran, max, errp);
 }
 
 /*

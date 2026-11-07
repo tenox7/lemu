@@ -2154,6 +2154,123 @@
   'if': 'CONFIG_TCG' }
 
 ##
+# @McpCoverageAction:
+#     What @debug-coverage does.
+#
+# @start: record the code that runs anyway (@quiet-ms), then begin
+#     recording the code that runs
+#
+# @stop: stop recording, and list the code that ran
+#
+# Since: 11.2
+##
+{ 'enum': 'McpCoverageAction',
+  'data': [ 'start', 'stop' ],
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpCoverageRange:
+#     Blocks of code close together in memory, all on the list.
+#
+# @address: where the first of them starts: the address the CPU ran
+#     it at, in hex
+#
+# @end: the last byte of the last of them, in hex
+#
+# @physical: @address as a physical address, when the code is in RAM
+#     or ROM
+#
+# @symbol: @address as a symbol and an offset (jiffies+0x8), when
+#     @debug-symbols loaded one there
+#
+# @blocks: how many blocks of code
+#
+# @runs: how many times the CPUs ran them, all told, while it recorded
+#     (with @refine and @ran false: in the recording before)
+#
+# Since: 11.2
+##
+{ 'struct': 'McpCoverageRange',
+  'data': { 'address': 'str', 'end': 'str', '*physical': 'str',
+            '*symbol': 'str', 'blocks': 'int', 'runs': 'int' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpCoverage:
+#     What @debug-coverage returns.
+#
+# @recording: whether the CPUs note the code they run now
+#
+# @milliseconds: how long the quiet part took (start), or how long it
+#     recorded (stop)
+#
+# @ran: how many blocks of code ran in the quiet part (start), or
+#     while it recorded (stop)
+#
+# @quiet: with stop: how many of the blocks that ran had run in the
+#     quiet part too; they are not on the list
+#
+# @blocks: with stop: how many blocks are on the list now
+#
+# @ranges: with stop: the blocks on the list, as ranges of code close
+#     together, by address, up to @max
+#
+# Since: 11.2
+##
+{ 'struct': 'McpCoverage',
+  'base': 'McpResult',
+  'data': { 'recording': 'bool', '*milliseconds': 'int', '*ran': 'int',
+            '*quiet': 'int', '*blocks': 'int',
+            '*ranges': [ 'McpCoverageRange' ] },
+  'if': 'CONFIG_TCG' }
+
+##
+# @debug-coverage:
+#     Find the code that runs for one thing the guest does, such as
+#     handling a click, a key or a command.  Call it with start, do
+#     the thing (with the other tools), then call it with stop.  Start
+#     first records a quiet part, in which you do nothing, to learn
+#     the code that runs anyway (idle loops, timers, a blinking
+#     cursor); stop leaves that code out and lists the rest: the
+#     blocks of code that ran, as ranges by address.  To narrow the
+#     list down, record again and stop with @refine: do the same thing
+#     again and keep the blocks that ran again, or do something else
+#     (or nothing) and drop the blocks that ran (@ran false).  The
+#     guest runs slower while it records, and recording stops by
+#     itself after 10 minutes.  To stop at a block, give its address
+#     to debug-run.
+#
+# @action: start or stop
+#
+# @quiet-ms: with start: how long the quiet part takes, in
+#     milliseconds; 0 for none.  The VM must run.  (default: 2000, at
+#     most 60000)
+#
+# @refine: with stop: look only at the blocks on the list that the
+#     stop before made (or kept), and keep the ones that ran while it
+#     recorded (see @ran).  (default: false)
+#
+# @ran: with @refine: true keeps the blocks on the list that ran
+#     while it recorded, and not in its quiet part; false keeps the
+#     ones that did not run at all (default: true)
+#
+# @max: with stop: list this many ranges, up to 500 (default: 20)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# Since: 11.2
+##
+{ 'command': 'debug-coverage',
+  'data': { 'action': 'McpCoverageAction', '*quiet-ms': 'int',
+            '*refine': 'bool', '*ran': 'bool', '*max': 'int' },
+  'returns': 'McpCoverage',
+  'features': [ 'mcp' ],
+  'coroutine': true,
+  'if': 'CONFIG_TCG' }
+
+##
 # @McpMemoryWriteResult:
 #     What @memory-write returns.
 #

@@ -67,6 +67,7 @@ only when exactly one VM is running and you started it.
 | `debug-trace` | Log each arrival at an address, access to watched memory (by CPUs or devices) or exception, with registers and memory, while the guest runs on |
 | `debug-step` | Run one CPU an instruction at a time, and show each one |
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
+| `debug-coverage` | Record the code that runs while you do one thing in the guest, less the code that runs anyway; narrow it down by recording again |
 | `memory-write` | Patch guest RAM or ROM: code or data |
 | `memory-search` | Find text, bytes or a number in guest RAM and ROM; search again among the places it found, to narrow down a value that changes |
 | `debug-symbols` | Load the names of the guest's functions and variables (from nm or a link map), to use in place of addresses |
@@ -149,6 +150,7 @@ Use these:
 | Use function and variable names in place of addresses | `debug-symbols` with nm's output or a link map |
 | Change a register, or where the CPU goes on (the pc) | `register-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |
+| Find the code that handles a click, a key or a command | `debug-coverage` `start`, do the thing, `debug-coverage` `stop`; then record again and stop with `refine` to narrow it down |
 | Pause and go on | `vm-power` `pause` and `resume`, or `hmp` `stop` and `cont` |
 | Any other monitor command | `hmp` (`help` lists them) or `qmp` |
 | Run a command in the guest, get its output and exit status | `serial-run` (log in on a serial port first) |
