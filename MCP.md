@@ -63,8 +63,8 @@ only when exactly one VM is running and you started it.
 | `media` | List, insert or eject CDs and floppies; put host files on a new one, or copy the files off a floppy |
 | `vm-power` | Pause, resume, reset, power down or quit |
 | `vm-snapshot` | Save, load, list or delete whole-VM snapshots (needs qcow2 disks) |
-| `debug-run` | Run until a CPU gets to an address (a breakpoint), touches watched memory or takes an exception, then show the instruction, the registers and memory |
-| `debug-trace` | Log each arrival at an address, access to watched memory or exception, with registers and memory, while the guest runs on |
+| `debug-run` | Run until a CPU gets to an address (a breakpoint), a CPU or a device touches watched memory, or a CPU takes an exception, then show the instruction, the registers and memory |
+| `debug-trace` | Log each arrival at an address, access to watched memory (by CPUs or devices) or exception, with registers and memory, while the guest runs on |
 | `debug-step` | Run one CPU an instruction at a time, and show each one |
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
@@ -135,6 +135,7 @@ Use these:
 | Stop when the guest crashes or takes a trap (an exception) | `debug-run` with `exception` |
 | See which exceptions the guest takes, and how often | `debug-trace` with `exception: {}` |
 | Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
+| Find when a device (DMA) writes some memory | `debug-run` with `watch`; `physical: true` for a physical address |
 | See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
 | See how the CPU got to where it stopped | `debug-run` with `history` |
 | Stop at the same code in any process (any space) | `debug-run` with `address-mask` |
@@ -233,9 +234,19 @@ Use these:
 - **What writes this memory?** `debug-run` with `watch` (`address`,
   `length`, and `write`, `read` or `access`) stops right after a CPU
   touches it, and shows the instruction that did it. With an
-  `address` too, whichever comes first stops it. Only CPUs are
-  watched, not devices that write memory themselves (DMA). On hppa,
-  give the whole address, space and offset, as for other memory.
+  `address` too, whichever comes first stops it. On hppa, give the
+  whole address, space and offset, as for other memory.
+- **Devices writing memory (DMA):** a `watch` for writes also stops
+  right after a device writes there itself, as a disk or network
+  card does. The result has `device` in place of `pc`: where the
+  write came from (`main-loop` when a device does it on its own,
+  as when a transfer ends; `cpu` when a CPU's I/O access started it,
+  or QEMU wrote for a CPU, as for a page table; `io-thread`), and how
+  many bytes it wrote in all. `devices: false` leaves devices out.
+  `physical: true` watches a physical address, such as a buffer from
+  a device's descriptor; only devices are watched there. The memory
+  is watched where its pages are mapped as the call begins. Devices'
+  reads are not watched.
 - **Several at once:** `address` takes a list of up to 64 addresses,
   and `watch` a list of up to 16 areas. `debug-run` stops at whichever
   a CPU gets to or touches first; `debug-trace` logs them all and
@@ -257,7 +268,8 @@ Use these:
   `s16[sp+8] == -1`. The CPU works it out itself at each hit, so a hit
   where it is false costs little and does not stop the VM; `skipped`
   counts those. For watched memory it is worked out after the access,
-  for an exception in the handler.
+  for an exception in the handler, and for a device's write with the
+  VM stopped for a moment, on the CPU the result would show.
 - **Changing registers:** `register-write` sets a register of a stopped
   CPU by the names a `memory` address takes, and returns the old value.
   `pc` moves the CPU to another instruction: to skip one, or to run one
@@ -284,8 +296,9 @@ Use these:
   `registers` and `memory` you ask for, until `count` hits or
   `duration-ms`. For watched memory it counts which instructions
   touched it, and lists the first access by each one, so a rare
-  writer behind a busy loop still shows. Each hit stops the VM for a
-  moment: a busy address slows the guest while it traces.
+  writer behind a busy loop still shows; devices' writes are counted
+  apart, as `device-writes`. Each hit stops the VM for a moment: a
+  busy address slows the guest while it traces.
 - **TLB misses and page faults:** when the CPU has no mapping for an
   address right now, the debug tools say so instead of showing the
   instruction or the memory there. Kernels are often mapped 1:1: ask

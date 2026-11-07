@@ -58,6 +58,7 @@
 #include "system/dma.h"
 #include "system/hostmem.h"
 #include "system/hw_accel.h"
+#include "system/ram-write-hook.h"
 #include "system/xen-mapcache.h"
 #include "trace.h"
 
@@ -3129,11 +3130,14 @@ MemoryRegion *get_system_io(void)
     return system_io;
 }
 
+RamWriteHook *ram_write_hook;
+
 static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
                                      hwaddr length)
 {
     uint8_t dirty_log_mask = memory_region_get_dirty_log_mask(mr);
     ram_addr_t ramaddr = memory_region_get_ram_addr(mr);
+    RamWriteHook *hook = qatomic_read(&ram_write_hook);
 
     /* We know we're only called for RAM MemoryRegions */
     assert(ramaddr != RAM_ADDR_INVALID);
@@ -3153,6 +3157,10 @@ static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
         dirty_log_mask &= ~(1 << DIRTY_MEMORY_CODE);
     }
     physical_memory_set_dirty_range(addr, length, dirty_log_mask);
+    /* LEMU: a debugger watches for devices writing memory */
+    if (unlikely(hook)) {
+        hook(addr, length);
+    }
 }
 
 void memory_region_flush_rom_device(MemoryRegion *mr, hwaddr addr, hwaddr size)

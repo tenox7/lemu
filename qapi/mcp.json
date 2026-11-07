@@ -1501,7 +1501,8 @@
 #     often as asked (debug-run), or the CPU did all its steps
 #     (debug-step)
 #
-# @cpu: the CPU, when one stopped
+# @cpu: the CPU, when one stopped; after a device's write, the one
+#     shown
 #
 # @pc: its program counter, in hex
 #
@@ -1524,8 +1525,8 @@
 #     first, such as a TLB miss or a page fault, and the CPU came back
 #     soon after.  Run debug-run again to go on.
 #
-# @watch: what the CPU did to the watched memory, when that stopped
-#     the VM (debug-run)
+# @watch: what the CPU or a device did to the watched memory, when
+#     that stopped the VM (debug-run)
 #
 # @exception: the exception the CPU took, when that stopped the VM
 #     (debug-run)
@@ -1574,11 +1575,22 @@
 #
 # @access: what stops the VM (default: write)
 #
+# @physical: @address is physical, as hmp's xp reads it.  Only
+#     devices' writes are caught there, as CPUs watch virtual
+#     addresses; @access must be write (default: false)
+#
+# @devices: also stop when a device writes to it itself (DMA), or QEMU
+#     writes to it for a CPU outside its instructions, as some CPUs do
+#     for their page tables.  Devices' reads are not watched.  The
+#     memory is watched where its pages were mapped as the call began
+#     (default: true with @access write or access)
+#
 # Since: 11.2
 ##
 { 'struct': 'McpWatch',
   'data': { 'address': 'str', '*length': 'int',
-            '*access': 'McpWatchAccess' },
+            '*access': 'McpWatchAccess', '*physical': 'bool',
+            '*devices': 'bool' },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1665,19 +1677,48 @@
   'if': 'CONFIG_TCG' }
 
 ##
+# @McpDeviceWrite:
+#     A write to watched memory that no instruction did: a device's
+#     (DMA), or QEMU's for a CPU.
+#
+# @physical: the physical address of the first watched byte it wrote,
+#     in hex
+#
+# @length: how many bytes that one write wrote in all; it may have
+#     written more than the watched memory
+#
+# @from: "cpu" when it came during an I/O access by CPU @cpu, or QEMU
+#     wrote for that CPU (as for a page table); "main-loop" for a
+#     device on its own, as when a timer fires or a disk or network
+#     transfer ends; "io-thread"; or "other-thread"
+#
+# @cpu: the CPU, with "cpu"
+#
+# Since: 11.2
+##
+{ 'struct': 'McpDeviceWrite',
+  'data': { 'physical': 'str', 'length': 'int', 'from': 'str',
+            '*cpu': 'int' },
+  'if': 'CONFIG_TCG' }
+
+##
 # @McpWatchHit:
-#     What a CPU did to watched memory.
+#     What a CPU or a device did to watched memory.
 #
 # @address: the first watched byte it touched, in hex
 #
 # @access: "read" or "write"
 #
-# @pc: the instruction that did it, in hex; the CPU has run it
+# @pc: the instruction that did it, in hex; the CPU has run it.  None
+#     when a device wrote it.
+#
+# @device: who wrote it, when a device did, not an instruction
 #
 # Since: 11.2
 ##
 { 'struct': 'McpWatchHit',
-  'data': { 'address': 'str', 'access': 'str', 'pc': 'str' },
+  'data': { 'address': 'str', 'access': 'str', '*pc': 'str',
+            '*device': 'McpDeviceWrite' },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1706,9 +1747,11 @@
 #     down (default: all bits)
 #
 # @watch: stop after a CPU writes or reads this memory, with the
-#     instruction that did it; or a list of up to 16 such areas.  Only
-#     CPUs are watched, not devices that write memory themselves
-#     (DMA).
+#     instruction that did it; or a list of up to 16 such areas.  A
+#     device that writes to it itself (DMA) stops the VM too, right
+#     after the write, unless @devices is false: the summary says
+#     where the write came from, and the CPU shown is the one whose
+#     I/O access it came in, if any.
 #
 # @exception: stop right after a CPU takes one of these exceptions,
 #     at the first instruction of the guest's handler; the summary
@@ -1730,8 +1773,10 @@
 #     make them signed, as in "s32(eax) < 0", and a comparison, /, %
 #     or >> with a signed side works signed.  The CPU works it out
 #     itself at each hit, so a hit where it is false does not stop
-#     the VM.  A hit where it can't be worked out, as when its memory
-#     can't be read, counts as false; the summary says why.
+#     the VM.  A device's write stops it for a moment: the condition
+#     is worked out then, with the registers of the CPU the summary
+#     would show.  A hit where it can't be worked out, as when its
+#     memory can't be read, counts as false; the summary says why.
 #
 # @hits: stop at this arrival, watched access or exception, counting
 #     from 1; with @condition, only the ones that meet it count
@@ -1772,12 +1817,15 @@
 #
 # @hit: its number, counting from 1
 #
-# @cpu: the CPU
+# @cpu: the CPU; for a device's write, the one whose registers are
+#     logged
 #
 # @pc: the address it got to, or the instruction that touched the
-#     watched memory or took the exception, in hex
+#     watched memory or took the exception, in hex; for a device's
+#     write, where the CPU was
 #
-# @watch: what it did to the watched memory, when that was the hit
+# @watch: what it or a device did to the watched memory, when that was
+#     the hit
 #
 # @value: the watched word after that, in hex
 #
@@ -1826,6 +1874,8 @@
 # @skipped: hits it left out because they did not meet the condition
 #     (with @condition)
 #
+# @device-writes: of the hits, the writes by devices (with @watch)
+#
 # @ms: how long it traced, in milliseconds
 #
 # @running: the VM is running
@@ -1844,7 +1894,8 @@
 ##
 { 'struct': 'McpTrace',
   'base': 'McpResult',
-  'data': { 'hits': 'int', '*skipped': 'int', 'ms': 'int',
+  'data': { 'hits': 'int', '*skipped': 'int', '*device-writes': 'int',
+            'ms': 'int',
             'running': 'bool',
             '*instructions': [ 'McpTraceInstruction' ],
             '*exceptions': [ 'McpExceptionCount' ],
@@ -1868,7 +1919,8 @@
 #     debug-run
 #
 # @watch: log the accesses to this memory, or to each area of a list,
-#     with the instruction that did each one
+#     with the instruction that did each one, and devices' writes to
+#     it, as for debug-run
 #
 # @exception: log these exceptions as CPUs take them, and count them
 #     by number and by the instruction that took them; {} for all.

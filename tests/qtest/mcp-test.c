@@ -2294,7 +2294,8 @@ static void test_debug_watch(void)
                    " 'timeout-ms': 200}");
     g_assert(!qdict_get_bool(ret, "reached"));
     g_assert(qdict_get_bool(ret, "running"));
-    debug_summary_has(ret, "no CPU wrote to 0x2000 in 0.2 s;");
+    debug_summary_has(ret, "no CPU wrote to 0x2000, and no device wrote to"
+                      " 0x2000 in 0.2 s;");
     qobject_unref(ret);
 
     debug_check_error(qts, "debug-run", "{'watch': {'address': 'ebx'}}",
@@ -2303,6 +2304,260 @@ static void test_debug_watch(void)
     debug_check_error(qts, "debug-run",
                       "{'watch': {'address': '0x1000', 'length': 0}}",
                       "watch length must be 1 to 4096");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
+ * A BIOS that counts at DMA_COUNTER as it loops, so a test sees it run,
+ * and that starts a fw_cfg DMA transfer itself when the byte at DMA_GO
+ * is set.  fw_cfg reads the transfer at DMA_DESC and writes its
+ * signature, "QEMU", to DMA_BUF.  At f000:0000, after a far jump:
+ *
+ *  0000  xor ax,ax / mov ds,ax
+ *  0004  inc word [8000]                 loop
+ *  0008  cmp byte [8002],0
+ *  000d  je 0004
+ *  000f  mov byte [8002],0
+ *  0014  mov dx,0514 / xor eax,eax
+ *  001a  out dx,eax                      the high half of DMA_DESC
+ *  001c  mov dx,0518 / mov eax,00900000
+ *  0025  out dx,eax                      the low half, big-endian:
+ *  0027  jmp 0004                        fw_cfg writes DMA_BUF in it
+ */
+#define DMA_COUNTER     0x8000
+#define DMA_GO          0x8002
+#define DMA_DESC        0x9000
+#define DMA_BUF         0xa000
+#define DMA_PORT        0x514
+#define DMA_QEMU        0x554d4551      /* "QEMU", little-endian */
+
+static char *debug_bios_dma(void)
+{
+    static const uint8_t code[] = {
+        0x31, 0xc0, 0x8e, 0xd8,
+        0xff, 0x06, 0x00, 0x80,
+        0x80, 0x3e, 0x02, 0x80, 0x00,
+        0x74, 0xf5,
+        0xc6, 0x06, 0x02, 0x80, 0x00,
+        0xba, 0x14, 0x05, 0x66, 0x31, 0xc0,
+        0x66, 0xef,
+        0xba, 0x18, 0x05, 0x66, 0xb8, 0x00, 0x00, 0x90, 0x00,
+        0x66, 0xef,
+        0xeb, 0xdb,
+    };
+
+    return debug_bios_code(code, sizeof(code));
+}
+
+/* The transfer at DMA_DESC: select fw_cfg's signature, read 4 bytes */
+static void debug_dma_arm(QTestState *qts)
+{
+    uint8_t desc[16];
+
+    stl_be_p(desc, 0x0a);
+    stl_be_p(desc + 4, 4);
+    stq_be_p(desc + 8, DMA_BUF);
+    qtest_memwrite(qts, DMA_DESC, desc, sizeof(desc));
+}
+
+/* fw_cfg does the transfer now, for qtest: from the main loop */
+static void debug_dma_start(QTestState *qts)
+{
+    qtest_outl(qts, DMA_PORT, 0);
+    qtest_outl(qts, DMA_PORT + 4, bswap32(DMA_DESC));
+}
+
+/* Wait until the guest runs, after a call that starts it was sent */
+static void debug_dma_wait_running(QTestState *qts)
+{
+    uint16_t was = qtest_readw(qts, DMA_COUNTER);
+    int i;
+
+    for (i = 0; i < 1000 && qtest_readw(qts, DMA_COUNTER) == was; i++) {
+        g_usleep(10 * 1000);
+    }
+    g_assert_cmpint(qtest_readw(qts, DMA_COUNTER), !=, was);
+}
+
+/* The reply to a debug call sent with qtest_qmp_send() */
+static QDict *debug_wait_ok(QTestState *qts)
+{
+    QDict *rsp = wait_reply(qts);
+    QDict *ret = qdict_get_qdict(rsp, "return");
+
+    if (!ret) {
+        g_test_message("%s", qdict_get_str(qdict_get_qdict(rsp, "error"),
+                                           "desc"));
+    }
+    g_assert(ret);
+    qobject_ref(ret);
+    qobject_unref(rsp);
+    return ret;
+}
+
+/*
+ * Send a debug call with the VM stopped, and wait until the guest runs:
+ * then the call watches
+ */
+static void debug_dma_send(QTestState *qts, const char *cmd,
+                           const char *args)
+{
+    qobject_unref(debug_ok(qts, "stop", "{}"));
+    debug_dma_arm(qts);
+    qtest_qmp_send(qts, "{'execute': %s, 'arguments': %p}", cmd,
+                   qobject_from_json(args, &error_abort));
+    debug_dma_wait_running(qts);
+}
+
+/* That, and the transfer from the main loop */
+static QDict *debug_dma_call(QTestState *qts, const char *cmd,
+                             const char *args)
+{
+    debug_dma_send(qts, cmd, args);
+    debug_dma_start(qts);
+    return debug_wait_ok(qts);
+}
+
+static QDict *debug_dma_device(QDict *ret, const char *from)
+{
+    QDict *watch = qdict_get_qdict(ret, "watch");
+    QDict *dev;
+
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(watch);
+    g_assert_cmpstr(qdict_get_str(watch, "address"), ==, "0xa000");
+    g_assert_cmpstr(qdict_get_str(watch, "access"), ==, "write");
+    g_assert(!qdict_haskey(watch, "pc"));
+    dev = qdict_get_qdict(watch, "device");
+    g_assert(dev);
+    g_assert_cmpstr(qdict_get_str(dev, "physical"), ==, "0xa000");
+    g_assert_cmpint(qdict_get_int(dev, "length"), ==, 4);
+    g_assert_cmpstr(qdict_get_str(dev, "from"), ==, from);
+    return dev;
+}
+
+/*
+ * A device that writes watched memory itself (DMA) stops debug-run and
+ * is logged by debug-trace: fw_cfg's DMA, started by qtest from the
+ * main loop, or by the guest's own I/O access
+ */
+static void test_debug_dma(void)
+{
+    g_autofree char *bios = debug_bios_dma();
+    QTestState *qts;
+    QDict *ret, *dev;
+    const char *pc;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* from the main loop: no CPU did it */
+    ret = debug_dma_call(qts, "debug-run", "{'watch': {'address': '0xa000'}}");
+    dev = debug_dma_device(ret, "main-loop");
+    g_assert(!qdict_haskey(dev, "cpu"));
+    debug_summary_has(ret, "a device wrote to 0xa000 (physical 0xa000) from"
+                      " the main loop, 4 bytes in all; the VM is stopped"
+                      " right after it; CPU 0:\n");
+    debug_summary_has(ret, "Memory at 0xa000:\n0000a000: 0x554d4551\n");
+    g_assert(!qdict_get_bool(ret, "running"));
+    qobject_unref(ret);
+
+    /* the guest's I/O access: its CPU stops right after it */
+    qtest_writel(qts, DMA_BUF, 0);
+    debug_dma_send(qts, "debug-run", "{'watch': {'address': '0xa000'}}");
+    qtest_writeb(qts, DMA_GO, 1);
+    ret = debug_wait_ok(qts);
+    dev = debug_dma_device(ret, "cpu");
+    g_assert_cmpint(qdict_get_int(dev, "cpu"), ==, 0);
+    g_assert_cmpint(qdict_get_int(ret, "cpu"), ==, 0);
+    pc = qdict_get_str(ret, "pc");
+    g_assert(!strcmp(pc, "0xf0027") || !strcmp(pc, "0xf0004"));
+    debug_summary_has(ret, "a device wrote to 0xa000 (physical 0xa000)"
+                      " during CPU 0's I/O access, 4 bytes in all; the VM"
+                      " is stopped right after it, though CPU 0 may have"
+                      " run on to the end of its block of code\n");
+    debug_summary_has(ret, "0000a000: 0x554d4551\n");
+    qobject_unref(ret);
+
+    /* a physical address: devices only */
+    ret = debug_dma_call(qts, "debug-run",
+                         "{'watch': {'address': '0xa000', 'physical': true}}");
+    debug_dma_device(ret, "main-loop");
+    debug_summary_has(ret, "a device wrote to physical 0xa000 from the main"
+                      " loop, 4 bytes in all;");
+    debug_summary_has(ret, "Memory at physical 0xa000:\n0000a000:"
+                      " 0x554d4551\n");
+    qobject_unref(ret);
+
+    /* devices left out: the write happens, the VM goes on */
+    qtest_writel(qts, DMA_BUF, 0);
+    ret = debug_dma_call(qts, "debug-run", "{'watch': {'address': '0xa000',"
+                         " 'devices': false}, 'timeout-ms': 1000}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    debug_summary_has(ret, "no CPU wrote to 0xa000 in 1.0 s;");
+    g_assert_cmphex(qtest_readl(qts, DMA_BUF), ==, DMA_QEMU);
+    qobject_unref(ret);
+
+    /* a condition is worked out with the VM stopped for the write */
+    ret = debug_dma_call(qts, "debug-run", "{'watch': {'address': '0xa000'},"
+                         " 'condition': 'u32[0xa000] == 0x1234',"
+                         " 'timeout-ms': 1000}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 1);
+    debug_summary_has(ret, "no CPU wrote to 0xa000, and no device wrote to"
+                      " 0xa000 in 1.0 s");
+    qobject_unref(ret);
+    ret = debug_dma_call(qts, "debug-run", "{'watch': {'address': '0xa000'},"
+                         " 'condition': 'u32[0xa000] == 0x554d4551'}");
+    debug_dma_device(ret, "main-loop");
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 0);
+    qobject_unref(ret);
+
+    /* debug-trace logs each write, and counts them apart */
+    debug_dma_send(qts, "debug-trace", "{'watch': {'address': '0xa000'},"
+                   " 'count': 2, 'duration-ms': 10000}");
+    debug_dma_start(qts);
+    debug_dma_arm(qts);
+    debug_dma_start(qts);
+    ret = debug_wait_ok(qts);
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 2);
+    g_assert_cmpint(qdict_get_int(ret, "device-writes"), ==, 2);
+    debug_summary_has(ret, "Traced writes to 0xa000 (4 bytes), and devices'"
+                      " writes to 0xa000 for ");
+    debug_summary_has(ret, ": 2 hits (2 by devices), as many as asked for;");
+    debug_summary_has(ret, "By instruction:\n       2 x no instruction: a"
+                      " device wrote\n");
+    debug_summary_has(ret, "#1 a device wrote to 0xa000 (physical 0xa000)"
+                      " from the main loop, 4 bytes in all (now 0x554d4551);"
+                      " CPU 0 at ");
+    debug_summary_has(ret, "#2 a device wrote to 0xa000");
+    qobject_unref(ret);
+
+    /* nothing writes 0xb000 */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0xb000',"
+                   " 'physical': true}, 'timeout-ms': 200}");
+    debug_summary_has(ret, "no device wrote to physical 0xb000 in 0.2 s;");
+    qobject_unref(ret);
+
+    /* the PCI hole is not RAM */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0xd0000000',"
+                   " 'physical': true}, 'timeout-ms': 100}");
+    debug_summary_has(ret, "\n\nDevices' writes were not watched at physical"
+                      " 0xd0000000 and maybe further on: it is not RAM.");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-run", "{'watch': {'address': '0xa000',"
+                      " 'physical': true, 'access': 'read'}}",
+                      "a physical address catches only devices' writes");
+    debug_check_error(qts, "debug-run", "{'watch': {'address': '0xa000',"
+                      " 'physical': true, 'devices': false}}",
+                      "a physical address catches only devices' writes");
+    debug_check_error(qts, "debug-run", "{'watch': {'address': '0xa000',"
+                      " 'access': 'read', 'devices': true}}",
+                      "devices' reads are not watched");
     qtest_quit(qts);
     unlink(bios);
 }
@@ -2616,14 +2871,16 @@ static void test_debug_several(void)
     g_assert_cmpint(debug_trace_count(ret, "0xf0008"), ==, 3);
     g_assert_cmpint(debug_trace_count(ret, "0xf000a"), ==, 3);
     debug_summary_has(ret, "Traced writes to 0x1000 (2 bytes) and reads of"
-                      " 0x1000 (2 bytes) for ");
+                      " 0x1000 (2 bytes), and devices' writes to 0x1000"
+                      " for ");
     qobject_unref(ret);
 
     ret = debug_ok(qts, "debug-run", "{'watch': [{'address': '0x2000'},"
                    " {'address': '0x3000', 'access': 'read'}],"
                    " 'timeout-ms': 100}");
     g_assert(!qdict_get_bool(ret, "reached"));
-    debug_summary_has(ret, "no CPU wrote to 0x2000 or read 0x3000 in 0.1 s;");
+    debug_summary_has(ret, "no CPU wrote to 0x2000 or read 0x3000, and no"
+                      " device wrote to 0x2000 in 0.1 s;");
     qobject_unref(ret);
 
     g_string_assign(many, "{'watch': [");
@@ -2895,7 +3152,8 @@ static void test_debug_trace(void)
     g_assert_cmpstr(qdict_get_str(e, "pc"), ==, "0xf0008");
     g_assert_cmpint(qdict_get_int(e, "count"), ==, 3);
     g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "entries")), ==, 2);
-    debug_summary_has(ret, "Traced accesses to 0x1000 (2 bytes) for ");
+    debug_summary_has(ret, "Traced accesses to 0x1000 (2 bytes), and"
+                      " devices' writes to 0x1000 for ");
     debug_summary_has(ret, "\n\nBy instruction:\n"
                       "       3 x 0x000f0008:");
     debug_summary_has(ret, "\n       3 x 0x000f000a:");
@@ -4331,6 +4589,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/retry", test_debug_retry);
         qtest_add_func("/mcp/debug/registers", test_debug_registers);
         qtest_add_func("/mcp/debug/watch", test_debug_watch);
+        qtest_add_func("/mcp/debug/dma", test_debug_dma);
         qtest_add_func("/mcp/debug/trace", test_debug_trace);
         qtest_add_func("/mcp/debug/history", test_debug_history);
         qtest_add_func("/mcp/debug/mask", test_debug_mask);

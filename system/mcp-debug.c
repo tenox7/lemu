@@ -43,9 +43,14 @@
 #include "exec/watchpoint.h"
 #include "qemu/bitops.h"
 #include "qemu/host-utils.h"
+#include "qemu/thread.h"
+#include "system/ram-write-hook.h"
 #endif
 
 #define WRITE_MAX_BYTES         1024
+
+/* memory-write is writing: the debug tools see no device write there */
+static __thread bool mcp_dma_self;
 
 /* "0x..." is hex, anything else decimal, as qapi/mcp.json says */
 static bool mcp_parse_address(const char *s, const char *what,
@@ -928,7 +933,9 @@ McpMemoryWriteResult *qmp_memory_write(const char *address,
             return NULL;
         }
         /* RAM, and ROM too; drops translated code made from the old bytes */
+        mcp_dma_self = true;
         address_space_write_rom(as, pa, attrs, data->data + done, n);
+        mcp_dma_self = false;
         address_space_read(as, pa, attrs, after + done, n);
     }
 
@@ -1702,11 +1709,31 @@ static vaddr mcp_debug_bp_pc(CPUState *cpu, uint64_t addr)
     return addr;
 }
 
+/* Where a device's write to watched memory came from */
+typedef enum McpDmaFrom {
+    DMA_FROM_CPU,               /* a CPU's I/O access, or QEMU for a CPU */
+    DMA_FROM_MAIN,              /* the main loop: timers, transfers ending */
+    DMA_FROM_IOTHREAD,
+    DMA_FROM_OTHER,
+} McpDmaFrom;
+
+/* A write to watched memory that was not a CPU's instruction */
+typedef struct McpDmaWrite {
+    uint64_t addr;              /* the first watched byte it wrote */
+    uint64_t phys;              /* that byte's physical address */
+    uint64_t len;               /* all it wrote */
+    bool physical;              /* the area was given as physical */
+    McpDmaFrom from;
+    int cpu;                    /* DMA_FROM_CPU: which */
+} McpDmaWrite;
+
 typedef struct McpWatchSeen {
     CPUState *cpu;
     uint64_t addr;
     uint64_t pc;
     bool write;
+    bool device;                /* no instruction did it: @dma says what */
+    McpDmaWrite dma;
 } McpWatchSeen;
 
 /* Memory that a debug tool watches */
@@ -1714,6 +1741,8 @@ typedef struct McpWatchArea {
     uint64_t addr;
     uint64_t len;
     int flags;                  /* BP_MEM_READ, BP_MEM_WRITE or both */
+    bool physical;              /* only devices' writes: CPUs watch virtual */
+    bool devices;               /* devices' writes too */
 } McpWatchArea;
 
 /* An exception a CPU stopped for */
@@ -1796,8 +1825,14 @@ typedef struct McpBreak {
     int hits;                   /* CPUs there as the time ran out */
     int n_watches;              /* the watched memory */
     McpWatchArea watches[RUN_WATCHES_MAX];
+    CPUState *wcpu;             /* whose mappings the watched addresses use */
     int whits;                  /* CPUs that touched it as the time ran out */
     McpWatchSeen seen;
+    int dhits;                  /* devices' writes as the time ran out */
+    /* the first watched byte devices' writes are not seen at, and why */
+    const char *dma_skip;       /* NULL when there is none */
+    uint64_t dma_skip_at;
+    bool dma_skip_physical;
     bool has_excp;              /* the exceptions to stop at */
     CPUExcpWatch excp;          /* each CPU watched gets a copy */
     int ehits;                  /* CPUs that took one as the time ran out */
@@ -1901,6 +1936,264 @@ static void mcp_debug_append_addrs(GString *s, McpBreak *b, const char *conj)
 }
 
 /*
+ * Devices' writes to watched memory (DMA), and QEMU's for a CPU, as for
+ * a page table: physmem calls mcp_dma_hook after each write to RAM that
+ * is not a CPU's own store.  The watched areas become RAM addresses as
+ * a run begins, with the VM stopped, so a write that reaches the same
+ * RAM through an alias, a bus window or an IOMMU counts too.  The hook
+ * runs in the thread that wrote: it notes the write and asks the VM to
+ * stop, and the run takes the writes noted.
+ */
+#define DMA_RANGES_MAX          (RUN_WATCHES_MAX * 8)
+#define DMA_PENDING_MAX         64
+
+typedef struct McpDmaRange {
+    uint64_t ram;               /* the ram_addr_t of its first byte */
+    uint64_t len;
+    uint64_t addr;              /* that byte as watched */
+    uint64_t phys;
+    bool physical;
+} McpDmaRange;
+
+static struct {
+    bool ready;
+    QemuMutex lock;             /* for what follows */
+    int n_ranges;
+    McpDmaRange ranges[DMA_RANGES_MAX];
+    int n_pending;              /* the writes no run took yet */
+    McpDmaWrite pending[DMA_PENDING_MAX];
+    uint64_t n_lost;            /* more of them, not noted */
+} mcp_dma;
+
+static void mcp_dma_init(void)
+{
+    if (!mcp_dma.ready) {
+        qemu_mutex_init(&mcp_dma.lock);
+        mcp_dma.ready = true;
+    }
+}
+
+static McpDmaFrom mcp_dma_from(void)
+{
+    AioContext *ctx;
+
+    if (qemu_in_vcpu_thread()) {
+        return DMA_FROM_CPU;
+    }
+    ctx = qemu_get_current_aio_context();
+    if (ctx == qemu_get_aio_context()) {
+        return DMA_FROM_MAIN;
+    }
+    return ctx ? DMA_FROM_IOTHREAD : DMA_FROM_OTHER;
+}
+
+static void mcp_dma_hook(uint64_t ram, uint64_t len)
+{
+    McpDmaRange *r = NULL;
+    uint64_t first = UINT64_MAX;
+    int i;
+
+    if (mcp_dma_self || !len) {
+        return;
+    }
+    qemu_mutex_lock(&mcp_dma.lock);
+    /* the first watched byte it wrote */
+    for (i = 0; i < mcp_dma.n_ranges; i++) {
+        McpDmaRange *o = &mcp_dma.ranges[i];
+
+        if (ram < o->ram + o->len && o->ram < ram + len &&
+            MAX(ram, o->ram) < first) {
+            first = MAX(ram, o->ram);
+            r = o;
+        }
+    }
+    if (r && mcp_dma.n_pending < DMA_PENDING_MAX) {
+        McpDmaWrite *w = &mcp_dma.pending[mcp_dma.n_pending++];
+
+        w->addr = r->addr + (first - r->ram);
+        w->phys = r->phys + (first - r->ram);
+        w->len = len;
+        w->physical = r->physical;
+        w->from = mcp_dma_from();
+        w->cpu = w->from == DMA_FROM_CPU ? current_cpu->cpu_index : -1;
+        /*
+         * In a CPU's I/O access, that CPU stops at the end of its block
+         * of code
+         */
+        if (w->from == DMA_FROM_CPU) {
+            cpu_set_interrupt(current_cpu, CPU_INTERRUPT_DEBUG);
+            qemu_cpu_kick(current_cpu);
+        }
+    } else if (r) {
+        mcp_dma.n_lost++;
+    }
+    /*
+     * The main loop stops the VM in any case: a CPU that halts next
+     * would never get to the end of its block.  This is done with the
+     * lock held, so no write asks for a stop once mcp_dma_unhook() has
+     * returned, and each stop asked for has its write noted.
+     */
+    if (r && runstate_is_running()) {
+        qemu_system_debug_request();
+    }
+    qemu_mutex_unlock(&mcp_dma.lock);
+}
+
+/* Note the first watched byte that devices' writes are not seen at */
+static void mcp_dma_skip(McpBreak *b, McpWatchArea *a, uint64_t addr,
+                         const char *why)
+{
+    if (!b->dma_skip) {
+        b->dma_skip = why;
+        b->dma_skip_at = addr;
+        b->dma_skip_physical = a->physical;
+    }
+}
+
+/*
+ * The RAM that @a is, for @cpu, into mcp_dma.ranges; the lock is held.
+ * Devices write only to RAM: not to a device's own memory, as a frame
+ * buffer handed to the guest by the host (a RAM device) is.
+ */
+static void mcp_dma_add(McpBreak *b, CPUState *cpu, McpWatchArea *a)
+{
+    uint64_t addr = a->addr, left = a->len;
+
+    while (left) {
+        MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+        AddressSpace *as = cpu->as;
+        uint64_t page = qemu_target_page_size();
+        uint64_t phys = addr, chunk;
+        TranslateForDebugResult t;
+        MemoryRegion *mr;
+        hwaddr xlat, l;
+
+        if (!a->physical) {
+            if (!cpu_translate_for_debug(cpu, addr, &t)) {
+                mcp_dma_skip(b, a, addr, "it was not mapped as the run"
+                             " began");
+                chunk = MIN(left, page - (addr & (page - 1)));
+                addr += chunk;
+                left -= chunk;
+                continue;
+            }
+            page = t.lg_page_size < 64 ? 1ULL << t.lg_page_size : 0;
+            as = cpu_get_address_space(cpu, cpu_asidx_from_attrs(cpu,
+                                                                 t.attrs));
+            attrs = t.attrs;
+            phys = t.physaddr;
+        }
+        chunk = page && !a->physical ?
+                MIN(left, page - (addr & (page - 1))) : left;
+        l = chunk;
+        WITH_RCU_READ_LOCK_GUARD() {
+            mr = address_space_translate(as, phys, &xlat, &l, true, attrs);
+            if (!memory_region_is_ram(mr) || memory_region_is_ram_device(mr)) {
+                mcp_dma_skip(b, a, addr, "it is not RAM");
+            } else if (mcp_dma.n_ranges < DMA_RANGES_MAX) {
+                McpDmaRange *r = &mcp_dma.ranges[mcp_dma.n_ranges++];
+
+                r->ram = memory_region_get_ram_addr(mr) + xlat;
+                r->len = MIN(l, chunk);
+                r->addr = addr;
+                r->phys = phys;
+                r->physical = a->physical;
+            } else {
+                mcp_dma_skip(b, a, addr, "the watches cover too many pieces"
+                             " of RAM");
+            }
+        }
+        chunk = l ? MIN(l, chunk) : chunk;
+        addr += chunk;
+        left -= chunk;
+    }
+}
+
+/*
+ * Watch the memory of @b for devices' writes: as RAM addresses, through
+ * the mappings of the CPU its addresses were read for.  The VM is
+ * stopped.
+ */
+static void mcp_dma_insert(McpBreak *b)
+{
+    int i, n;
+
+    qemu_mutex_lock(&mcp_dma.lock);
+    mcp_dma.n_ranges = 0;
+    mcp_dma.n_pending = 0;
+    mcp_dma.n_lost = 0;
+    b->dma_skip = NULL;
+    for (i = 0; i < b->n_watches; i++) {
+        if (b->watches[i].devices) {
+            mcp_dma_add(b, b->wcpu, &b->watches[i]);
+        }
+    }
+    n = mcp_dma.n_ranges;
+    qemu_mutex_unlock(&mcp_dma.lock);
+    if (n) {
+        qatomic_set(&ram_write_hook, mcp_dma_hook);
+    }
+}
+
+/* No more writes are noted; those noted stay for the run to take */
+static void mcp_dma_unhook(void)
+{
+    qatomic_set(&ram_write_hook, NULL);
+    qemu_mutex_lock(&mcp_dma.lock);
+    mcp_dma.n_ranges = 0;
+    qemu_mutex_unlock(&mcp_dma.lock);
+}
+
+/* Whether writes were noted that no run took yet */
+static bool mcp_dma_pending(void)
+{
+    bool any;
+
+    qemu_mutex_lock(&mcp_dma.lock);
+    any = mcp_dma.n_pending || mcp_dma.n_lost;
+    qemu_mutex_unlock(&mcp_dma.lock);
+    return any;
+}
+
+/*
+ * Take the writes noted into @w, which has room for DMA_PENDING_MAX;
+ * *@lost gets how many more came.  The CPUs they came from need not
+ * stop for them any more: under the lock, so that a write noted later
+ * keeps its stop.  The BQL is held.
+ */
+static int mcp_dma_take(McpDmaWrite *w, uint64_t *lost)
+{
+    int n, i;
+
+    qemu_mutex_lock(&mcp_dma.lock);
+    n = mcp_dma.n_pending;
+    memcpy(w, mcp_dma.pending, n * sizeof(*w));
+    *lost = mcp_dma.n_lost;
+    mcp_dma.n_pending = 0;
+    mcp_dma.n_lost = 0;
+    for (i = 0; i < n; i++) {
+        CPUState *cpu = w[i].from == DMA_FROM_CPU ? qemu_get_cpu(w[i].cpu)
+                                                  : NULL;
+
+        /* a watchpoint hit may still need it */
+        if (cpu && !cpu->watchpoint_hit) {
+            cpu_reset_interrupt(cpu, CPU_INTERRUPT_DEBUG);
+        }
+    }
+    qemu_mutex_unlock(&mcp_dma.lock);
+    return n;
+}
+
+/* Forget the writes noted that no hit took: how many */
+static uint64_t mcp_dma_drop(void)
+{
+    g_autofree McpDmaWrite *w = g_new(McpDmaWrite, DMA_PENDING_MAX);
+    uint64_t lost;
+
+    return mcp_dma_take(w, &lost) + lost;
+}
+
+/*
  * Breakpoints are checked when a CPU looks for the next block of
  * translated code, and chained blocks don't look: flush them all, so
  * that every way to the addresses looks again.  Watchpoints flush the
@@ -1924,6 +2217,10 @@ static void mcp_debug_insert(McpBreak *b)
         for (i = 0; i < b->n_watches; i++) {
             McpWatchArea *w = &b->watches[i];
 
+            /* a CPU watches virtual addresses */
+            if (w->physical) {
+                continue;
+            }
             cpu_watchpoint_insert(cpu, w->addr, w->len, BP_GDB | w->flags,
                                   NULL);
         }
@@ -1936,6 +2233,7 @@ static void mcp_debug_insert(McpBreak *b)
     if (b->n_addrs) {
         tb_flush__exclusive_or_serial();
     }
+    mcp_dma_insert(b);
 }
 
 /*
@@ -1965,6 +2263,9 @@ static CPUWatchpoint *mcp_watch_find(McpWatchArea *w, CPUState *cpu)
 {
     CPUWatchpoint *wp;
 
+    if (w->physical) {
+        return NULL;            /* only devices' writes: no watchpoint */
+    }
     QTAILQ_FOREACH(wp, &cpu->watchpoints, entry) {
         if (wp->vaddr == w->addr && wp->len == w->len &&
             (wp->flags & ~BP_WATCHPOINT_HIT) == (BP_GDB | w->flags)) {
@@ -2058,6 +2359,7 @@ static void mcp_debug_remove(McpBreak *b)
     CPUState *cpu;
     int i;
 
+    mcp_dma_unhook();
     CPU_FOREACH(cpu) {
         if (b->only && cpu != b->only) {
             continue;
@@ -2108,7 +2410,8 @@ static void mcp_debug_remove_paused(void *opaque)
 
 /*
  * CPUs at an address, that touched the watched memory, or that took an
- * exception
+ * exception, and whether devices wrote to it.  Devices' writes are no
+ * longer noted.
  */
 static void mcp_debug_late_hits(McpBreak *b)
 {
@@ -2124,6 +2427,7 @@ static void mcp_debug_late_hits(McpBreak *b)
             b->eseen = s;
         }
     }
+    b->dhits = mcp_dma_pending();
 }
 
 /*
@@ -2132,12 +2436,15 @@ static void mcp_debug_late_hits(McpBreak *b)
  * the VM stops there, as for any hit.  A CPU that hit the watchpoint
  * has done the access by now (its last instruction runs with
  * interrupts off) and has asked to stop the VM: it stops.  So does a
- * CPU that took an exception.
+ * CPU that took an exception, and a device that wrote to the watched
+ * memory.
  */
 static void mcp_debug_remove_running(void *opaque)
 {
     McpBreak *b = opaque;
 
+    /* first, so that each write noted is counted */
+    mcp_dma_unhook();
     if (!runstate_is_running()) {
         /* it may have stopped for a hit after the wait gave up */
         if (runstate_check(RUN_STATE_DEBUG)) {
@@ -2149,7 +2456,7 @@ static void mcp_debug_remove_running(void *opaque)
     pause_all_vcpus();
     mcp_debug_late_hits(b);
     mcp_debug_remove(b);
-    if (b->hits || b->whits || b->ehits) {
+    if (b->hits || b->whits || b->ehits || b->dhits) {
         qemu_system_debug_request();
     } else {
         resume_all_vcpus();
@@ -3075,12 +3382,28 @@ static bool mcp_parse_watch(McpWatch *w, McpBreak *b, Error **errp)
         return false;
     }
     a.flags = flags[w->has_access ? w->access : MCP_WATCH_ACCESS_WRITE];
+    a.physical = w->has_physical && w->physical;
+    /* devices' writes, unless asked not to; their reads are not seen */
+    a.devices = (a.flags & BP_MEM_WRITE) && (!w->has_devices || w->devices);
+    if (w->has_devices && w->devices && !(a.flags & BP_MEM_WRITE)) {
+        error_setg(errp, "devices' reads are not watched, only their"
+                   " writes: give access write or access, or leave devices"
+                   " out");
+        return false;
+    }
+    if (a.physical && (a.flags != BP_MEM_WRITE || !a.devices)) {
+        error_setg(errp, "a physical address catches only devices' writes"
+                   " (CPUs watch virtual addresses), so it needs access"
+                   " write and devices true");
+        return false;
+    }
 
     /* the same area twice is one watchpoint */
     for (i = 0; i < b->n_watches; i++) {
         McpWatchArea *o = &b->watches[i];
 
-        if (o->addr == a.addr && o->len == a.len && o->flags == a.flags) {
+        if (o->addr == a.addr && o->len == a.len && o->flags == a.flags &&
+            o->physical == a.physical && o->devices == a.devices) {
             return true;
         }
     }
@@ -3089,6 +3412,7 @@ static bool mcp_parse_watch(McpWatch *w, McpBreak *b, Error **errp)
         return false;
     }
     b->watches[b->n_watches++] = a;
+    b->wcpu = cpu;
     return true;
 }
 
@@ -3128,6 +3452,7 @@ static bool mcp_parse_watches(McpWatches *w, McpBreak *b, McpMem *shown,
         shown[i].n_terms = 1;
         shown[i].term[0].num = a->addr & ~3ULL;
         shown[i].words = MIN(DIV_ROUND_UP(a->len + (a->addr & 3), 4), most);
+        shown[i].physical = a->physical;
     }
     return true;
 }
@@ -3382,10 +3707,98 @@ static void mcp_debug_append_watches(GString *s, McpBreak *b,
                             a->len == 1 ? "" : "s") : NULL;
         g_autofree char *at = mcp_addr_str(a->addr);
 
+        if (a->physical) {
+            continue;           /* no CPU watches it */
+        }
         g_ptr_array_add(items, g_strdup_printf("%s %s%s", verb[a->flags], at,
                                                len ? len : ""));
     }
     mcp_append_list(s, items, conj);
+}
+
+/* How many of the watched areas CPUs watch: those not physical */
+static int mcp_debug_cpu_watches(McpBreak *b)
+{
+    int i, n = 0;
+
+    for (i = 0; i < b->n_watches; i++) {
+        n += !b->watches[i].physical;
+    }
+    return n;
+}
+
+/*
+ * The memory watched for devices' writes: "0x2000", "physical 0x2000",
+ * or more, joined with @conj.  False when there is none.
+ */
+static bool mcp_debug_append_dev(GString *s, McpBreak *b, const char *conj)
+{
+    GPtrArray *items = g_ptr_array_new_with_free_func(g_free);
+    int i;
+
+    for (i = 0; i < b->n_watches; i++) {
+        McpWatchArea *a = &b->watches[i];
+
+        if (a->devices) {
+            g_ptr_array_add(items, a->physical ?
+                            g_strdup_printf("physical 0x%" PRIx64, a->addr) :
+                            mcp_addr_str(a->addr));
+        }
+    }
+    if (!items->len) {
+        g_ptr_array_free(items, true);
+        return false;
+    }
+    mcp_append_list(s, items, conj);
+    return true;
+}
+
+/*
+ * "a device wrote to 0x2000 (physical 0x2000) from the main loop, 4
+ * bytes in all"
+ */
+static void mcp_dma_append(GString *s, const McpDmaWrite *w)
+{
+    static const char *const from[] = {
+        [DMA_FROM_MAIN] = "from the main loop",
+        [DMA_FROM_IOTHREAD] = "from an I/O thread",
+        [DMA_FROM_OTHER] = "from another thread",
+    };
+
+    if (w->physical) {
+        g_string_append_printf(s, "a device wrote to physical 0x%" PRIx64,
+                               w->addr);
+    } else {
+        g_autofree char *at = mcp_addr_str(w->addr);
+
+        g_string_append_printf(s, "a device wrote to %s (physical 0x%"
+                               PRIx64 ")", at, w->phys);
+    }
+    if (w->from == DMA_FROM_CPU) {
+        g_string_append_printf(s, " during CPU %d's I/O access", w->cpu);
+    } else {
+        g_string_append_printf(s, " %s", from[w->from]);
+    }
+    g_string_append_printf(s, ", %" PRIu64 " byte%s in all", w->len,
+                           w->len == 1 ? "" : "s");
+}
+
+static McpDeviceWrite *mcp_dma_hit(const McpDmaWrite *w)
+{
+    static const char *const from[] = {
+        [DMA_FROM_CPU] = "cpu",
+        [DMA_FROM_MAIN] = "main-loop",
+        [DMA_FROM_IOTHREAD] = "io-thread",
+        [DMA_FROM_OTHER] = "other-thread",
+    };
+    McpDeviceWrite *d = g_new0(McpDeviceWrite, 1);
+
+    d->physical = g_strdup_printf("0x%" PRIx64, w->phys);
+    d->length = w->len;
+    d->from = g_strdup(from[w->from]);
+    d->has_cpu = w->from == DMA_FROM_CPU;
+    d->cpu = w->cpu;
+    return d;
 }
 
 /*
@@ -3439,7 +3852,7 @@ static void mcp_debug_what(GString *s, McpBreak *b)
         mcp_debug_append_addrs(s, b, "or");
         sep = " or ";
     }
-    if (b->n_watches) {
+    if (mcp_debug_cpu_watches(b)) {
         g_string_append(s, sep);
         mcp_debug_append_watches(s, b, verb, false, "or");
         sep = " or ";
@@ -3448,6 +3861,28 @@ static void mcp_debug_what(GString *s, McpBreak *b)
         g_string_append(s, sep);
         mcp_debug_append_excp(s, b, "took exception", "took exceptions",
                               "took an exception", "or");
+    }
+}
+
+/*
+ * What none of the CPUs and devices did, or what one did not do before:
+ * "no CPU wrote to 0x2000, and no device wrote to 0x2000" with @cpu "no
+ * CPU", @join ", and ", @dev "no device"; "a CPU reached 0x1000, or a
+ * device wrote to 0x2000" with "a CPU", ", or ", "a device"
+ */
+static void mcp_debug_what_all(GString *s, McpBreak *b, const char *cpu,
+                               const char *join, const char *dev)
+{
+    bool cpus = b->n_addrs || b->has_excp || mcp_debug_cpu_watches(b);
+    g_autoptr(GString) devs = g_string_new(NULL);
+
+    if (cpus) {
+        g_string_append_printf(s, "%s ", cpu);
+        mcp_debug_what(s, b);
+    }
+    if (mcp_debug_append_dev(devs, b, "or")) {
+        g_string_append_printf(s, "%s%s wrote to %s", cpus ? join : "", dev,
+                               devs->str);
     }
 }
 
@@ -3474,6 +3909,7 @@ struct McpRun {
     McpWatchSeen seen;
     McpExcpSeen excp;
     bool late;                  /* hits as the time ran out */
+    uint64_t dma_more;          /* devices' writes after the last hit */
     McpRunResult result;
 };
 
@@ -3509,6 +3945,50 @@ static void mcp_run_arrivals(McpRun *r)
                         mcp_debug_retry(cpu, cpu->cc->get_pc(cpu)));
         }
     }
+}
+
+/*
+ * The writes to watched memory that no instruction did, noted since the
+ * run last looked; the VM is stopped.  Each is a hit when the condition
+ * holds for the CPU it shows: the one in whose I/O access it came, else
+ * the one the tool shows.  How many writes it looked at.
+ */
+static int mcp_run_dma(McpRun *r)
+{
+    g_autofree McpDmaWrite *w = g_new(McpDmaWrite, DMA_PENDING_MAX);
+    McpBreak *b = &r->b;
+    uint64_t lost;
+    int n = mcp_dma_take(w, &lost), i;
+
+    for (i = 0; i < n; i++) {
+        CPUState *cpu = w[i].from == DMA_FROM_CPU ? qemu_get_cpu(w[i].cpu)
+                                                  : NULL;
+        McpWatchSeen seen = { 0 };
+
+        cpu = cpu ? cpu : b->only ? b->only : b->wcpu;
+        if (r->n_hits >= r->limit) {
+            r->dma_more++;
+            continue;
+        }
+        if (b->cond) {
+            bool holds = mcp_cond_test(cpu, &b->cond->base);
+
+            /* not an arrival, if the CPU stands at an address */
+            mcp_cond_forget(b->cond, cpu);
+            if (!holds) {
+                continue;
+            }
+        }
+        seen.cpu = cpu;
+        seen.addr = w[i].addr;
+        seen.pc = cpu->cc->get_pc(cpu);
+        seen.write = true;
+        seen.device = true;
+        seen.dma = w[i];
+        mcp_run_hit(r, cpu, &seen, NULL, false);
+    }
+    r->dma_more += lost;
+    return n + !!lost;
 }
 
 #define HISTORY_MAX     1024
@@ -3615,7 +4095,9 @@ static void coroutine_fn mcp_run(McpRun *r)
     CPUState *cpu;
     int64_t before;
     bool inserted = false, interrupted;
+    int looked;
 
+    mcp_dma_init();
     r->result = RUN_TIMEOUT;
     /* a CPU there when the running VM stops has got there */
     if (runstate_is_running()) {
@@ -3648,6 +4130,8 @@ static void coroutine_fn mcp_run(McpRun *r)
                 }
             }
         }
+        /* devices may have written to it, even with the VM stopped */
+        mcp_run_dma(r);
         if (r->n_hits >= r->limit) {
             break;
         }
@@ -3664,15 +4148,23 @@ static void coroutine_fn mcp_run(McpRun *r)
         }
 
         mcp_debug_outside(mcp_debug_start, NULL);
+        /*
+         * A device that wrote while the VM was stopped asked for no stop.
+         * A write since then did, and the VM has not stopped for it yet
+         * while it runs: this request joins that one.
+         */
+        if (runstate_is_running() && mcp_dma_pending()) {
+            qemu_system_debug_request();
+        }
         if (!mcp_debug_wait_stop(ctx, r->end, NULL)) {
             r->result = ctx->cancelled ? RUN_CANCELLED : RUN_TIMEOUT;
             mcp_debug_outside(mcp_debug_remove_running, b);
             inserted = false;
-            if (b->hits || b->whits || b->ehits) {
+            if (b->hits || b->whits || b->ehits || b->dhits) {
                 /* got there as the time ran out; its stop comes next */
                 mcp_debug_wait_stop(ctx, qemu_clock_get_ms(QEMU_CLOCK_REALTIME)
                                     + STEP_WAIT_MS, NULL);
-                r->late = true;
+                before = r->n_hits;
                 mcp_run_arrivals(r);
                 if (b->whits) {
                     mcp_run_hit(r, b->seen.cpu, &b->seen, NULL, false);
@@ -3680,18 +4172,27 @@ static void coroutine_fn mcp_run(McpRun *r)
                 if (b->ehits) {
                     mcp_run_hit(r, b->eseen.cpu, NULL, &b->eseen, false);
                 }
-                r->result = r->n_hits >= r->limit ? RUN_REACHED : RUN_STOPPED;
+                mcp_run_dma(r);
+                /* devices' writes that the condition left out don't count */
+                if (r->n_hits != before) {
+                    r->late = true;
+                    r->result = r->n_hits >= r->limit ? RUN_REACHED
+                                                      : RUN_STOPPED;
+                }
             }
             break;
         }
         before = r->n_hits;
+        looked = 0;
         if (runstate_check(RUN_STATE_DEBUG)) {
             mcp_run_arrivals(r);
             CPU_FOREACH(cpu) {
                 mcp_run_access(r, cpu);
             }
+            looked = mcp_run_dma(r);
         }
-        if (r->n_hits == before) {
+        /* devices' writes that the condition left out: go on */
+        if (r->n_hits == before && !looked) {
             r->at = NULL;
             r->result = RUN_STOPPED;
             break;
@@ -3703,6 +4204,8 @@ static void coroutine_fn mcp_run(McpRun *r)
     if (inserted) {
         mcp_debug_outside(mcp_debug_remove_paused, b);
     }
+    /* devices' writes noted after the last hit, which none took */
+    r->dma_more += mcp_dma_drop();
 }
 
 /* The addresses to stop at, one or several, into @b */
@@ -3835,8 +4338,9 @@ static bool mcp_run_parse(McpRun *r, McpAddresses *address,
 }
 
 /*
- * What the last hit of @r was: "reached 0x1000", "wrote to 0x2000",
- * "took exception 14 at 0x1000"
+ * What the last hit of @r was: "CPU 0 reached 0x1000", "CPU 0 wrote to
+ * 0x2000", "CPU 0 took exception 14 at 0x1000", "a device wrote to
+ * 0x2000 (physical 0x2000) from the main loop, 4 bytes in all"
  */
 static void mcp_run_append_hit(GString *s, McpRun *r)
 {
@@ -3844,6 +4348,11 @@ static void mcp_run_append_hit(GString *s, McpRun *r)
                                        r->by_excp ? r->excp.from :
                                        mcp_debug_reached(&r->b, r->at));
 
+    if (r->by_watch && r->seen.device) {
+        mcp_dma_append(s, &r->seen.dma);
+        return;
+    }
+    g_string_append_printf(s, "CPU %d ", r->at->cpu_index);
     if (r->by_watch) {
         g_string_append_printf(s, "%s %s", r->seen.write ? "wrote to" : "read",
                                at);
@@ -3853,6 +4362,35 @@ static void mcp_run_append_hit(GString *s, McpRun *r)
     } else {
         g_string_append_printf(s, "reached %s", at);
     }
+}
+
+/*
+ * " (devices wrote to the watched memory 3 more times, not counted)":
+ * past the hits asked for, or more than the run could note at once
+ */
+static void mcp_run_append_more(GString *s, McpRun *r)
+{
+    if (r->dma_more) {
+        g_string_append_printf(s, " (devices wrote to the watched memory %"
+                               PRIu64 " more time%s, not counted)",
+                               r->dma_more, r->dma_more == 1 ? "" : "s");
+    }
+}
+
+/* A paragraph on watched memory that devices' writes were not seen at */
+static void mcp_dma_append_skipped(GString *s, McpBreak *b)
+{
+    g_autofree char *at = NULL;
+
+    if (!b->dma_skip) {
+        return;
+    }
+    at = b->dma_skip_physical ?
+         g_strdup_printf("physical 0x%" PRIx64, b->dma_skip_at) :
+         mcp_addr_str(b->dma_skip_at);
+    g_string_append(s, s->len && s->str[s->len - 1] == '\n' ? "\n" : "\n\n");
+    g_string_append_printf(s, "Devices' writes were not watched at %s and"
+                           " maybe further on: %s.", at, b->dma_skip);
 }
 
 /* "arrival", "access", "exception", or "hit" when it may be any of them */
@@ -3890,6 +4428,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
     strList *hist = NULL, *l;
     int n_mem = 0, n;
     const char *hit_word;
+    bool name_cpu;
 
     if (!r.ctx) {
         qemu_input_ctx_init(&local, NULL);
@@ -3978,7 +4517,11 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         res->watch = g_new0(McpWatchHit, 1);
         res->watch->address = g_strdup_printf("0x%" PRIx64, seen->addr);
         res->watch->access = g_strdup(seen->write ? "write" : "read");
-        res->watch->pc = g_strdup_printf("0x%" PRIx64, seen->pc);
+        if (seen->device) {
+            res->watch->device = mcp_dma_hit(&seen->dma);
+        } else {
+            res->watch->pc = g_strdup_printf("0x%" PRIx64, seen->pc);
+        }
     }
     if (at && r.by_excp) {
         res->exception = g_new0(McpExceptionHit, 1);
@@ -3986,14 +4529,26 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         res->exception->pc = g_strdup_printf("0x%" PRIx64, r.excp.from);
         res->exception->handler = g_strdup_printf("0x%" PRIx64, r.excp.to);
     }
+    /* a device's write, from no CPU: say whose registers follow */
+    name_cpu = !at || (r.by_watch && seen->device &&
+                       seen->dma.from != DMA_FROM_CPU);
     switch (r.result) {
     case RUN_REACHED:
-        g_string_printf(s, "CPU %d ", at->cpu_index);
         mcp_run_append_hit(s, &r);
         if (hits > 1) {
             count = g_strdup_printf("%s %" PRId64, hit_word, r.n_hits);
         }
         mcp_cond_append(s, count, cond);
+        mcp_run_append_more(s, &r);
+        if (r.by_watch && seen->device) {
+            g_string_append(s, "; the VM is stopped right after it");
+            if (!name_cpu) {
+                g_string_append_printf(s, ", though CPU %d may have run on"
+                                       " to the end of its block of code",
+                                       at->cpu_index);
+            }
+            break;
+        }
         if (r.by_watch) {
             g_autofree char *insn = mcp_debug_insn(at, seen->pc);
 
@@ -4027,8 +4582,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         }
         break;
     case RUN_TIMEOUT:
-        g_string_assign(s, "no CPU ");
-        mcp_debug_what(s, b);
+        mcp_debug_what_all(s, b, "no CPU", ", and ", "no device");
         g_string_append_printf(s, " in %.1f s", timeout_ms / 1000.0);
         if (hits > 1) {
             count = g_strdup_printf("%" PRId64 " of %" PRId64 " %ss",
@@ -4039,12 +4593,12 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         break;
     case RUN_STOPPED:
         if (at) {
-            g_string_printf(s, "CPU %d ", at->cpu_index);
             mcp_run_append_hit(s, &r);
             count = g_strdup_printf("%s %" PRId64 " of %" PRId64, hit_word,
                                     r.n_hits, hits);
             g_string_append(s, " as the time ran out");
             mcp_cond_append(s, count, cond);
+            mcp_run_append_more(s, &r);
             g_string_append(s, "; the VM is stopped");
         } else {
             if (res->running) {
@@ -4053,8 +4607,8 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
                 g_string_printf(s, "the VM stopped (%s)",
                                 RunState_str(runstate_get()));
             }
-            g_string_append(s, " before a CPU ");
-            mcp_debug_what(s, b);
+            g_string_append(s, " before ");
+            mcp_debug_what_all(s, b, "a CPU", ", or ", "a device");
             mcp_cond_append(s, NULL, cond);
         }
         break;
@@ -4062,7 +4616,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         g_assert_not_reached();
     }
     if (!res->running) {
-        if (!at) {
+        if (name_cpu) {
             g_string_append_printf(s, "; CPU %d:", cpu->cpu_index);
         }
         if (hist) {
@@ -4082,6 +4636,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         /* and the watched memory, after the memory asked for */
         mcp_debug_show(s, cpu, mem, n_mem + b->n_watches);
     }
+    mcp_dma_append_skipped(s, b);
     qapi_free_strList(hist);
     res->summary = g_strdup(s->str);
     return res;
@@ -4204,6 +4759,7 @@ typedef struct McpTracer {
     int64_t n_other;            /* by instructions past TRACE_INSNS_MAX */
     GHashTable *excps;          /* McpTraceExcp by number */
     int64_t n_other_excps;      /* past TRACE_EXCPS_MAX numbers */
+    int64_t n_dev;              /* devices' writes */
 } McpTracer;
 
 /* Count exception @excp by its number */
@@ -4228,6 +4784,7 @@ static void mcp_trace_log(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
                           const McpExcpSeen *excp, bool retry)
 {
     McpTracer *t = container_of(r, McpTracer, r);
+    bool device = seen && seen->device;
     uint64_t pc = seen ? seen->pc : excp ? excp->from :
                   mcp_debug_reached(&r->b, cpu);
     g_autofree char *at = NULL;
@@ -4240,8 +4797,11 @@ static void mcp_trace_log(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
     if (excp) {
         mcp_trace_count_excp(t, excp);
     }
-    /* which instructions touch the watched memory, trap, or are got to */
-    if (seen || excp || mcp_debug_by_addr(&r->b)) {
+    if (device) {
+        /* no instruction: counted apart, the first one listed */
+        first = !t->n_dev++;
+    } else if (seen || excp || mcp_debug_by_addr(&r->b)) {
+        /* which instructions touch the watched memory, trap, or are got to */
         c = g_hash_table_lookup(t->insns, &pc);
         if (!c && g_hash_table_size(t->insns) < TRACE_INSNS_MAX) {
             c = g_new0(McpTraceCount, 1);
@@ -4281,9 +4841,25 @@ static void mcp_trace_log(McpRun *r, CPUState *cpu, const McpWatchSeen *seen,
     e->cpu = cpu->cpu_index;
     e->pc = g_strdup_printf("0x%" PRIx64, pc);
     at = mcp_addr_str(pc);
-    g_string_append_printf(t->text, "#%" PRId64 " CPU %d at %s", e->hit,
-                           cpu->cpu_index, at);
-    if (seen) {
+    if (device) {
+        e->watch = g_new0(McpWatchHit, 1);
+        e->watch->address = g_strdup_printf("0x%" PRIx64, seen->addr);
+        e->watch->access = g_strdup("write");
+        e->watch->device = mcp_dma_hit(&seen->dma);
+        e->value = mcp_read_words(cpu, seen->addr & ~3ULL, 1,
+                                  seen->dma.physical);
+        g_string_append_printf(t->text, "#%" PRId64 " ", e->hit);
+        mcp_dma_append(t->text, &seen->dma);
+        if (e->value) {
+            g_string_append_printf(t->text, " (now %s)", e->value);
+        }
+        g_string_append_printf(t->text, "; CPU %d at %s", cpu->cpu_index,
+                               at);
+    } else {
+        g_string_append_printf(t->text, "#%" PRId64 " CPU %d at %s",
+                               e->hit, cpu->cpu_index, at);
+    }
+    if (seen && !device) {
         g_autofree char *addr = mcp_addr_str(seen->addr);
 
         e->watch = g_new0(McpWatchHit, 1);
@@ -4347,7 +4923,7 @@ static void mcp_trace_what(GString *s, McpBreak *b)
         mcp_debug_append_addrs(s, b, "and");
         sep = " and ";
     }
-    if (b->n_watches) {
+    if (mcp_debug_cpu_watches(b)) {
         g_string_append(s, sep);
         mcp_debug_append_watches(s, b, what, true, "and");
         sep = " and ";
@@ -4356,6 +4932,15 @@ static void mcp_trace_what(GString *s, McpBreak *b)
         g_string_append(s, sep);
         mcp_debug_append_excp(s, b, "exception", "exceptions", "exceptions",
                               "and");
+        sep = " and ";
+    }
+    if (b->n_watches) {
+        g_autoptr(GString) devs = g_string_new(NULL);
+
+        if (mcp_debug_append_dev(devs, b, "and")) {
+            g_string_append_printf(s, "%sdevices' writes to %s",
+                                   *sep ? ", and " : "", devs->str);
+        }
     }
 }
 
@@ -4502,6 +5087,10 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
     res->ms = ms;
     res->running = runstate_is_running();
     res->entries = t.entries;
+    for (n = 0; n < b->n_watches; n++) {
+        res->has_device_writes |= b->watches[n].devices;
+    }
+    res->device_writes = t.n_dev;
     g_string_assign(s, "Traced ");
     mcp_trace_what(s, b);
     g_string_append_printf(s, " for %.1f s: ", ms / 1000.0);
@@ -4511,9 +5100,13 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
     } else {
         g_string_append(s, "no hits");
     }
+    if (t.n_dev) {
+        g_string_append_printf(s, " (%" PRId64 " by devices)", t.n_dev);
+    }
     if (t.r.result == RUN_REACHED) {
         g_string_append(s, ", as many as asked for");
     }
+    mcp_run_append_more(s, &t.r);
     if (t.r.n_retries) {
         g_string_append_printf(s, " (%" PRId64 " right after an interruption"
                                " there)", t.r.n_retries);
@@ -4576,7 +5169,7 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
         g_ptr_array_sort(sorted, mcp_trace_count_cmp);
         res->has_instructions = true;
         itail = &res->instructions;
-        if (sorted->len) {
+        if (sorted->len || t.n_dev) {
             g_string_append(s, s->str[s->len - 1] == '\n' ? "\n" : "\n\n");
             g_string_append(s, "By instruction:\n");
         }
@@ -4595,6 +5188,10 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
             g_string_append_printf(s, "%8" PRId64 " x other instructions"
                                    " (only %d are told apart)\n", t.n_other,
                                    TRACE_INSNS_MAX);
+        }
+        if (t.n_dev) {
+            g_string_append_printf(s, "%8" PRId64 " x no instruction: a"
+                                   " device wrote\n", t.n_dev);
         }
     }
     if (t.n_listed) {
@@ -4625,6 +5222,7 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
         }
         g_string_append(s, text->str);
     }
+    mcp_dma_append_skipped(s, b);
     res->summary = g_strdup(g_strchomp(s->str));
     return res;
 }
