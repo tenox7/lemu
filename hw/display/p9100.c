@@ -219,6 +219,7 @@ struct P9100State {
     uint32_t vram_size;
     uint32_t pu_config;
     uint8_t silicon_rev;
+    bool intx;
 
     /* system control group */
     uint32_t sysconfig;
@@ -263,7 +264,11 @@ static void p9100_update_irq(P9100State *s)
     uint32_t mask = P9100_INT_DE_IDLE | P9100_INT_PICKED | P9100_INT_VBLANKED;
     uint32_t active = s->interrupt & s->interrupt_en & mask;
 
-    pci_set_irq(PCI_DEVICE(s), (s->interrupt_en & P9100_INT_MASTER) && active);
+    /* Without intx the status bits still latch, for drivers that poll */
+    if (s->intx) {
+        pci_set_irq(PCI_DEVICE(s),
+                    (s->interrupt_en & P9100_INT_MASTER) && active);
+    }
 }
 
 static const uint32_t shift0_bytes[8] = { 0, 0, 0, 128, 256, 512, 1024, 2048 };
@@ -1543,7 +1548,9 @@ static void p9100_reset_hold(Object *obj, ResetType type)
 
     s->width = s->height = s->depth = s->pitch = 0;
     s->full_update = true;
-    pci_set_irq(PCI_DEVICE(s), 0);
+    if (s->intx) {
+        pci_set_irq(PCI_DEVICE(s), 0);
+    }
 
     if (s->pu_config & PU_CONFIG_MODESELECT) {
         s->parent_obj.config[P9100_CFG65] |= CFG65_MODESELECT;
@@ -1597,7 +1604,7 @@ static void p9100_realize(PCIDevice *dev, Error **errp)
     if (s->pu_config & PU_CONFIG_VGA_ABSENT) {
         pci_config_set_class(dev->config, PCI_CLASS_DISPLAY_OTHER);
     }
-    dev->config[PCI_INTERRUPT_PIN] = 1;
+    dev->config[PCI_INTERRUPT_PIN] = s->intx ? 1 : 0;
     dev->config[P9100_CFG64] = (s->pu_config >> 24) & 0xfc;
     dev->wmask[P9100_CFG65] = 0xff;
     dev->wmask[P9100_CFG66] = 0xff;
@@ -1646,6 +1653,8 @@ static const Property p9100_properties[] = {
     DEFINE_PROP_UINT32("vram_size", P9100State, vram_size, 4 * MiB),
     DEFINE_PROP_UINT32("pu-config", P9100State, pu_config, PU_CONFIG_DEFAULT),
     DEFINE_PROP_UINT8("silicon-rev", P9100State, silicon_rev, 4),
+    /* drive PCI INTA# from the interrupt register */
+    DEFINE_PROP_BOOL("intx", P9100State, intx, true),
 };
 
 static void p9100_class_init(ObjectClass *klass, const void *data)

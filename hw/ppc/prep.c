@@ -619,6 +619,12 @@ static void ibm_40p_machine_init(MachineClass *mc)
         { "lsi53c810", "stack-sist", "on" },
         { "lsi53c810", "sip-until-read", "on" },
         { "lsi53c810", "reg-alias", "on" },
+        /*
+         * The residual data gives the video no interrupt, and Solaris
+         * turns on the P9100 vblank interrupt without a handler: on the
+         * slots' shared IRQ 15 that would hang it once the PCnet unmasks it.
+         */
+        { "p9100", "intx", "off" },
     };
 
     mc->desc = "IBM RS/6000 7020 (40p)",
