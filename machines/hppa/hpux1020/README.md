@@ -17,8 +17,8 @@ It is in LEMU's history:
 `git show 90ce9a4150:pc-bios/hppa-firmware.img > hppa-firmware-v25.img`
 
 Check the guest with `ioscan -fnC processor` (four processors, all CLAIMED) and
-`sar -u -M 2 3` (load per CPU). Run it with a window, or with `-display vnc=...`. With
-`-display none` the X server does not start and the VUE login never appears.
+`sar -u -M 2 3` (load per CPU). With `-display none` the VUE login still comes up, out
+of sight: QEMU only hides its window, and the B160L keeps its Artist card.
 
 ## What changed in QEMU
 
