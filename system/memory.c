@@ -35,6 +35,8 @@
 #include "hw/core/boards.h"
 #include "migration/vmstate.h"
 #include "system/address-spaces.h"
+#include "system/io-access-hook.h"
+#include "system/ioport.h"
 
 #include "memory-internal.h"
 
@@ -1404,6 +1406,20 @@ static MemTxResult memory_region_dispatch_read1(MemoryRegion *mr,
     }
 }
 
+/* LEMU: see io-access-hook.h */
+IoAccessHook *io_access_hook;
+
+static inline void io_access_hook_call(MemoryRegion *mr, hwaddr addr,
+                                       uint64_t data, unsigned size,
+                                       bool write, bool ok)
+{
+    IoAccessHook *hook = qatomic_read(&io_access_hook);
+
+    if (unlikely(hook)) {
+        hook(mr, addr, data, size, write, ok);
+    }
+}
+
 MemTxResult memory_region_dispatch_read(MemoryRegion *mr,
                                         hwaddr addr,
                                         uint64_t *pval,
@@ -1420,11 +1436,13 @@ MemTxResult memory_region_dispatch_read(MemoryRegion *mr,
     }
     if (!memory_region_access_valid(mr, addr, size, false, attrs)) {
         *pval = unassigned_mem_read(mr, addr, size);
+        io_access_hook_call(mr, addr, *pval, size, false, false);
         return MEMTX_DECODE_ERROR;
     }
 
     r = memory_region_dispatch_read1(mr, addr, pval, size, attrs);
     adjust_endianness(mr, pval, op);
+    io_access_hook_call(mr, addr, *pval, size, false, true);
     return r;
 }
 
@@ -1468,10 +1486,12 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
                                             data, op, attrs);
     }
     if (!memory_region_access_valid(mr, addr, size, true, attrs)) {
+        io_access_hook_call(mr, addr, data, size, true, false);
         unassigned_mem_write(mr, addr, data, size);
         return MEMTX_DECODE_ERROR;
     }
 
+    io_access_hook_call(mr, addr, data, size, true, true);
     adjust_endianness(mr, &data, op);
 
     /*
@@ -3098,6 +3118,46 @@ void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
     as->name = g_strdup(name ? name : "anonymous");
     address_space_update_topology(as);
     address_space_update_ioeventfds(as);
+}
+
+/* LEMU: the address space called @name, or else so but for case */
+AddressSpace *address_space_find_by_name(const char *name)
+{
+    AddressSpace *as;
+
+    QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+        if (!strcmp(as->name, name)) {
+            return as;
+        }
+    }
+    QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+        if (!g_ascii_strcasecmp(as->name, name)) {
+            return as;
+        }
+    }
+    return NULL;
+}
+
+/* LEMU: the names of the address spaces, each once, joined with ", " */
+char *address_space_names(void)
+{
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(GHashTable) seen = g_hash_table_new(g_str_hash, g_str_equal);
+    AddressSpace *as;
+
+    QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+        if (g_hash_table_add(seen, as->name)) {
+            g_string_append_printf(s, "%s%s", s->len ? ", " : "", as->name);
+        }
+    }
+    return g_string_free(g_steal_pointer(&s), false);
+}
+
+/* LEMU: whether @mr is where nothing is mapped */
+bool memory_region_is_unassigned(MemoryRegion *mr)
+{
+    /* the I/O ports' own region takes the ports no device has */
+    return mr->ops == &unassigned_mem_ops || mr->ops == &unassigned_io_ops;
 }
 
 static void do_address_space_destroy(AddressSpace *as)

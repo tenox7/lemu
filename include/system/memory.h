@@ -2416,6 +2416,34 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
 void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name);
 
 /**
+ * address_space_find_by_name: LEMU: find an address space by its name
+ *
+ * The first one called @name, as 'info mtree' lists them, else the
+ * first one called so but for case; NULL when there is none.
+ *
+ * @name: the name
+ */
+AddressSpace *address_space_find_by_name(const char *name);
+
+/**
+ * address_space_names: LEMU: the names of all address spaces
+ *
+ * Each name once, joined with ", ".  The caller frees the string.
+ */
+char *address_space_names(void);
+
+/**
+ * memory_region_is_unassigned: LEMU: whether nothing is mapped there
+ *
+ * True for the region that address_space_translate() gives where no
+ * RAM, ROM or device is, and for the I/O ports' own region, which takes
+ * the ports that no device has.
+ *
+ * @mr: the memory region
+ */
+bool memory_region_is_unassigned(MemoryRegion *mr);
+
+/**
  * address_space_destroy: destroy an address space
  *
  * Releases all resources associated with an address space.  After an
