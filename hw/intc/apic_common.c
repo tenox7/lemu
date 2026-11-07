@@ -239,6 +239,16 @@ static void apic_reset_common(DeviceState *dev)
     s->apicbase = APIC_DEFAULT_ADDRESS | bsp | MSR_IA32_APICBASE_ENABLE;
     s->id = s->initial_apic_id;
 
+    /*
+     * The reset turns the APIC on again, so CPUID shows it again.  A
+     * guest that turned it off through IA32_APIC_BASE also hid it there
+     * (apic_set_base()), and firmware that finds no APIC in CPUID leaves
+     * LINT0 masked, so the 8259's interrupts never reached the CPU.
+     */
+    if (s->cpuid_apic) {
+        cpu_set_apic_feature(&s->cpu->env);
+    }
+
     kvm_reset_irq_delivered();
 
     s->vapic_paddr = 0;
@@ -261,6 +271,7 @@ static void apic_common_realize(DeviceState *dev, Error **errp)
         error_setg(errp, "APIC is not attached to a CPU");
         return;
     }
+    s->cpuid_apic = cpu_has_apic_feature(&s->cpu->env);
 
     if (s->initial_apic_id >= 255 &&
         !cpu_has_x2apic_feature(&s->cpu->env)) {

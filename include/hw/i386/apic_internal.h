@@ -158,6 +158,7 @@ struct APICCommonState {
 
     MemoryRegion io_memory;
     X86CPU *cpu;
+    bool cpuid_apic; /* the CPU model shows this APIC in CPUID */
     uint32_t apicbase;
     uint8_t id; /* legacy APIC ID */
     uint32_t initial_apic_id;

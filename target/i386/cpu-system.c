@@ -252,6 +252,11 @@ void cpu_set_apic_feature(CPUX86State *env)
     env->features[FEAT_1_EDX] |= CPUID_APIC;
 }
 
+bool cpu_has_apic_feature(CPUX86State *env)
+{
+    return env->features[FEAT_1_EDX] & CPUID_APIC;
+}
+
 bool cpu_has_x2apic_feature(CPUX86State *env)
 {
     return env->features[FEAT_1_ECX] & CPUID_EXT_X2APIC;
