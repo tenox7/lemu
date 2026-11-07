@@ -66,7 +66,12 @@ once, and the host CPU that QEMU uses while the guest waits at the CDE login.
 
 ## Known guest messages
 
-- Each boot logs one error in `/etc/rc.log`: the iCAP agent (`S602icod`) finds no CIM
-  server. It does no harm.
+- At each boot the iCAP agent (`/sbin/rc2.d/S602icod`) fails with a few ERROR lines in
+  `/etc/rc.log`: it finds no CIM server, so it changes nothing. It does no harm; all four
+  CPUs stay active.
+- Host names come from `/etc/hosts` only (`hosts: files` in `/etc/nsswitch.conf`).
+  QEMU's DNS (192.168.1.3, from DHCP) works after a change to `hosts: files dns`.
+- Mozilla 1.7 (`/opt/mozilla/mozilla`) works. Firefox 1.5 (`/opt/firefox`) does not
+  start: `firefox-bin` is a PA-RISC 2.0 program, and the B160L's PA-7300LC is PA-RISC 1.1.
 - After `shutdown -h`, HP-UX says "System has halted" and then spins in a busy wait; type
   `quit` in the monitor.
