@@ -1,6 +1,6 @@
 # One build for all kits
 
-These scripts build QEMU once for all the kits: the six binaries the
+These scripts build QEMU once for all the kits: the seven binaries the
 kits use, for macOS, Linux and Windows. Each machine's own `release/`
 folder then packs its kits from that one build. Without them, each of
 the five release folders builds its own QEMU, so a full set of kits
@@ -8,13 +8,14 @@ compiles the same code 15 times, with slightly different features.
 
 | Binary | Kits (`<name>-qemu.tar.lz`) | Pack script |
 |---|---|---|
-| qemu-system-ppc | aix415rs6k, aix433rs6k, aix51rs6k, nt40powerpc, os2powerpc, sol251powerpc | `../40p/release/mkrelease.sh` |
+| qemu-system-ppc | aix415rs6k, aix433rs6k, aix51rs6k, nt351powerpc, nt40powerpc, os2powerpc, sol251powerpc | `../40p/release/mkrelease.sh` |
 | qemu-system-ppc | aix325rs6000 | `../7006/release/mkrelease.sh` |
 | qemu-system-ppc64 | aix53pseries, aix61pseries, aix71pseries, aix72pseries | `../pseries/release/mkrelease.sh` |
-| qemu-system-alpha | nt31axp, nt40axp | `../jensen/release/pack.sh` |
-| qemu-system-mips64el | nt31mips, nt4-jazz, nt4-rm200, nt4-rm200-smp, nt4srv-rm300-smp4 | `../rm200/release/pack.sh` |
+| qemu-system-alpha | nt31axp, nt351axp, nt40axp | `../jensen/release/pack.sh` |
+| qemu-system-mips64el | nt31mips, nt351-jazz, nt351-rm200, nt4-jazz, nt4-rm200, nt4-rm200-smp, nt4srv-rm300-smp4 | `../rm200/release/pack.sh` |
 | qemu-system-mips64 | sinixn545 | `../rm200/release/pack.sh` |
 | qemu-system-hppa | hpux1020b160l, hpux905-715, hpux907-715, hpux11v1b160l | `../hppa/release/mkrelease.sh` |
+| qemu-system-i386 | nt351x86 | `../pc/release/pack.sh` |
 
 Run them on an Apple Silicon Mac with Homebrew and Docker. The Linux and
 Windows builds run in Docker.
@@ -34,7 +35,7 @@ commit.
 - `OUT/rc` must show exit code 0 for all four. The logs are in
   `OUT/*.log`.
 - Each binary has every feature that any of the five machine builds had.
-  qemu-system-hppa gets the same set.
+  qemu-system-hppa and qemu-system-i386 get the same set.
 - `build-mac.sh` prints the oldest macOS the binaries run on
   (`needs macOS ...`). The kit READMEs must say the same.
 
@@ -55,7 +56,7 @@ what each binary has in `OUT/macos-*.features` and
 
     sh stage.sh OUT STAGE
 
-`stage.sh` makes `STAGE` new. `STAGE/ppc`, `STAGE/ppc64`, `STAGE/alpha`
+`stage.sh` makes `STAGE` new. `STAGE/i386`, `STAGE/ppc`, `STAGE/ppc64`, `STAGE/alpha`
 and `STAGE/hppa` each hold only their own binary. `STAGE/mips` has the
 folder names that `rm200/release/pack.sh` wants. Give the pack scripts
 these folders in place of their own build, for example:
@@ -64,6 +65,7 @@ these folders in place of their own build, for example:
     sh ../7006/release/mkrelease.sh VMDIR STAGE/ppc aix325rs6000-qemu.tar.lz
     sh ../pseries/release/mkrelease.sh aix53 VMDIR STAGE/ppc64 aix53pseries-qemu.tar.lz
     sh ../jensen/release/pack.sh nt40 SRCDIR STAGE/alpha nt40axp-qemu.tar.lz
+    sh ../pc/release/pack.sh nt351 VMDIR STAGE/i386 nt351x86-qemu.tar.lz
     sh ../rm200/release/pack.sh KITDIR qemu-system-mips64el STAGE/mips nt4-rm200-qemu.tar.lz
     sh ../hppa/release/mkrelease.sh hpux1020 VMDIR STAGE/hppa hpux1020b160l-qemu.tar.lz
     sh ../hppa/release/mkrelease.sh hpux905 VMDIR STAGE/hppa hpux905-715-qemu.tar.lz

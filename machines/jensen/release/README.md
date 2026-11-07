@@ -2,14 +2,15 @@
 
 Scripts that build the portable QEMU for the Jensen kits on macOS, Linux
 and Windows, check that nothing is missing, and pack the kits. One build
-serves both kits:
+serves all three kits:
 
 | Kit | Guest | Disk |
 |---|---|---|
 | nt31axp-qemu | Windows NT 3.1 (build 511, SP3) | nt31.qcow2 |
 | nt40axp-qemu | Windows NT 4.0 Workstation (build 1381, SP6a) | nt40.qcow2 |
+| nt351axp-qemu | Windows NT 3.51 Workstation (build 1057, SP5) | nt351.qcow2 |
 
-A kit has run.sh, run.cmd and README.txt from `../nt31` or `../nt40`, the
+A kit has run.sh, run.cmd and README.txt from `../nt31`, `../nt40` or `../nt351`, the
 disk, the flash (feprom0.bin, feprom1.bin), the NVRAM (rtc.bin), the
 firmware (fw/) and the binaries in bin/.
 
@@ -52,6 +53,7 @@ What each platform gets:
 
     sh pack.sh nt31 VMDIR $OUT nt31axp-qemu.tar.lz
     sh pack.sh nt40 VMDIR $OUT nt40axp-qemu.tar.lz
+    sh pack.sh nt351 VMDIR $OUT nt351axp-qemu.tar.lz
     sh verify.sh WORKDIR nt31axp-qemu.tar.lz nt40axp-qemu.tar.lz
     sh ltest.sh amd64 ubuntu:24.04 KITCOPY
 

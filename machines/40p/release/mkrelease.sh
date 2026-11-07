@@ -1,11 +1,12 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 set -e
-[ $# -eq 4 ] || { echo "usage: $0 nt|os2|solaris|aix41|aix43|aix51 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
+[ $# -eq 4 ] || { echo "usage: $0 nt|nt351|os2|solaris|aix41|aix43|aix51 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 os=$1 vm=$2 bin=$3 out=$4
 case $os in
 nt) name=nt40powerpc-qemu disk=nt40 nvram=nvram.bin ;;
+nt351) name=nt351powerpc-qemu disk=nt351 nvram=nvram.bin ;;
 os2) name=os2powerpc-qemu disk=os2 nvram=nvram-os2.bin ;;
 solaris) name=sol251powerpc-qemu disk=sol251 nvram=nvram-sol.bin ;;
 aix41) name=aix415rs6k-qemu disk=aix415 nvram=nvram.bin ;;
@@ -42,7 +43,7 @@ find "$here/../../../pc-bios/keymaps" -type f ! -name meson.build \
 for p in macos-arm64 linux-x86_64 linux-aarch64 windows-x86_64; do
     cp -a "$bin/$p" "$r/bin/"
 done
-if [ $os != nt ]; then
+if [ $os != nt ] && [ $os != nt351 ]; then
     cp "$here/../../../pc-bios/efi-pcnet.rom" "$r/bin/share/qemu/"
     cp "$here/../../../pc-bios/efi-pcnet.rom" "$r/bin/windows-x86_64/share/"
 fi

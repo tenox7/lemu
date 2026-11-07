@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # Pack a Jensen kit: the disk, flash, NVRAM and firmware from VMDIR,
 # run.sh, run.cmd and README.txt from ../GUEST, the binaries from BINDIR
-# usage: pack.sh nt31|nt40 VMDIR BINDIR OUT.tar.lz
+# usage: pack.sh nt31|nt40|nt351 VMDIR BINDIR OUT.tar.lz
 #   VMDIR   holds GUEST.qcow2, feprom0.bin, feprom1.bin, rtc.bin and
 #           fw/928-n9.bin, fw/jensen-v2.2.bin; it is only read
 #   BINDIR  the OUT folder of the build scripts
 set -e
-[ $# -eq 4 ] || { echo "usage: $0 nt31|nt40 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
+[ $# -eq 4 ] || { echo "usage: $0 nt31|nt40|nt351 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 top=$(cd "$here/../../.." && pwd)
 g=$1 vm=$2 bin=$3
