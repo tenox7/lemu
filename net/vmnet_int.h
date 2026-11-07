@@ -47,12 +47,27 @@ typedef struct VmnetState {
     struct iovec iov_buf[VMNET_PACKETS_LIMIT];
 
     VMChangeStateEntry *change;
+
+    /* lemu-vmnet, when QEMU is not root: see vmnet_helper_start() */
+    bool helper;
+    bool helper_dead;
+    int helper_fd;
+    pid_t helper_pid;
+    uint8_t *helper_buf;
+
+    /* The MAC address lock: see vmnet_claim_mac() */
+    const char *kind;           /* "bridged", "shared" or "host" */
+    bool watching_mac;
+    Notifier machine_done;
+    bool mac_locked;
+    int mac_lock_fd;
 } VmnetState;
 
 const char *vmnet_status_map_str(vmnet_return_t status);
 
 int vmnet_if_create(NetClientState *nc,
                     xpc_object_t if_desc,
+                    const char *helper,
                     Error **errp);
 
 ssize_t vmnet_receive_common(NetClientState *nc,

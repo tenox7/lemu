@@ -4649,6 +4649,14 @@ if have_tools
   endif
 endif
 
+# vmnet without sudo: a setuid root helper, see lemu-vmnet.c. Plain C,
+# without glib, so that little runs as root.
+if have_system and vmnet.found()
+  executable('lemu-vmnet', files('lemu-vmnet.c'),
+             dependencies: [vmnet],
+             install: true)
+endif
+
 if stap.found()
   foreach t: traceable
     foreach stp: [

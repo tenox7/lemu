@@ -95,7 +95,8 @@ int net_init_vmnet_shared(const Netdev *netdev, const char *name,
     }
 
     if_desc = build_if_desc(netdev);
-    result = vmnet_if_create(nc, if_desc, errp);
+    result = vmnet_if_create(nc, if_desc, netdev->u.vmnet_shared.helper,
+                             errp);
     xpc_release(if_desc);
     return result;
 }

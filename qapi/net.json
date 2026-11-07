@@ -778,6 +778,9 @@
 #     is allowed only with other interfaces added to this network
 #     identified by the UUID.  Requires at least macOS Big Sur 11.0.
 #
+# @helper: the setuid lemu-vmnet helper that starts vmnet when QEMU
+#     is not root (default: /usr/local/bin/lemu-vmnet) (Since: 11.2)
+#
 # Since: 7.1
 ##
 { 'struct': 'NetdevVmnetHostOptions',
@@ -786,7 +789,8 @@
     '*end-address':   'str',
     '*subnet-mask':   'str',
     '*isolated':      'bool',
-    '*net-uuid':      'str' },
+    '*net-uuid':      'str',
+    '*helper':        'str' },
   'if': 'CONFIG_VMNET' }
 
 ##
@@ -822,6 +826,9 @@
 #     unique local address i.e. start with fd00::/8 and have length of
 #     64.
 #
+# @helper: the setuid lemu-vmnet helper that starts vmnet when QEMU
+#     is not root (default: /usr/local/bin/lemu-vmnet) (Since: 11.2)
+#
 # Since: 7.1
 ##
 { 'struct': 'NetdevVmnetSharedOptions',
@@ -830,7 +837,8 @@
     '*end-address':   'str',
     '*subnet-mask':   'str',
     '*isolated':      'bool',
-    '*nat66-prefix':  'str' },
+    '*nat66-prefix':  'str',
+    '*helper':        'str' },
   'if': 'CONFIG_VMNET' }
 
 ##
@@ -846,12 +854,16 @@
 #     other vmnet interfaces.  Only communication with host is
 #     allowed.  Requires at least macOS Big Sur 11.0.
 #
+# @helper: the setuid lemu-vmnet helper that starts vmnet when QEMU
+#     is not root (default: /usr/local/bin/lemu-vmnet) (Since: 11.2)
+#
 # Since: 7.1
 ##
 { 'struct': 'NetdevVmnetBridgedOptions',
   'data': {
     'ifname':     'str',
-    '*isolated':  'bool' },
+    '*isolated':  'bool',
+    '*helper':    'str' },
   'if': 'CONFIG_VMNET' }
 
 ##
