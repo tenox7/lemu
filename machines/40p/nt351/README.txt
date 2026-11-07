@@ -7,6 +7,9 @@ Mouse: no vmmouse driver, so QEMU grabs the mouse when you click in the window. 
 The QEMU monitor is in the terminal: sendkey ctrl-alt-delete, change cd0 file.iso (E: in NT), change fd0 file.img.
 The screen is 1280x1024 with 65536 colours (Weitek P9100, NT's weitekp9 driver). 16.7 million colours shows wrong colours.
 NT is in C:\WINNT35 (NTFS). D: is the 5 MB FAT system partition.
+Compilers: Visual C++ 4.1 for PowerPC (cl 10.10) in C:\MSDEV and the Win32 SDK of August 1996 in C:\MSTOOLS. cl and nmake work in any new Command Prompt.
+APPVER=3.51 makes the SDK's win32.mak build programs for NT 3.51. The SDK tools need MSVCRT.DLL 4.20 and MFC42.DLL: NT 3.51 has neither, so both are in C:\MSTOOLS\BIN.
+Developer Studio asks for the VC++ CD when it starts (the help is on that CD): press Cancel.
 The clock is the host's local time. The firmware shows the year as 1926; NT shows the right one.
 Network is QEMU user mode NAT on an ISA NE2000 (DHCP, 10.0.2.15).
 QEMU halts the CPU while NT is idle, so an idle VM uses about 5% of a host core.

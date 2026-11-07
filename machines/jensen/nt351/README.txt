@@ -6,6 +6,9 @@ The firmware takes about a minute to show its boot menu, then boots NT by itself
 Mouse: no vmmouse driver, so QEMU grabs the mouse when you click in the window. Ctrl-Alt-G lets it go.
 The screen is 1280x1024 with 65536 colours (S3 86C928, 4 MB).
 C: is the 10 MB FAT system partition, NT is in D:\WINNT35 (NTFS), the CD-ROM is E:.
+Compilers: Visual C++ 4.1 for Alpha (cl 10.10) in D:\MSDEV and the Win32 SDK of August 1996 in D:\MSTOOLS. cl and nmake work in any new Command Prompt.
+APPVER=3.51 makes the SDK's win32.mak build programs for NT 3.51. The SDK tools need MSVCRT.DLL 4.20 and MFC42.DLL: NT 3.51 has neither, so both are in D:\MSTOOLS\BIN.
+Developer Studio asks for the VC++ CD when it starts (the help is on that CD): press Cancel.
 QEMU halts the CPU while NT is idle, so an idle VM uses about 3% of a host core.
 The clock runs 28 years behind (the firmware rejects current years). Network is QEMU user mode NAT (NE2000, DHCP, 10.0.2.15).
 QEMU monitor: Ctrl-Alt-2 (back with Ctrl-Alt-1). CD-ROM and floppy are empty: change cd0 file.iso, change fd0 file.img.
