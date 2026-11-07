@@ -822,6 +822,17 @@ typedef struct P9100Clip {
     int xmin, ymin, xmax, ymax;
 } P9100Clip;
 
+/* The pixel clipping window from W_MIN and W_MAX, made half-open */
+static void p9100_clip_window(P9100State *s, unsigned bypp, P9100Clip *clip)
+{
+    clip->xmin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] >> 16));
+    clip->ymin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] & 0xffff));
+    clip->xmax = MIN(p9100_max_x(s, bypp),
+                     (int16_t)(s->de[DE_P_W_MAX] >> 16) + 1);
+    clip->ymax = MIN(p9100_max_y(s),
+                     (int16_t)(s->de[DE_P_W_MAX] & 0xffff) + 1);
+}
+
 static void p9100_plot(P9100State *s, uint8_t *vram, unsigned bypp,
                        const P9100Clip *clip, int x, int y)
 {
@@ -893,12 +904,7 @@ static void p9100_quad(P9100State *s)
         ymax = MAX(ymax, s->y[i]);
     }
 
-    clip.xmin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] >> 16));
-    clip.ymin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] & 0xffff));
-    clip.xmax = MIN(p9100_max_x(s, bypp),
-                    (int16_t)(s->de[DE_P_W_MAX] >> 16) + 1);
-    clip.ymax = MIN(p9100_max_y(s),
-                    (int16_t)(s->de[DE_P_W_MAX] & 0xffff) + 1);
+    p9100_clip_window(s, bypp, &clip);
 
     lo_y = MAX(ymin, clip.ymin);
     hi_y = MIN(ymax, clip.ymax);
@@ -968,7 +974,7 @@ static void p9100_blit(P9100State *s)
     int dx = MIN(s->x[2], s->x[3]), dy = MIN(s->y[2], s->y[3]);
     int w = MIN(abs(s->x[1] - s->x[0]), abs(s->x[3] - s->x[2]));
     int h = MIN(abs(s->y[1] - s->y[0]), abs(s->y[3] - s->y[2]));
-    int xmin, ymin, xmax, ymax;
+    P9100Clip clip;
     int row, step;
 
     if (!p9100_accel_ready(s, &bypp)) {
@@ -976,23 +982,20 @@ static void p9100_blit(P9100State *s)
     }
     vram = memory_region_get_ram_ptr(&s->vram);
 
-    xmin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] >> 16));
-    ymin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] & 0xffff));
-    xmax = MIN(p9100_max_x(s, bypp), (int16_t)(s->de[DE_P_W_MAX] >> 16) + 1);
-    ymax = MIN(p9100_max_y(s), (int16_t)(s->de[DE_P_W_MAX] & 0xffff) + 1);
+    p9100_clip_window(s, bypp, &clip);
 
-    if (dx < xmin) {
-        w -= xmin - dx;
-        sx += xmin - dx;
-        dx = xmin;
+    if (dx < clip.xmin) {
+        w -= clip.xmin - dx;
+        sx += clip.xmin - dx;
+        dx = clip.xmin;
     }
-    if (dy < ymin) {
-        h -= ymin - dy;
-        sy += ymin - dy;
-        dy = ymin;
+    if (dy < clip.ymin) {
+        h -= clip.ymin - dy;
+        sy += clip.ymin - dy;
+        dy = clip.ymin;
     }
-    w = MIN(w, xmax - dx);
-    h = MIN(h, ymax - dy);
+    w = MIN(w, clip.xmax - dx);
+    h = MIN(h, clip.ymax - dy);
 
     w = MIN(w, p9100_max_x(s, bypp) - MAX(sx, dx));
     h = MIN(h, p9100_max_y(s) - MAX(sy, dy));
@@ -1115,6 +1118,7 @@ static void p9100_pixel1(P9100State *s, unsigned npix, uint32_t val)
     int dirty_lo = -1, dirty_hi = -1;
     unsigned bypp, i;
     uint8_t *vram;
+    P9100Clip clip;
 
     if (!p9100_accel_ready(s, &bypp)) {
         return;
@@ -1125,6 +1129,8 @@ static void p9100_pixel1(P9100State *s, unsigned npix, uint32_t val)
         return;
     }
     vram = memory_region_get_ram_ptr(&s->vram);
+    /* X draws text with pixel1 and clips it to each window by W_MIN/W_MAX */
+    p9100_clip_window(s, bypp, &clip);
 
     if (s->x[1] < left || s->x[1] > right) {
         s->x[1] = left;
@@ -1146,8 +1152,8 @@ static void p9100_pixel1(P9100State *s, unsigned npix, uint32_t val)
         }
         colour = s->de[bit ? DE_COLOR1 : DE_COLOR0];
 
-        if (s->y[1] >= 0 && s->y[1] < p9100_max_y(s) && s->x[1] >= 0 &&
-            (s->x[1] + 1) * (int)bypp <= (int)s->pitch) {
+        if (s->x[1] >= clip.xmin && s->x[1] < clip.xmax &&
+            s->y[1] >= clip.ymin && s->y[1] < clip.ymax) {
             off = (size_t)s->y[1] * s->pitch + (size_t)s->x[1] * bypp;
 
             for (lane = 0; lane < bypp; lane++) {
