@@ -2203,11 +2203,33 @@ static inline void cirrus_cursor_compute_yrange(CirrusVGAState *s)
     }
 }
 
-/* NOTE: we do not currently handle the cursor bitmap change, so we
-   update the cursor only if it moves. */
+/*
+ * Has the guest changed the cursor image since the last frame? NT changes it in
+ * place (arrow to hourglass and back) without moving the pointer.
+ */
+static bool cirrus_cursor_image_changed(CirrusVGAState *s)
+{
+    const uint8_t *src = s->vga.vram_ptr + s->real_vram_size - 16 * KiB;
+    size_t len;
+
+    if (s->vga.sr[0x12] & CIRRUS_CURSOR_LARGE) {
+        src += (s->vga.sr[0x13] & 0x3c) * 256;
+        len = 1024;
+    } else {
+        src += (s->vga.sr[0x13] & 0x3f) * 256;
+        len = 256;
+    }
+    if (!memcmp(s->last_hw_cursor_image, src, len)) {
+        return false;
+    }
+    memcpy(s->last_hw_cursor_image, src, len);
+    return true;
+}
+
 static void cirrus_cursor_invalidate(VGACommonState *s1)
 {
     CirrusVGAState *s = container_of(s1, CirrusVGAState, vga);
+    bool image_changed;
     int size;
 
     if (!(s->vga.sr[0x12] & CIRRUS_CURSOR_SHOW)) {
@@ -2218,8 +2240,9 @@ static void cirrus_cursor_invalidate(VGACommonState *s1)
         else
             size = 32;
     }
+    image_changed = size && cirrus_cursor_image_changed(s);
     /* invalidate last cursor and new cursor if any change */
-    if (s->last_hw_cursor_size != size ||
+    if (image_changed || s->last_hw_cursor_size != size ||
         s->last_hw_cursor_x != s->vga.hw_cursor_x ||
         s->last_hw_cursor_y != s->vga.hw_cursor_y) {
 

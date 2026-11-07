@@ -91,6 +91,7 @@ typedef struct CirrusVGAState {
     int last_hw_cursor_y;
     int last_hw_cursor_y_start;
     int last_hw_cursor_y_end;
+    uint8_t last_hw_cursor_image[1024]; /* the image last drawn */
     int real_vram_size; /* XXX: suppress that */
     int device_id;
     int bustype;
