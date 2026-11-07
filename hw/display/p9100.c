@@ -823,7 +823,7 @@ typedef struct P9100Clip {
 } P9100Clip;
 
 /* The pixel clipping window from W_MIN and W_MAX, made half-open */
-static void p9100_clip_window(P9100State *s, unsigned bypp, P9100Clip *clip)
+static void p9100_pixel_window(P9100State *s, unsigned bypp, P9100Clip *clip)
 {
     clip->xmin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] >> 16));
     clip->ymin = MAX(0, (int16_t)(s->de[DE_P_W_MIN] & 0xffff));
@@ -831,6 +831,41 @@ static void p9100_clip_window(P9100State *s, unsigned bypp, P9100Clip *clip)
                      (int16_t)(s->de[DE_P_W_MAX] >> 16) + 1);
     clip->ymax = MIN(p9100_max_y(s),
                      (int16_t)(s->de[DE_P_W_MAX] & 0xffff) + 1);
+}
+
+/* The byte clipping window from B_W_MIN and B_W_MAX, made half-open */
+static void p9100_byte_window(P9100State *s, P9100Clip *clip)
+{
+    clip->xmin = MAX(0, (int16_t)(s->de[DE_B_W_MIN] >> 16));
+    clip->ymin = MAX(0, (int16_t)(s->de[DE_B_W_MIN] & 0xffff));
+    clip->xmax = MIN((int)s->pitch, (int16_t)(s->de[DE_B_W_MAX] >> 16) + 1);
+    clip->ymax = MIN(p9100_max_y(s),
+                     (int16_t)(s->de[DE_B_W_MAX] & 0xffff) + 1);
+}
+
+static void p9100_clip_and(P9100Clip *clip, const P9100Clip *with)
+{
+    clip->xmin = MAX(clip->xmin, with->xmin);
+    clip->ymin = MAX(clip->ymin, with->ymin);
+    clip->xmax = MIN(clip->xmax, with->xmax);
+    clip->ymax = MIN(clip->ymax, with->ymax);
+}
+
+/*
+ * Drawing is clipped to both windows. Solaris's X clips its text with the
+ * pixel window. NT 3.51 leaves that open and clips text and icons with the
+ * byte window, and NetBSD's driver opens the byte window before each blit,
+ * fill and text. A pixel is drawn when all its bytes are in the byte window.
+ */
+static void p9100_clip_window(P9100State *s, unsigned bypp, P9100Clip *clip)
+{
+    P9100Clip b;
+
+    p9100_pixel_window(s, bypp, clip);
+    p9100_byte_window(s, &b);
+    b.xmin = DIV_ROUND_UP(b.xmin, bypp);
+    b.xmax /= bypp;
+    p9100_clip_and(clip, &b);
 }
 
 static void p9100_plot(P9100State *s, uint8_t *vram, unsigned bypp,
@@ -980,7 +1015,7 @@ static void p9100_blit(P9100State *s)
     int dx = MIN(s->x[2], s->x[3]), dy = MIN(s->y[2], s->y[3]);
     int w = MIN(abs(s->x[1] - s->x[0]), abs(s->x[3] - s->x[2])) + 1;
     int h = MIN(abs(s->y[1] - s->y[0]), abs(s->y[3] - s->y[2])) + 1;
-    P9100Clip clip;
+    P9100Clip clip, b;
     int row, step;
 
     if (!p9100_accel_ready(s, &bypp)) {
@@ -988,10 +1023,12 @@ static void p9100_blit(P9100State *s)
     }
     vram = memory_region_get_ram_ptr(&s->vram);
 
-    /* The pixel clipping window, in bytes */
-    p9100_clip_window(s, bypp, &clip);
+    /* Both clipping windows, in bytes */
+    p9100_pixel_window(s, bypp, &clip);
     clip.xmin *= bypp;
     clip.xmax *= bypp;
+    p9100_byte_window(s, &b);
+    p9100_clip_and(&clip, &b);
 
     if (dx < clip.xmin) {
         w -= clip.xmin - dx;
@@ -1054,7 +1091,7 @@ static void p9100_pixel8(P9100State *s, uint32_t val)
     unsigned bypp;
     uint8_t *vram;
     int i, dirty_lo = -1, dirty_hi = -1;
-    int bx0, by0, bx1, by1;
+    P9100Clip b;
     bool copy;
 
     if (!p9100_accel_ready(s, &bypp)) {
@@ -1073,10 +1110,7 @@ static void p9100_pixel8(P9100State *s, uint32_t val)
 
     copy = op == 0xcc && s->de[DE_PMASK] == 0xffffffff;
 
-    bx0 = MAX(0, (int16_t)(s->de[DE_B_W_MIN] >> 16));
-    by0 = MAX(0, (int16_t)(s->de[DE_B_W_MIN] & 0xffff));
-    bx1 = MIN((int)s->pitch, (int16_t)(s->de[DE_B_W_MAX] >> 16) + 1);
-    by1 = MIN(p9100_max_y(s), (int16_t)(s->de[DE_B_W_MAX] & 0xffff) + 1);
+    p9100_byte_window(s, &b);
 
     for (i = 0; i < 4; i++) {
         int x = s->x[1] + i;
@@ -1088,7 +1122,8 @@ static void p9100_pixel8(P9100State *s, uint32_t val)
             s->de[DE_PIXEL8] = val << (8 * i);
             break;
         }
-        if (s->y[1] < by0 || s->y[1] >= by1 || x < bx0 || x >= bx1) {
+        if (s->y[1] < b.ymin || s->y[1] >= b.ymax ||
+            x < b.xmin || x >= b.xmax) {
             continue;
         }
         off = (size_t)s->y[1] * s->pitch + x;
@@ -1138,7 +1173,6 @@ static void p9100_pixel1(P9100State *s, unsigned npix, uint32_t val)
         return;
     }
     vram = memory_region_get_ram_ptr(&s->vram);
-    /* X draws text with pixel1 and clips it to each window by W_MIN/W_MAX */
     p9100_clip_window(s, bypp, &clip);
 
     if (s->x[1] < left || s->x[1] > right) {
