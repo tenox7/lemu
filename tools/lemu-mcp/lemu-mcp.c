@@ -65,6 +65,11 @@ static const char vm_wait_tool[] =
     " answer, instead of a sleep or pgrep loop in a shell. until up: the"
     " VM runs and its tools answer (give the name from -name, or the"
     " PID); then wait for the guest with wait-screen or serial-expect."
+    " With restarted, only a new process of that VM counts, so the call"
+    " can begin before a restart. A VM started with -S waits before its"
+    " first instruction: to catch a boot prompt that shows only for"
+    " seconds, resume it with vm-power in a steps call that then waits"
+    " for the prompt (wait-screen until text) and answers it."
     " until gone: its QEMU process has ended and closed its disks, for"
     " example after a guest shutdown. until port: a TCP port on this"
     " host sends an answer, such as a port that hostfwd forwards to the"
@@ -76,6 +81,9 @@ static const char vm_wait_tool[] =
     " VM, a name or PID\"},"
     "\"until\":{\"type\":\"string\",\"enum\":[\"up\",\"gone\",\"port\"],"
     "\"description\":\"what to wait for (default: up)\"},"
+    "\"restarted\":{\"type\":\"boolean\",\"description\":\"until up: wait"
+    " for a new process of the VM, with another PID than it had when the"
+    " call began, as after a restart; give its name (default: false)\"},"
     "\"port\":{\"type\":\"integer\",\"description\":\"until port: the TCP"
     " port\"},"
     "\"host\":{\"type\":\"string\",\"description\":\"until port: the host"
@@ -1008,6 +1016,8 @@ typedef struct Wait {
     char *label;                /* "VM 'x'", "VM x (pid N)" or "pid N" */
     char *name;                 /* up: the name asked for, or NULL */
     int64_t pid;                /* the PID, or -1 */
+    bool restarted;             /* up: only a new process counts */
+    int64_t old_pid;            /* restarted: the VM's PID at the start */
     char *file;                 /* gone: the VM's registry file */
     bool listed;                /* up: seen in the registry */
 
@@ -1199,13 +1209,17 @@ static bool wait_check_up(Wait *w)
     for (i = 0; i < list->len; i++) {
         Vm *vm = g_ptr_array_index(list, i);
 
+        if (w->restarted && vm->pid == w->old_pid) {
+            continue;           /* the process we wait to be replaced */
+        }
         if (w->pid >= 0 ? vm->pid == w->pid : !strcmp(vm->name, w->name)) {
             found = vm;
             n++;
         }
     }
     if (n > 1) {
-        wait_error(w, "several VMs are named '%s'; use the PID", w->name);
+        wait_error(w, "several VMs are named '%s'%s", w->name,
+                   w->restarted ? "" : "; use the PID");
         return true;
     }
     if (!found) {
@@ -1227,9 +1241,16 @@ static bool wait_check_up(Wait *w)
         }
         return false;
     }
-    text = g_strdup_printf("VM %s (pid %d) is up after %.1f s: %s in %s",
-                           found->name, found->pid, wait_secs(w),
-                           found->machine, found->cwd);
+    if (w->old_pid >= 0) {
+        text = g_strdup_printf("VM %s is up again after %.1f s, as pid %d"
+                               " (it was pid %" PRId64 "): %s in %s",
+                               found->name, wait_secs(w), found->pid,
+                               w->old_pid, found->machine, found->cwd);
+    } else {
+        text = g_strdup_printf("VM %s (pid %d) is up after %.1f s: %s in %s",
+                               found->name, found->pid, wait_secs(w),
+                               found->machine, found->cwd);
+    }
     wait_done(w, true, text, vm_describe(found, true));
     return true;
 }
@@ -1448,6 +1469,12 @@ static void wait_timeout(Wait *w)
                                    " with that PID came up in %.1f s; was it"
                                    " started with -mcp off?", w->pid,
                                    wait_secs(w));
+        } else if (w->old_pid >= 0) {
+            text = g_strdup_printf("no new process of VM '%s' came up in"
+                                   " %.1f s; the old one (pid %" PRId64 ")"
+                                   " %s", w->name, wait_secs(w), w->old_pid,
+                                   pid_alive(w->old_pid) ? "still runs"
+                                                         : "has ended");
         } else {
             text = g_strdup_printf("no VM named '%s' came up in %.1f s; look"
                                    " at the output of the command that"
@@ -1585,6 +1612,29 @@ static bool wait_vm_init(Wait *w, QObject *arg)
         w->name = g_strdup(name);
     }
 
+    if (w->restarted) {
+        g_autoptr(GPtrArray) list = NULL;
+        guint i;
+
+        if (pid >= 0) {
+            wait_error(w, "restarted needs the VM's name: a new process has"
+                       " another PID");
+            return false;
+        }
+        list = registry_scan();
+        for (i = 0; i < list->len; i++) {
+            Vm *vm = g_ptr_array_index(list, i);
+
+            if (!strcmp(vm->name, name)) {
+                if (w->old_pid >= 0) {
+                    wait_error(w, "several VMs are named '%s'", name);
+                    return false;
+                }
+                w->old_pid = vm->pid;
+            }
+        }
+    }
+
     if (w->until == WAIT_GONE) {
         g_autoptr(GPtrArray) list = registry_scan();
         g_autofree char *path = NULL;
@@ -1679,6 +1729,7 @@ static void client_vm_wait(QObject *id, QDict *params)
     w->client_id = qobject_ref(id);
     w->progress_token = token ? qobject_ref(token) : NULL;
     w->pid = -1;
+    w->old_pid = -1;
     w->fd = -1;
     w->start_ms = now_ms();
     w->next_progress_ms = w->start_ms + WAIT_PROGRESS_MS;
@@ -1698,6 +1749,11 @@ static void client_vm_wait(QObject *id, QDict *params)
         w->until = WAIT_PORT;
     } else {
         wait_error(w, "until must be up, gone or port");
+        return;
+    }
+    w->restarted = args && qdict_get_try_bool(args, "restarted", false);
+    if (w->restarted && w->until != WAIT_UP) {
+        wait_error(w, "restarted goes with until up");
         return;
     }
 

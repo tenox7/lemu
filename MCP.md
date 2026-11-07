@@ -46,7 +46,7 @@ only when exactly one VM is running and you started it.
 | Tool | What it does |
 |---|---|
 | `vm-list` | List the running VMs: name, PID, folder, machine, who started it |
-| `vm-wait` | Wait for a VM to start or end, or for a guest service on a forwarded port |
+| `vm-wait` | Wait for a VM to start, end or start again, or for a guest service on a forwarded port |
 | `vm-info` | Describe one VM: screens, mouse, disks, serial ports. Use it first |
 | `vm-stats` | Measure how much host CPU a VM uses and how often its CPUs are halted |
 | `screenshot` | Take a picture of a screen (PNG) |
@@ -150,6 +150,7 @@ Use these:
 | Wait until a menu line is chosen (highlighted) | `wait-screen` until `text` with `highlighted` |
 | Press keys, type, wait and look, several times, in one call | `steps` |
 | Wait for a VM to start, or to end | `vm-wait` until `up` or `gone` |
+| Wait for a VM to start again after a restart | `vm-wait` with `restarted` |
 | Wait until a guest service answers on a forwarded port | `vm-wait` until `port` |
 | See how much host CPU a VM uses, and whether the guest idles | `vm-stats` |
 | Crop or zoom a screenshot | `screenshot` with `region` and `scale` |
