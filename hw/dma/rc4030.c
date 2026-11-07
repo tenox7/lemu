@@ -564,6 +564,8 @@ static void rc4030_reset(DeviceState *dev)
     s->isr_jazz = 0;
 
     s->itr = 0;
+    /* the interval timer starts again when the reload register is written */
+    timer_del(s->periodic_timer);
 
     qemu_irq_lower(s->timer_irq);
     qemu_irq_lower(s->jazz_bus_irq);
