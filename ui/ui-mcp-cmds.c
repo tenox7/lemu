@@ -22,6 +22,7 @@
 #include "qobject/qstring.h"
 #include "system/runstate.h"
 #include "ui/console.h"
+#include "console-priv.h"
 #include "ui/frames.h"
 #include "ui/input.h"
 #include "ui/png.h"
@@ -387,6 +388,360 @@ static void mcp_wait_summary(GString *s, QemuFramesUntil until,
     }
 }
 
+/* Text mode */
+
+/* Code page 437, as the PC draws it, control codes included */
+static const uint16_t mcp_cp437[256] = {
+    0x0020, 0x263a, 0x263b, 0x2665, 0x2666, 0x2663, 0x2660, 0x2022,
+    0x25d8, 0x25cb, 0x25d9, 0x2642, 0x2640, 0x266a, 0x266b, 0x263c,
+    0x25ba, 0x25c4, 0x2195, 0x203c, 0x00b6, 0x00a7, 0x25ac, 0x21a8,
+    0x2191, 0x2193, 0x2192, 0x2190, 0x221f, 0x2194, 0x25b2, 0x25bc,
+    0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,
+    0x0028, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x002f,
+    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
+    0x0038, 0x0039, 0x003a, 0x003b, 0x003c, 0x003d, 0x003e, 0x003f,
+    0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
+    0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e, 0x004f,
+    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
+    0x0058, 0x0059, 0x005a, 0x005b, 0x005c, 0x005d, 0x005e, 0x005f,
+    0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
+    0x0068, 0x0069, 0x006a, 0x006b, 0x006c, 0x006d, 0x006e, 0x006f,
+    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
+    0x0078, 0x0079, 0x007a, 0x007b, 0x007c, 0x007d, 0x007e, 0x2302,
+    0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7,
+    0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
+    0x00c9, 0x00e6, 0x00c6, 0x00f4, 0x00f6, 0x00f2, 0x00fb, 0x00f9,
+    0x00ff, 0x00d6, 0x00dc, 0x00a2, 0x00a3, 0x00a5, 0x20a7, 0x0192,
+    0x00e1, 0x00ed, 0x00f3, 0x00fa, 0x00f1, 0x00d1, 0x00aa, 0x00ba,
+    0x00bf, 0x2310, 0x00ac, 0x00bd, 0x00bc, 0x00a1, 0x00ab, 0x00bb,
+    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
+    0x2555, 0x2563, 0x2551, 0x2557, 0x255d, 0x255c, 0x255b, 0x2510,
+    0x2514, 0x2534, 0x252c, 0x251c, 0x2500, 0x253c, 0x255e, 0x255f,
+    0x255a, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256c, 0x2567,
+    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256b,
+    0x256a, 0x2518, 0x250c, 0x2588, 0x2584, 0x258c, 0x2590, 0x2580,
+    0x03b1, 0x00df, 0x0393, 0x03c0, 0x03a3, 0x03c3, 0x00b5, 0x03c4,
+    0x03a6, 0x0398, 0x03a9, 0x03b4, 0x221e, 0x03c6, 0x03b5, 0x2229,
+    0x2261, 0x00b1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00f7, 0x2248,
+    0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x00a0,
+};
+
+#define MCP_TEXT_MAX_CELLS  (160 * 100)
+#define MCP_TEXT_HIGHLIGHTS 50
+
+/*
+ * How often a text wait looks.  Out of text mode, each look makes VGA
+ * set up its graphics screen again, so it looks less often there.
+ */
+#define MCP_TEXT_POLL_MS        25
+#define MCP_TEXT_POLL_GFX_MS    250
+
+/* Background colour of a console_ch_t cell: see ATTR2CHTYPE() */
+static int mcp_cell_bg(uint32_t ch)
+{
+    return (ch >> 11) & 7;
+}
+
+static char *mcp_cells_text(const uint32_t *cells, int n)
+{
+    GString *s = g_string_new(NULL);
+    int i;
+
+    for (i = 0; i < n; i++) {
+        g_string_append_unichar(s, mcp_cp437[cells[i] & 0xff]);
+    }
+    return g_string_free(s, false);
+}
+
+/* A text-mode screen as the display card shows it */
+typedef struct McpTextScreen {
+    int w, h;                   /* columns and rows */
+    int cx, cy;                 /* the cursor, or -1 */
+    int bg;                     /* the background most cells have */
+    uint32_t *cells;
+} McpTextScreen;
+
+static void mcp_text_screen_clear(McpTextScreen *t)
+{
+    g_free(t->cells);
+}
+
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(McpTextScreen, mcp_text_screen_clear)
+
+/* A run of cells whose background differs from the screen's */
+typedef struct McpTextRun {
+    int row, col, len;
+} McpTextRun;
+
+/* Read @con's text screen into @t; false, and why, if it shows none */
+static bool mcp_text_read(QemuConsole *con, McpTextScreen *t, char **why)
+{
+    int bg_count[8] = { 0 };
+    int i;
+
+    if (!t->cells) {
+        t->cells = g_new0(uint32_t, MCP_TEXT_MAX_CELLS);
+    }
+    /* a full update reports the size and cursor and fills every cell */
+    qemu_console_hw_invalidate(con);
+    qemu_console_hw_text_update(con, t->cells);
+    qemu_frames_get_text(qemu_console_frames(con), &t->w, &t->h,
+                         &t->cx, &t->cy);
+
+    if (!t->w || !t->h || t->w * t->h > MCP_TEXT_MAX_CELLS) {
+        *why = g_strdup_printf("console %d has no text mode",
+                               qemu_console_get_index(con));
+        return false;
+    }
+    if (t->w == 60 && t->h == 3 && t->cx < 0) {
+        /* VGA puts a one-line notice here when not in text mode */
+        g_autofree char *msg = mcp_cells_text(t->cells + t->w, t->w);
+
+        if (strstr(msg, "Graphic mode") || strstr(msg, "Blank mode") ||
+            strstr(msg, "Text mode")) {
+            *why = g_strdup_printf("console %d is not in a text mode it can"
+                                   " read (%s)", qemu_console_get_index(con),
+                                   g_strstrip(msg));
+            return false;
+        }
+    }
+    for (i = 0; i < t->w * t->h; i++) {
+        bg_count[mcp_cell_bg(t->cells[i])]++;
+    }
+    t->bg = 0;
+    for (i = 1; i < 8; i++) {
+        if (bg_count[i] > bg_count[t->bg]) {
+            t->bg = i;
+        }
+    }
+    return true;
+}
+
+/* Row @y, without its trailing spaces: they carry nothing */
+static char *mcp_text_row(const McpTextScreen *t, int y)
+{
+    char *line = mcp_cells_text(t->cells + y * t->w, t->w);
+    int len = strlen(line);
+
+    while (len && line[len - 1] == ' ') {
+        len--;
+    }
+    line[len] = '\0';
+    return line;
+}
+
+static char *mcp_text_run_text(const McpTextScreen *t, const McpTextRun *r)
+{
+    return mcp_cells_text(t->cells + r->row * t->w + r->col, r->len);
+}
+
+/* The highlighted runs: cells with another background than most */
+static GArray *mcp_text_runs(const McpTextScreen *t)
+{
+    GArray *runs = g_array_new(false, false, sizeof(McpTextRun));
+    int x, y;
+
+    for (y = 0; y < t->h; y++) {
+        const uint32_t *row = t->cells + y * t->w;
+
+        for (x = 0; x < t->w; x++) {
+            McpTextRun r = { .row = y, .col = x };
+            int bg = mcp_cell_bg(row[x]);
+
+            if (bg == t->bg) {
+                continue;
+            }
+            while (x < t->w && mcp_cell_bg(row[x]) == bg) {
+                x++;
+            }
+            r.len = x - r.col;
+            g_array_append_val(runs, r);
+            x--;
+        }
+    }
+    return runs;
+}
+
+/* What a text wait looks for */
+typedef struct McpTextWant {
+    char *text;
+    GRegex *regex;              /* or NULL: look for @text as it is */
+    bool highlighted;
+} McpTextWant;
+
+static void mcp_text_want_clear(McpTextWant *want)
+{
+    g_free(want->text);
+    if (want->regex) {
+        g_regex_unref(want->regex);
+    }
+    memset(want, 0, sizeof(*want));
+}
+
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(McpTextWant, mcp_text_want_clear)
+
+static bool mcp_text_want_init(McpTextWant *want, QemuConsole *con,
+                               const char *text, bool regex,
+                               bool highlighted, Error **errp)
+{
+    g_autoptr(GError) gerr = NULL;
+
+    /* VGA can show text; most workstation framebuffers cannot */
+    if (!con->hw_ops->text_update) {
+        error_setg(errp, "console %d has no text mode; use wait-screen"
+                   " until change or stable, and screenshot",
+                   qemu_console_get_index(con));
+        return false;
+    }
+    if (!text || !*text) {
+        error_setg(errp, "waiting for \"text\" needs text: what to wait for");
+        return false;
+    }
+    if (regex) {
+        want->regex = g_regex_new(text, G_REGEX_MULTILINE, 0, &gerr);
+        if (!want->regex) {
+            error_setg(errp, "text is not a regular expression: %s",
+                       gerr->message);
+            return false;
+        }
+    }
+    want->text = g_strdup(text);
+    want->highlighted = highlighted;
+    return true;
+}
+
+/* @want in @s; where it starts, in bytes, in *@at */
+static bool mcp_text_match(const McpTextWant *want, const char *s, int *at)
+{
+    if (want->regex) {
+        g_autoptr(GMatchInfo) mi = NULL;
+        int end;
+
+        if (!g_regex_match(want->regex, s, 0, &mi)) {
+            return false;
+        }
+        return g_match_info_fetch_pos(mi, 0, at, &end);
+    } else {
+        const char *p = strstr(s, want->text);
+
+        *at = p ? p - s : 0;
+        return p != NULL;
+    }
+}
+
+/* Look for @want on @t; where it is in *@m */
+static bool mcp_text_find(const McpTextScreen *t, const McpTextWant *want,
+                          McpTextMatch **m)
+{
+    g_autoptr(GString) all = NULL;
+    g_autofree int *starts = NULL;
+    int at, y;
+
+    if (want->highlighted) {
+        g_autoptr(GArray) runs = mcp_text_runs(t);
+        guint i;
+
+        for (i = 0; i < runs->len; i++) {
+            McpTextRun *r = &g_array_index(runs, McpTextRun, i);
+            g_autofree char *s = mcp_text_run_text(t, r);
+            /* a menu bar pads its words: ^ and $ go with the words */
+            size_t lead = strspn(s, " ");
+            char *words = g_strchomp(s + lead);
+
+            if (mcp_text_match(want, words, &at)) {
+                *m = g_new0(McpTextMatch, 1);
+                (*m)->row = r->row;
+                (*m)->col = r->col + lead + g_utf8_strlen(words, at);
+                (*m)->line = g_strdup(words);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /* the rows, one per line, so that a regex sees them as lines */
+    all = g_string_new(NULL);
+    starts = g_new(int, t->h + 1);
+    for (y = 0; y < t->h; y++) {
+        g_autofree char *line = mcp_text_row(t, y);
+
+        starts[y] = all->len;
+        g_string_append(all, line);
+        g_string_append_c(all, '\n');
+    }
+    starts[t->h] = all->len;
+    if (!mcp_text_match(want, all->str, &at)) {
+        return false;
+    }
+    for (y = 0; y < t->h - 1 && starts[y + 1] <= at; y++) {
+        /* find the row the match starts in */
+    }
+    *m = g_new0(McpTextMatch, 1);
+    (*m)->row = y;
+    (*m)->col = g_utf8_strlen(all->str + starts[y], at - starts[y]);
+    (*m)->line = g_strndup(all->str + starts[y], starts[y + 1] - starts[y] - 1);
+    return true;
+}
+
+/*
+ * Wait until @con's text screen shows @want, for at most @timeout_ms.
+ * It looks every MCP_TEXT_POLL_MS on a text screen: a boot prompt may
+ * show only for a moment.  Adds to @summary; NULL if the call was
+ * cancelled.
+ */
+static McpWaitInfo *coroutine_fn mcp_co_text_wait(QemuConsole *con,
+                                                  QemuInputCtx *ctx,
+                                                  const McpTextWant *want,
+                                                  int64_t timeout_ms,
+                                                  GString *summary,
+                                                  Error **errp)
+{
+    const char *what = want->highlighted ? "highlighted text" : "text";
+    g_auto(McpTextScreen) t = { 0 };
+    g_autofree char *why = NULL;
+    int64_t start = mcp_now_ms(), left;
+    McpTextMatch *m = NULL;
+    McpWaitInfo *w;
+
+    for (;;) {
+        bool is_text;
+
+        g_clear_pointer(&why, g_free);
+        is_text = mcp_text_read(con, &t, &why);
+        if (is_text && mcp_text_find(&t, want, &m)) {
+            break;
+        }
+        left = timeout_ms - (mcp_now_ms() - start);
+        if (left <= 0) {
+            break;
+        }
+        if (!mcp_co_sleep(ctx, MIN(left, is_text ? MCP_TEXT_POLL_MS
+                                                 : MCP_TEXT_POLL_GFX_MS))) {
+            error_setg(errp, "cancelled");
+            return NULL;
+        }
+    }
+
+    w = g_new0(McpWaitInfo, 1);
+    w->matched = m != NULL;
+    w->elapsed_ms = mcp_now_ms() - start;
+    w->frame = qemu_frames_get_frame(qemu_console_frames(con));
+    w->found = m;
+    if (m) {
+        g_string_append_printf(summary, "%s \"%s\" found after %" PRId64
+                               " ms, at row %" PRId64 ", column %" PRId64,
+                               what, want->text, w->elapsed_ms, m->row,
+                               m->col);
+    } else {
+        g_string_append_printf(summary, "%s \"%s\" not found within %" PRId64
+                               " ms", what, want->text, w->elapsed_ms);
+        if (why) {
+            g_string_append_printf(summary, ": %s", why);
+        }
+    }
+    return w;
+}
+
 static bool mcp_until(McpWaitUntil until, QemuFramesUntil *out,
                       Error **errp)
 {
@@ -441,6 +796,10 @@ McpWaitResult *coroutine_fn qmp_wait_screen(McpWaitUntil until,
                                             bool ignore_blink,
                                             bool has_ignore_animation,
                                             bool ignore_animation,
+                                            const char *text,
+                                            bool has_regex, bool regex,
+                                            bool has_highlighted,
+                                            bool highlighted,
                                             McpScreenshotChoice *screenshot,
                                             Error **errp)
 {
@@ -453,10 +812,35 @@ McpWaitResult *coroutine_fn qmp_wait_screen(McpWaitUntil until,
     QemuFramesResult r;
     ScreenRegionList *l;
     McpWaitResult *res;
+    McpWaitInfo *info;
     ScreenRegion *shot_region;
     double shot_scale;
 
-    if (!con || !mcp_until(until, &c.until, errp)) {
+    if (!con) {
+        return NULL;
+    }
+    if (until == MCP_WAIT_UNTIL_TEXT) {
+        g_auto(McpTextWant) want = { 0 };
+
+        if (!mcp_text_want_init(&want, con, text, has_regex && regex,
+                                has_highlighted && highlighted, errp)) {
+            return NULL;
+        }
+        info = mcp_co_text_wait(con, ctx, &want,
+                                MIN(has_timeout_ms ? timeout_ms : 60000,
+                                    mcp_wait_max_ms()),
+                                summary, errp);
+        if (!info) {
+            return NULL;
+        }
+        goto done;
+    }
+    if (text || has_regex || has_highlighted) {
+        error_setg(errp, "text, regex and highlighted go with until"
+                   " \"text\"");
+        return NULL;
+    }
+    if (!mcp_until(until, &c.until, errp)) {
         return NULL;
     }
     if (region) {
@@ -503,10 +887,12 @@ McpWaitResult *coroutine_fn qmp_wait_screen(McpWaitUntil until,
         error_setg(errp, "cancelled");
         return NULL;
     }
-
-    res = g_new0(McpWaitResult, 1);
-    res->wait = mcp_wait_info(&r);
+    info = mcp_wait_info(&r);
     mcp_wait_summary(summary, c.until, c.ignore_animation, &r);
+
+done:
+    res = g_new0(McpWaitResult, 1);
+    res->wait = info;
     if (mcp_screenshot_wanted(screenshot, true, &shot_region, &shot_scale)) {
         McpImage *mi = mcp_co_image(con, shot_region, shot_scale, false,
                                     errp);
@@ -531,6 +917,7 @@ typedef struct McpInput {
     QemuFrames *frames;
     QemuFramesWaiter *wt;
     QemuFramesCond cond;
+    McpTextWant text;           /* then.wait "text": what to look for */
     int64_t start_ms;
 } McpInput;
 
@@ -552,6 +939,19 @@ static bool mcp_input_begin(McpInput *in, QemuConsole *con, McpThen *then,
     in->frames = qemu_console_frames(con);
     qemu_frames_activity(in->frames);
 
+    if (then && (!then->has_wait || then->wait != MCP_WAIT_UNTIL_TEXT) &&
+        (then->text || then->has_regex || then->has_highlighted)) {
+        error_setg(errp, "then.text, regex and highlighted go with wait"
+                   " \"text\"");
+        return false;
+    }
+    if (then && then->has_wait && then->wait == MCP_WAIT_UNTIL_TEXT) {
+        /* looked for after the input: it may be on the screen already */
+        return mcp_text_want_init(&in->text, con, then->text,
+                                  then->has_regex && then->regex,
+                                  then->has_highlighted &&
+                                  then->highlighted, errp);
+    }
     if (then && then->has_wait && then->wait != MCP_WAIT_UNTIL_NONE) {
         if (then->wait == MCP_WAIT_UNTIL_PIXEL) {
             error_setg(errp, "then.wait cannot be \"pixel\"; use "
@@ -580,6 +980,7 @@ static void mcp_input_abort(McpInput *in)
         qemu_frames_wait_abort(in->frames, in->wt);
         in->wt = NULL;
     }
+    mcp_text_want_clear(&in->text);
 }
 
 /* After the input: delay, wait, screenshot; fill in the result */
@@ -588,14 +989,27 @@ static bool coroutine_fn mcp_co_input_finish(McpInput *in,
                                              GString *summary, Error **errp)
 {
     McpThen *then = in->then;
+    g_auto(McpTextWant) text = in->text;
     ScreenRegion *region;
     double scale;
 
+    memset(&in->text, 0, sizeof(in->text));
     if (then && then->has_delay_ms && then->delay_ms > 0 &&
         !mcp_co_sleep(in->ctx, then->delay_ms)) {
         mcp_input_abort(in);
         error_setg(errp, "cancelled");
         return false;
+    }
+    if (text.text) {
+        g_string_append(summary, "; ");
+        res->wait = mcp_co_text_wait(in->con, in->ctx, &text,
+                                     MIN(then->has_timeout_ms
+                                         ? then->timeout_ms : 10000,
+                                         mcp_wait_max_ms()),
+                                     summary, errp);
+        if (!res->wait) {
+            return false;
+        }
     }
     if (in->wt) {
         QemuFramesResult r;
@@ -1393,155 +1807,57 @@ McpInputResult *coroutine_fn qmp_mouse_button(bool has_button,
     return res;
 }
 
-/* Text mode */
-
-/* Code page 437, as the PC draws it, control codes included */
-static const uint16_t mcp_cp437[256] = {
-    0x0020, 0x263a, 0x263b, 0x2665, 0x2666, 0x2663, 0x2660, 0x2022,
-    0x25d8, 0x25cb, 0x25d9, 0x2642, 0x2640, 0x266a, 0x266b, 0x263c,
-    0x25ba, 0x25c4, 0x2195, 0x203c, 0x00b6, 0x00a7, 0x25ac, 0x21a8,
-    0x2191, 0x2193, 0x2192, 0x2190, 0x221f, 0x2194, 0x25b2, 0x25bc,
-    0x0020, 0x0021, 0x0022, 0x0023, 0x0024, 0x0025, 0x0026, 0x0027,
-    0x0028, 0x0029, 0x002a, 0x002b, 0x002c, 0x002d, 0x002e, 0x002f,
-    0x0030, 0x0031, 0x0032, 0x0033, 0x0034, 0x0035, 0x0036, 0x0037,
-    0x0038, 0x0039, 0x003a, 0x003b, 0x003c, 0x003d, 0x003e, 0x003f,
-    0x0040, 0x0041, 0x0042, 0x0043, 0x0044, 0x0045, 0x0046, 0x0047,
-    0x0048, 0x0049, 0x004a, 0x004b, 0x004c, 0x004d, 0x004e, 0x004f,
-    0x0050, 0x0051, 0x0052, 0x0053, 0x0054, 0x0055, 0x0056, 0x0057,
-    0x0058, 0x0059, 0x005a, 0x005b, 0x005c, 0x005d, 0x005e, 0x005f,
-    0x0060, 0x0061, 0x0062, 0x0063, 0x0064, 0x0065, 0x0066, 0x0067,
-    0x0068, 0x0069, 0x006a, 0x006b, 0x006c, 0x006d, 0x006e, 0x006f,
-    0x0070, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0076, 0x0077,
-    0x0078, 0x0079, 0x007a, 0x007b, 0x007c, 0x007d, 0x007e, 0x2302,
-    0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7,
-    0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
-    0x00c9, 0x00e6, 0x00c6, 0x00f4, 0x00f6, 0x00f2, 0x00fb, 0x00f9,
-    0x00ff, 0x00d6, 0x00dc, 0x00a2, 0x00a3, 0x00a5, 0x20a7, 0x0192,
-    0x00e1, 0x00ed, 0x00f3, 0x00fa, 0x00f1, 0x00d1, 0x00aa, 0x00ba,
-    0x00bf, 0x2310, 0x00ac, 0x00bd, 0x00bc, 0x00a1, 0x00ab, 0x00bb,
-    0x2591, 0x2592, 0x2593, 0x2502, 0x2524, 0x2561, 0x2562, 0x2556,
-    0x2555, 0x2563, 0x2551, 0x2557, 0x255d, 0x255c, 0x255b, 0x2510,
-    0x2514, 0x2534, 0x252c, 0x251c, 0x2500, 0x253c, 0x255e, 0x255f,
-    0x255a, 0x2554, 0x2569, 0x2566, 0x2560, 0x2550, 0x256c, 0x2567,
-    0x2568, 0x2564, 0x2565, 0x2559, 0x2558, 0x2552, 0x2553, 0x256b,
-    0x256a, 0x2518, 0x250c, 0x2588, 0x2584, 0x258c, 0x2590, 0x2580,
-    0x03b1, 0x00df, 0x0393, 0x03c0, 0x03a3, 0x03c3, 0x00b5, 0x03c4,
-    0x03a6, 0x0398, 0x03a9, 0x03b4, 0x221e, 0x03c6, 0x03b5, 0x2229,
-    0x2261, 0x00b1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00f7, 0x2248,
-    0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x00a0,
-};
-
-#define MCP_TEXT_MAX_CELLS  (160 * 100)
-#define MCP_TEXT_HIGHLIGHTS 50
-
-/* Background colour of a console_ch_t cell */
-static int mcp_cell_bg(uint32_t ch)
-{
-    return (ch >> 12) & 7;
-}
-
-static char *mcp_cells_text(const uint32_t *cells, int n)
-{
-    GString *s = g_string_new(NULL);
-    int i;
-
-    for (i = 0; i < n; i++) {
-        g_string_append_unichar(s, mcp_cp437[cells[i] & 0xff]);
-    }
-    return g_string_free(s, false);
-}
+/* Text mode screens */
 
 McpScreenTextResult *qmp_screen_text(QObject *console, Error **errp)
 {
     QemuConsole *con = mcp_console(console, 0, errp);
-    g_autofree uint32_t *cells = NULL;
+    g_auto(McpTextScreen) t = { 0 };
     g_autoptr(GString) rows = g_string_new(NULL);
+    g_autoptr(GArray) runs = NULL;
+    g_autofree char *why = NULL;
     McpTextHighlightList **htail;
     McpScreenTextResult *res;
-    QemuFrames *f;
-    int w, h, cx, cy, x, y, bg_count[8] = { 0 }, bg = 0, nhl = 0;
+    guint i;
+    int y;
 
     if (!con) {
         return NULL;
     }
-    f = qemu_console_frames(con);
-    cells = g_new0(uint32_t, MCP_TEXT_MAX_CELLS);
-    /* a full update reports the size and cursor and fills every cell */
-    qemu_console_hw_invalidate(con);
-    qemu_console_hw_text_update(con, cells);
-    qemu_frames_get_text(f, &w, &h, &cx, &cy);
-
-    if (!w || !h || w * h > MCP_TEXT_MAX_CELLS) {
-        error_setg(errp, "console %d has no text mode; use screenshot",
-                   qemu_console_get_index(con));
+    if (!mcp_text_read(con, &t, &why)) {
+        error_setg(errp, "%s; use screenshot", why);
         return NULL;
-    }
-    if (w == 60 && h == 3 && cx < 0) {
-        /* VGA puts a one-line notice here when not in text mode */
-        g_autofree char *msg = mcp_cells_text(cells + w, w);
-
-        if (strstr(msg, "Graphic mode") || strstr(msg, "Blank mode") ||
-            strstr(msg, "Text mode")) {
-            error_setg(errp, "console %d is not in a text mode it can read "
-                       "(%s); use screenshot",
-                       qemu_console_get_index(con), g_strstrip(msg));
-            return NULL;
-        }
-    }
-
-    for (x = 0; x < w * h; x++) {
-        bg_count[mcp_cell_bg(cells[x])]++;
-    }
-    for (x = 1; x < 8; x++) {
-        if (bg_count[x] > bg_count[bg]) {
-            bg = x;
-        }
     }
 
     res = g_new0(McpScreenTextResult, 1);
-    res->columns = w;
-    res->rows = h;
-    if (cx >= 0 && cy >= 0) {
+    res->columns = t.w;
+    res->rows = t.h;
+    if (t.cx >= 0 && t.cy >= 0) {
         res->has_cursor_col = res->has_cursor_row = true;
-        res->cursor_col = cx;
-        res->cursor_row = cy;
+        res->cursor_col = t.cx;
+        res->cursor_row = t.cy;
     }
-    htail = &res->highlights;
-    for (y = 0; y < h; y++) {
-        const uint32_t *row = cells + y * w;
-        g_autofree char *line = mcp_cells_text(row, w);
-        int len = strlen(line);
+    for (y = 0; y < t.h; y++) {
+        g_autofree char *line = mcp_text_row(&t, y);
 
-        /* trailing spaces carry nothing */
-        while (len && line[len - 1] == ' ') {
-            len--;
-        }
-        g_string_append_len(rows, line, len);
+        g_string_append(rows, line);
         g_string_append_c(rows, '\n');
+    }
+    runs = mcp_text_runs(&t);
+    htail = &res->highlights;
+    for (i = 0; i < runs->len && i < MCP_TEXT_HIGHLIGHTS; i++) {
+        McpTextRun *r = &g_array_index(runs, McpTextRun, i);
+        McpTextHighlight *hl = g_new0(McpTextHighlight, 1);
 
-        for (x = 0; x < w && nhl < MCP_TEXT_HIGHLIGHTS; x++) {
-            McpTextHighlight *hl;
-            int start = x;
-
-            if (mcp_cell_bg(row[x]) == bg) {
-                continue;
-            }
-            while (x < w && mcp_cell_bg(row[x]) == mcp_cell_bg(row[start])) {
-                x++;
-            }
-            hl = g_new0(McpTextHighlight, 1);
-            hl->row = y;
-            hl->col = start;
-            hl->len = x - start;
-            hl->text = g_strstrip(mcp_cells_text(row + start, x - start));
-            QAPI_LIST_APPEND(htail, hl);
-            nhl++;
-            x--;
-        }
+        hl->row = r->row;
+        hl->col = r->col;
+        hl->len = r->len;
+        hl->text = g_strstrip(mcp_text_run_text(&t, r));
+        QAPI_LIST_APPEND(htail, hl);
     }
     res->summary = g_strdup_printf("console %d, text %dx%d%s:\n%s",
-                                   qemu_console_get_index(con), w, h,
-                                   cx >= 0 ? "" : ", no cursor", rows->str);
+                                   qemu_console_get_index(con), t.w, t.h,
+                                   t.cx >= 0 ? "" : ", no cursor", rows->str);
     return res;
 }
 

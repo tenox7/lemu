@@ -24,6 +24,9 @@
  * at the first wait that is not met or the first error, and run nothing
  * when a tool name is wrong.
  *
+ * The text test waits for SeaBIOS's words on its text screen, also for
+ * a line highlighted the way menus show the chosen one.
+ *
  * The debug tests run a BIOS of two instructions under TCG, step it,
  * stop it at an address and patch it while it runs.
  *
@@ -1471,6 +1474,200 @@ static void test_steps(void)
     g_free(text);
 
     steps_vm_stop(&v);
+}
+
+/* Write @s at @row, @col of the 80-column VGA text screen, in @attr */
+static void text_put(QTestState *qts, int row, int col, const char *s,
+                     uint8_t attr)
+{
+    size_t i, n = strlen(s);
+    g_autofree uint8_t *cells = g_new(uint8_t, n * 2);
+
+    for (i = 0; i < n; i++) {
+        cells[i * 2] = s[i];
+        cells[i * 2 + 1] = attr;
+    }
+    qtest_memwrite(qts, 0xb8000 + (row * 80 + col) * 2, cells, n * 2);
+}
+
+/* A wait-screen reply: where it found its text, or NULL */
+static QDict *text_found(QDict *rsp)
+{
+    QDict *ret = qdict_get_qdict(rsp, "return");
+    QDict *wait;
+
+    if (!ret) {
+        g_autoptr(GString) json = qobject_to_json(QOBJECT(rsp));
+
+        g_test_message("reply: %s", json->str);
+        g_assert_not_reached();
+    }
+    wait = qdict_get_qdict(ret, "wait");
+    g_test_message("wait-screen: %s", qdict_get_str(ret, "summary"));
+    g_assert(qdict_get_bool(wait, "matched") ==
+             qdict_haskey(wait, "found"));
+    return qdict_get_qdict(wait, "found");
+}
+
+static void text_found_at(QDict *rsp, int row, int col, const char *line)
+{
+    QDict *found = text_found(rsp);
+
+    g_assert(found);
+    g_assert_cmpint(qdict_get_int(found, "row"), ==, row);
+    g_assert_cmpint(qdict_get_int(found, "col"), ==, col);
+    g_assert_cmpstr(qdict_get_str(found, "line"), ==, line);
+    qobject_unref(rsp);
+}
+
+static void text_error(QDict *rsp, const char *want)
+{
+    const char *desc;
+
+    g_assert(qdict_haskey(rsp, "error"));
+    desc = qdict_get_str(qdict_get_qdict(rsp, "error"), "desc");
+    if (!strstr(desc, want)) {
+        g_test_message("error '%s' lacks '%s'", desc, want);
+        g_assert_not_reached();
+    }
+    qobject_unref(rsp);
+}
+
+/*
+ * SeaBIOS on a text screen.  The VM starts with -S, and one "steps"
+ * call starts it, waits for the boot menu prompt and answers it: that
+ * is how an agent catches a prompt that shows only for seconds.  Then a
+ * regular expression, a wait that times out, the chosen line of a menu
+ * (on blue, which a wrong colour bit once hid), and bad arguments.
+ */
+static void test_screen_text(void)
+{
+    StepsVm v;
+    QDict *json, *rsp, *found;
+    QListEntry *e;
+    bool is_error, image, seen = false;
+    char *text;
+
+    steps_vm_start(&v, "-accel tcg -machine pc -nodefaults -vga std"
+                   " -boot menu=on,splash-time=30000 -S");
+    text = steps_call(v.fd, 2, "[{\"tool\": \"vm-power\", \"args\": "
+                      "{\"action\": \"resume\"}}, "
+                      "{\"tool\": \"wait-screen\", \"args\": "
+                      "{\"until\": \"text\", \"text\": \"Press ESC for boot"
+                      " menu\", \"timeout-ms\": 60000, "
+                      "\"screenshot\": false}}, "
+                      "{\"tool\": \"key\", \"args\": {\"keys\": [\"esc\"], "
+                      "\"then\": {\"wait\": \"text\", \"text\": \"Select"
+                      " boot device\", \"timeout-ms\": 30000}}}]",
+                      &is_error, &image, &json);
+    g_assert(!is_error);
+    g_assert(g_str_has_prefix(text, "ran all 3 steps\n"));
+    steps_has(text, "\n2. wait-screen: text \"Press ESC for boot menu\" "
+              "found after ", true);
+    steps_has(text, "; text \"Select boot device\" found after ", true);
+    g_assert_cmpint(qdict_get_int(json, "steps-done"), ==, 3);
+    qobject_unref(json);
+    g_free(text);
+
+    /* ^ and $ match at the ends of each row, without its trailing spaces */
+    rsp = qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                    " {'until': 'text', 'regex': true,"
+                    " 'text': '^SeaBIOS [(]version [^)]+[)]$',"
+                    " 'timeout-ms': 1000, 'screenshot': false}}");
+    found = text_found(rsp);
+    g_assert(found);
+    g_assert_cmpint(qdict_get_int(found, "row"), ==, 0);
+    g_assert_cmpint(qdict_get_int(found, "col"), ==, 0);
+    g_assert(g_str_has_prefix(qdict_get_str(found, "line"),
+                              "SeaBIOS (version "));
+    qobject_unref(rsp);
+
+    /* not there: it says so when the time is up */
+    rsp = qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                    " {'until': 'text', 'text': 'No such words',"
+                    " 'timeout-ms': 300, 'screenshot': false}}");
+    g_assert(!text_found(rsp));
+    g_assert(strstr(qdict_get_str(qdict_get_qdict(rsp, "return"),
+                                  "summary"),
+                    "text \"No such words\" not found within "));
+    qobject_unref(rsp);
+
+    /* a key's "then" takes text only with wait "text" */
+    text_error(qtest_qmp(v.qts, "{'execute': 'key', 'arguments':"
+                         " {'keys': ['shift'], 'then': {'text': 'x'}}}"),
+               "go with wait \"text\"");
+
+    /*
+     * A menu: the chosen line is a bar of white on blue, with a space
+     * at each end; the other line is not highlighted.
+     */
+    qtest_qmp_assert_success(v.qts, "{'execute': 'stop'}");
+    text_put(v.qts, 20, 4, " Chosen line ", 0x1f);
+    text_put(v.qts, 21, 4, "Other line", 0x07);
+    text_found_at(qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                            " {'until': 'text', 'text': 'line',"
+                            " 'highlighted': true, 'timeout-ms': 1000,"
+                            " 'screenshot': false}}"),
+                  20, 12, "Chosen line");
+    text_found_at(qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                            " {'until': 'text', 'text': '^Chosen line$',"
+                            " 'regex': true, 'highlighted': true,"
+                            " 'timeout-ms': 1000, 'screenshot': false}}"),
+                  20, 5, "Chosen line");
+    rsp = qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                    " {'until': 'text', 'text': 'Other',"
+                    " 'highlighted': true, 'timeout-ms': 300,"
+                    " 'screenshot': false}}");
+    g_assert(!text_found(rsp));
+    qobject_unref(rsp);
+    /* without highlighted, any text counts, and line is the whole row */
+    text_found_at(qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                            " {'until': 'text', 'text': 'Other line',"
+                            " 'timeout-ms': 1000, 'screenshot': false}}"),
+                  21, 4, "    Other line");
+
+    /* screen-text lists the chosen line as highlighted, and only it */
+    rsp = qtest_qmp(v.qts, "{'execute': 'screen-text'}");
+    QLIST_FOREACH_ENTRY(qdict_get_qlist(qdict_get_qdict(rsp, "return"),
+                                        "highlights"), e) {
+        QDict *hl = qobject_to(QDict, qlist_entry_obj(e));
+
+        g_assert_cmpint(qdict_get_int(hl, "row"), ==, 20);
+        g_assert_cmpint(qdict_get_int(hl, "col"), ==, 4);
+        g_assert_cmpint(qdict_get_int(hl, "len"), ==, 13);
+        g_assert_cmpstr(qdict_get_str(hl, "text"), ==, "Chosen line");
+        g_assert(!seen);
+        seen = true;
+    }
+    g_assert(seen);
+    qobject_unref(rsp);
+
+    text_error(qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                         " {'until': 'text'}}"), "needs text");
+    text_error(qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                         " {'until': 'text', 'text': '(', 'regex': true}}"),
+               "not a regular expression");
+    text_error(qtest_qmp(v.qts, "{'execute': 'wait-screen', 'arguments':"
+                         " {'until': 'stable', 'text': 'x'}}"),
+               "go with until \"text\"");
+
+    steps_vm_stop(&v);
+}
+
+/* A card without a text mode: the wait says so at once */
+static void test_screen_text_none(void)
+{
+    QTestState *qts = qtest_init("-machine pc -nodefaults"
+                                 " -device bochs-display");
+    int64_t start = g_get_monotonic_time();
+
+    text_error(qtest_qmp(qts, "{'execute': 'wait-screen', 'arguments':"
+                         " {'until': 'text', 'text': 'x'}}"),
+               "has no text mode; use wait-screen until change or stable");
+    g_assert_cmpint(g_get_monotonic_time() - start, <, 30 * G_USEC_PER_SEC);
+    text_error(qtest_qmp(qts, "{'execute': 'screen-text'}"),
+               "has no text mode; use screenshot");
+    qtest_quit(qts);
 }
 
 /*
@@ -3245,6 +3442,9 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/keys", test_keys);
     qtest_add_func("/mcp/screen/change", test_screen_change);
     qtest_add_func("/mcp/screen/blink", test_screen_blink);
+    if (qtest_has_device("bochs-display")) {
+        qtest_add_func("/mcp/screen/text-none", test_screen_text_none);
+    }
     qtest_add_data_func("/mcp/input/quit-key",
                         "{\"execute\": \"key\", \"arguments\":"
                         " {\"keys\": [\"a\", \"b\", \"c\"]}}",
@@ -3265,6 +3465,7 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/media/disc", test_media_disc);
     qtest_add_func("/mcp/media/floppy", test_media_floppy);
     if (qtest_has_accel("tcg")) {
+        qtest_add_func("/mcp/screen/text", test_screen_text);
         qtest_add_func("/mcp/debug/run", test_debug_run);
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
         qtest_add_func("/mcp/steps/debug", test_steps_debug);

@@ -51,7 +51,7 @@ only when exactly one VM is running and you started it.
 | `vm-stats` | Measure how much host CPU a VM uses and how often its CPUs are halted |
 | `screenshot` | Take a picture of a screen (PNG) |
 | `frames` | List recent screens, to find one that went by too fast |
-| `wait-screen` | Wait until the screen changes, settles or shows a colour. Use it instead of sleeping |
+| `wait-screen` | Wait until the screen changes, settles, shows a colour or shows some text. Use it instead of sleeping |
 | `screen-text` | Read a text-mode screen (BIOS, DOS, NT setup) as text |
 | `key` | Press keys and key combinations |
 | `type-text` | Type a string, in the guest's keyboard layout |
@@ -86,7 +86,8 @@ The server sends these rules to every agent that connects:
   not a hang. Move the mouse, then look again.
 - **Don't sleep.** Use `wait-screen`, or `serial-expect` for serial
   text. One call can wait up to 25 minutes; for a longer install, call
-  it again.
+  it again. On a text screen (a BIOS, DOS, a boot menu), `wait-screen`
+  until `text` waits for words.
 - **Starting and stopping:** after you start a VM from a shell, call
   `vm-wait`. After a guest shutdown, `vm-wait` until `gone` before you
   copy its disk.
@@ -145,6 +146,8 @@ Use these:
 | Read what a serial port printed | `serial-read` |
 | Log in over the network, when the console is the screen | `serial-connect`, then the serial tools on the port it names |
 | Wait for the screen | `wait-screen` |
+| Wait for words on a text screen (a BIOS, a boot menu) | `wait-screen` until `text`, or a key's `then` with `wait: text` |
+| Wait until a menu line is chosen (highlighted) | `wait-screen` until `text` with `highlighted` |
 | Press keys, type, wait and look, several times, in one call | `steps` |
 | Wait for a VM to start, or to end | `vm-wait` until `up` or `gone` |
 | Wait until a guest service answers on a forwarded port | `vm-wait` until `port` |
@@ -177,6 +180,18 @@ Use these:
   [{"tool": "serial-write", "args": {"text": "root\r"}},
    {"tool": "serial-expect", "args": {"pattern": "# $"}},
    {"tool": "serial-run", "args": {"command": "uname -a"}}]
+  ```
+- **A boot prompt that shows for seconds,** such as NT's "Press
+  spacebar NOW": start QEMU with `-S`, so that it waits before the
+  first instruction, and `vm-wait` until it is up. Then one `steps`
+  call starts the guest, waits for the prompt and answers it, with no
+  gap between the steps:
+
+  ```json
+  [{"tool": "vm-power", "args": {"action": "resume"}},
+   {"tool": "wait-screen", "args": {"until": "text",
+                                    "text": "Press spacebar NOW"}},
+   {"tool": "key", "args": {"keys": ["spc"]}}]
   ```
 - **Waiting outside the VM:** `vm-wait` covers a QEMU process that
   starts or ends, and a port that should answer. For anything else, use

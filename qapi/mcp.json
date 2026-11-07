@@ -99,10 +99,13 @@
 #
 # @pixel: a pixel has a given colour
 #
+# @text: a text-mode screen (PC BIOS, DOS, boot menus) shows some text
+#
 # Since: 11.2
 ##
 { 'enum': 'McpWaitUntil',
-  'data': [ 'none', 'change', 'stable', 'change-then-stable', 'pixel' ] }
+  'data': [ 'none', 'change', 'stable', 'change-then-stable', 'pixel',
+            'text' ] }
 
 ##
 # @McpThen:
@@ -123,6 +126,13 @@
 # @ignore-animation: do not count areas that keep changing on their
 #     own, as in wait-screen (default: false)
 #
+# @text: for "text": the text to wait for, as in wait-screen
+#
+# @regex: for "text": @text is a regular expression (default: false)
+#
+# @highlighted: for "text": only highlighted text counts
+#     (default: false)
+#
 # @screenshot: take a screenshot at the end (default: false)
 #
 # Since: 11.2
@@ -130,8 +140,24 @@
 { 'struct': 'McpThen',
   'data': { '*wait': 'McpWaitUntil', '*delay-ms': 'int',
             '*timeout-ms': 'int', '*stable-ms': 'int',
-            '*ignore-animation': 'bool',
+            '*ignore-animation': 'bool', '*text': 'str',
+            '*regex': 'bool', '*highlighted': 'bool',
             '*screenshot': 'McpScreenshotChoice' } }
+
+##
+# @McpTextMatch:
+#     Where a text wait found its text.
+#
+# @row: its row, from 0
+#
+# @col: its first column, from 0
+#
+# @line: the whole row, or the highlighted run for "highlighted"
+#
+# Since: 11.2
+##
+{ 'struct': 'McpTextMatch',
+  'data': { 'row': 'int', 'col': 'int', 'line': 'str' } }
 
 ##
 # @McpWaitInfo:
@@ -155,13 +181,16 @@
 # @animations: areas that kept changing on their own during the wait,
 #     such as a clock or a graph
 #
+# @found: for "text": where the text was found
+#
 # Since: 11.2
 ##
 { 'struct': 'McpWaitInfo',
   'data': { 'matched': 'bool', 'elapsed-ms': 'int',
             '*changed-after-ms': 'int', '*stable-after-ms': 'int',
             'changed-pixels': 'int', '*box': 'ScreenRegion',
-            'frame': 'int', '*animations': [ 'ScreenRegion' ] } }
+            'frame': 'int', '*animations': [ 'ScreenRegion' ],
+            '*found': 'McpTextMatch' } }
 
 ##
 # @McpPointer:
@@ -446,13 +475,13 @@
 
 ##
 # @wait-screen:
-#     Wait until the screen changes, becomes stable, or a pixel has a
-#     colour.  Use it instead of sleeping.  change-then-stable waits
-#     for something to happen, then for it to settle.  Changes smaller
-#     than @min-pixels and blinking text cursors are not counted.  One
-#     call can wait up to 25 minutes; for a longer install, call it
-#     again.  If a clock or a graph keeps the screen from settling,
-#     use @ignore-animation.
+#     Wait until the screen changes, becomes stable, a pixel has a
+#     colour, or a text-mode screen shows some text.  Use it instead
+#     of sleeping.  change-then-stable waits for something to happen,
+#     then for it to settle.  Changes smaller than @min-pixels and
+#     blinking text cursors are not counted.  One call can wait up to
+#     25 minutes; for a longer install, call it again.  If a clock or
+#     a graph keeps the screen from settling, use @ignore-animation.
 #
 # @until: what to wait for
 #
@@ -484,6 +513,17 @@
 #     Scrolling text looks the same, so do not use it to wait for
 #     command output (default: false)
 #
+# @text: for "text": the text to wait for, as screen-text reads it.
+#     On a text screen it looks about 40 times a second, so a prompt
+#     that shows for a second is caught.  While the screen is in a
+#     graphics mode it waits on, and looks 4 times a second.
+#
+# @regex: @text is a regular expression; ^ and $ match at the start
+#     and end of each row (default: false)
+#
+# @highlighted: only highlighted text counts, such as the chosen line
+#     of a menu (default: false)
+#
 # @screenshot: take a screenshot at the end (default: true)
 #
 # Features:
@@ -500,6 +540,7 @@
             '*min-pixels': 'int', '*stable-ms': 'int',
             '*timeout-ms': 'int', '*pixel': 'McpPixel',
             '*ignore-blink': 'bool', '*ignore-animation': 'bool',
+            '*text': 'str', '*regex': 'bool', '*highlighted': 'bool',
             '*screenshot': 'McpScreenshotChoice' },
   'returns': 'McpWaitResult',
   'features': [ 'mcp', 'mcp-read-only' ],
