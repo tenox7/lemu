@@ -333,12 +333,22 @@ enum {
  * Where a display card draws its hardware cursor.  @x, @y is the
  * top-left corner of the cursor image in framebuffer pixels; @w, @h is
  * its size.  The hotspot inside the image is not known to the card.
+ * @shape tells cursor images apart: it changes when the guest loads
+ * another image, which may have its hotspot elsewhere.  0 if the card
+ * does not say; cards fill it with qemu_cursor_shape().
  */
 typedef struct QemuCursorState {
     bool visible;
     int x, y;
     int w, h;
+    uint32_t shape;
 } QemuCursorState;
+
+/*
+ * Fold @len bytes of a cursor image into @shape (start with 0), for
+ * QemuCursorState.shape.  Never returns 0.
+ */
+uint32_t qemu_cursor_shape(uint32_t shape, const void *data, size_t len);
 
 typedef struct GraphicHwOps {
     int (*get_flags)(void *opaque); /* optional, default 0 */

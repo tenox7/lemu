@@ -233,6 +233,18 @@ void qemu_console_hw_text_update(QemuConsole *con, uint32_t *chardata)
     }
 }
 
+uint32_t qemu_cursor_shape(uint32_t shape, const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    uint32_t h = shape ? shape : 2166136261u;   /* FNV-1a */
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h ? h : 1;
+}
+
 bool qemu_console_hw_cursor_state(QemuConsole *con, QemuCursorState *cs)
 {
     QemuGraphicConsole *gc;
@@ -263,6 +275,13 @@ bool qemu_console_hw_cursor_state(QemuConsole *con, QemuCursorState *cs)
     cs->y = gc->cursor_y - gc->cursor->hot_y;
     cs->w = gc->cursor->width;
     cs->h = gc->cursor->height;
+    cs->shape = qemu_cursor_shape(0, gc->cursor->data,
+                                  gc->cursor->width * gc->cursor->height *
+                                  sizeof(gc->cursor->data[0]));
+    cs->shape = qemu_cursor_shape(cs->shape, &gc->cursor->hot_x,
+                                  sizeof(gc->cursor->hot_x));
+    cs->shape = qemu_cursor_shape(cs->shape, &gc->cursor->hot_y,
+                                  sizeof(gc->cursor->hot_y));
     return true;
 }
 

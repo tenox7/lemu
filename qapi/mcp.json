@@ -641,7 +641,11 @@
 # @absolute: the mouse takes absolute positions
 #
 # @closed-loop: relative moves, corrected by reading the card's
-#     hardware cursor
+#     hardware cursor.  The card tells where it draws the cursor
+#     image, not where the hotspot (the tip) is in it, so lemu
+#     measures that for each image the guest loads: in the
+#     bottom-right corner, or on the way into a window with another
+#     cursor.
 #
 # @open-loop: push the pointer into the top-left corner, then move in
 #     small paced steps

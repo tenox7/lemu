@@ -1240,6 +1240,10 @@ static bool gxt_cursor_state(void *opaque, QemuCursorState *cs)
     cs->y = dac_word(s, DAC_CURSOR_Y) - s->dac[DAC_HOT_Y];
     cs->w = CURSOR_DIM;
     cs->h = CURSOR_DIM;
+    cs->shape = qemu_cursor_shape(0, &s->dac[DAC_CURSOR_IMG],
+                                  CURSOR_DIM * CURSOR_DIM / 4);
+    cs->shape = qemu_cursor_shape(cs->shape, &s->dac[DAC_HOT_X], 1);
+    cs->shape = qemu_cursor_shape(cs->shape, &s->dac[DAC_HOT_Y], 1);
     return true;
 }
 

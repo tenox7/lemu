@@ -39,6 +39,8 @@ typedef struct QemuPointerResult {
     double gain_x, gain_y;      /* open loop: px a count moves */
     bool calibrated;            /* the step and gain were measured now */
     char cal_error[192];        /* calibrated: why they could not be */
+    /* closed loop: the hotspot of the cursor image at the end is a guess */
+    bool hot_guess;
     bool known;
     int x, y;
 } QemuPointerResult;

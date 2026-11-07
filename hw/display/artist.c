@@ -1428,11 +1428,23 @@ static void artist_invalidate(void *opaque)
 static bool artist_cursor_state(void *opaque, QemuCursorState *cs)
 {
     ARTISTState *s = opaque;
+    const struct vram_buffer *plane[2] = {
+        &s->vram_buffer[ARTIST_BUFFER_CURSOR1],
+        &s->vram_buffer[ARTIST_BUFFER_CURSOR2],
+    };
+    int i, cy;
 
     cs->visible = cursor_visible(s);
     artist_get_cursor_pos(s, &cs->x, &cs->y);
     cs->w = s->cursor_width;
     cs->h = s->cursor_height;
+    for (i = 0; i < 2; i++) {
+        for (cy = 0; cy < s->cursor_height; cy++) {
+            cs->shape = qemu_cursor_shape(cs->shape,
+                                          plane[i]->data + cy * plane[i]->width,
+                                          s->cursor_width);
+        }
+    }
     return true;
 }
 

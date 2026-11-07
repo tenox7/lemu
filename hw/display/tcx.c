@@ -749,6 +749,8 @@ static bool tcx_cursor_state(void *opaque, QemuCursorState *cs)
     cs->y = s->cursy;
     cs->w = 32;
     cs->h = 32;
+    cs->shape = qemu_cursor_shape(0, s->cursmask, sizeof(s->cursmask));
+    cs->shape = qemu_cursor_shape(cs->shape, s->cursbits, sizeof(s->cursbits));
     return true;
 }
 

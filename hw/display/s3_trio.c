@@ -1467,6 +1467,7 @@ static uint32_t s3_hwc_base(S3TrioState *s)
 /* Where s3_cursor_draw_line() puts the cursor image */
 static bool s3_cursor_state(VGACommonState *vga, QemuCursorState *cs)
 {
+    S3TrioState *s = container_of(vga, S3TrioState, vga);
     uint8_t *cr = vga->cr;
 
     cs->visible = s3_hwc_on(vga);
@@ -1474,6 +1475,10 @@ static bool s3_cursor_state(VGACommonState *vga, QemuCursorState *cs)
     cs->y = (((cr[0x48] & 7) << 8) | cr[0x49]) - (cr[0x4f] & 0x3f);
     cs->w = 64;
     cs->h = 64;
+    if (s3_hwc_base(s) + 1024 <= vga->vram_size) {
+        cs->shape = qemu_cursor_shape(0, vga->vram_ptr + s3_hwc_base(s),
+                                      1024);
+    }
     return true;
 }
 

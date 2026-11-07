@@ -631,12 +631,16 @@ static void s3_cursor_invalidate(VGACommonState *v)
 static bool s3_cursor_state(VGACommonState *v, QemuCursorState *cs)
 {
     S3TrioState *s = container_of(v, S3TrioState, vga);
+    uint32_t start = (((v->cr[0x4c] & 0x0f) << 8) | v->cr[0x4d]) * 1024;
 
     cs->visible = s3_cursor_on(s);
     cs->x = (int)v->hw_cursor_x - (v->cr[0x4e] & 0x3f);
     cs->y = (int)v->hw_cursor_y - (v->cr[0x4f] & 0x3f);
     cs->w = 64;
     cs->h = 64;
+    if (start + 1024 <= v->vram_size) {
+        cs->shape = qemu_cursor_shape(0, v->vram_ptr + start, 1024);
+    }
     return true;
 }
 

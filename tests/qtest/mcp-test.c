@@ -412,12 +412,74 @@ typedef struct FakeGuest {
     int accel;
     bool caret;                 /* it blinks with every mouse packet */
     bool caret_on;
+    bool hw;                    /* an ATI card's hardware cursor instead */
+    QPCIBar mmio;
+    uint32_t img;               /* hw: the cursor image shown */
     double fx, fy;              /* the hotspot */
     int x, y;                   /* the hotspot as drawn */
     uint8_t pkt[3];
     int npkt;
     QDict *reply;
 } FakeGuest;
+
+/*
+ * A guest with a hardware cursor on an ATI card, for the closed loop.
+ * Like X, it loads another cursor image for each window and puts the
+ * image at the pointer less that image's hotspot: left of the middle
+ * an arrow with its hotspot at 2,1, right of it a text cursor with its
+ * hotspot at 17,16, and between them a window border 8 px wide with a
+ * resize cursor, hotspot 10,6.  A scrollbar 8 px wide runs down the
+ * right edge of the top half, with a cursor whose hotspot is at 17,20.
+ * The card reports only where the image is.
+ */
+#define ATI_CRTC_GEN_CNTL       0x0050
+#define ATI_CUR_OFFSET          0x0260
+#define ATI_CUR_HORZ_VERT_POSN  0x0264
+#define ATI_CUR_HORZ_VERT_OFF   0x0268
+#define ATI_CRTC_ON             0x03010600  /* 32 bpp, CRTC and cursor on */
+#define ATI_IMG_ARROW           0x200000    /* the images in VRAM */
+#define ATI_IMG_TEXT            0x200400
+#define ATI_IMG_RESIZE          0x200800
+#define ATI_IMG_SCROLL          0x200c00
+#define ATI_IMG_SIZE            1024        /* 64x64, 2 bits a pixel */
+#define BORDER_X                (SCR_W / 2 - 4)
+#define BORDER_W                8
+#define SCROLL_W                8
+
+static void fake_hw_cursor(FakeGuest *g)
+{
+    int px = lround(g->fx), py = lround(g->fy);
+    uint32_t img = ATI_IMG_ARROW;
+    int x = px - 2, y = py - 1;
+    int xoff, yoff;
+
+    if (px >= BORDER_X && px < BORDER_X + BORDER_W) {
+        img = ATI_IMG_RESIZE;
+        x = px - 10;
+        y = py - 6;
+    } else if (px >= SCR_W - SCROLL_W && py < SCR_H / 2) {
+        img = ATI_IMG_SCROLL;
+        x = px - 17;
+        y = py - 20;
+    } else if (px >= SCR_W / 2) {
+        img = ATI_IMG_TEXT;
+        x = px - 17;
+        y = py - 16;
+    }
+    xoff = MAX(0, -x);
+    yoff = MAX(0, -y);
+
+    if (img != g->img) {
+        qpci_io_writel(g->s.dev, g->mmio, ATI_CUR_OFFSET, img);
+        g->img = img;
+    }
+    qpci_io_writel(g->s.dev, g->mmio, ATI_CUR_HORZ_VERT_OFF,
+                   xoff << 16 | yoff);
+    qpci_io_writel(g->s.dev, g->mmio, ATI_CUR_HORZ_VERT_POSN,
+                   (x + xoff) << 16 | (y + yoff));
+    g->x = px;
+    g->y = py;
+}
 
 static void fake_blink(FakeGuest *g)
 {
@@ -465,7 +527,9 @@ static void fake_packet(FakeGuest *g, const uint8_t *p)
 
     g->fx = MAX(0, MIN(SCR_W - 1, g->fx + dx * k));
     g->fy = MAX(0, MIN(SCR_H - 1, g->fy - dy * k));     /* PS/2 y is up */
-    if (lround(g->fx) != g->x || lround(g->fy) != g->y) {
+    if (g->hw) {
+        fake_hw_cursor(g);
+    } else if (lround(g->fx) != g->x || lround(g->fy) != g->y) {
         fake_draw(g, lround(g->fx), lround(g->fy));
     }
     if (g->caret) {
@@ -495,20 +559,11 @@ static bool fake_poll(FakeGuest *g)
     return any;
 }
 
-static void fake_init(FakeGuest *g, double gain, int accel)
+/* Enable the mouse port, then the mouse, and take its ACK */
+static void fake_mouse_on(FakeGuest *g)
 {
     uint8_t st;
 
-    memset(g, 0, sizeof(*g));
-    g->gain = gain;
-    g->accel = accel;
-    screen_init_machine(&g->s, "pc,vmport=off");
-    g->x = g->y = -PTR_SIZE;
-    g->fx = SCR_W / 2.0;
-    g->fy = SCR_H / 2.0;
-    fake_draw(g, SCR_W / 2, SCR_H / 2);
-
-    /* enable the mouse port, then the mouse, and take its ACK */
     qtest_outb(g->s.qts, I8042_CMD, 0xa8);
     qtest_outb(g->s.qts, I8042_CMD, 0xd4);
     qtest_outb(g->s.qts, I8042_DATA, 0xf4);
@@ -523,6 +578,56 @@ static void fake_init(FakeGuest *g, double gain, int accel)
             }
         }
     }
+}
+
+static void fake_init(FakeGuest *g, double gain, int accel)
+{
+    memset(g, 0, sizeof(*g));
+    g->gain = gain;
+    g->accel = accel;
+    screen_init_machine(&g->s, "pc,vmport=off");
+    g->x = g->y = -PTR_SIZE;
+    g->fx = SCR_W / 2.0;
+    g->fy = SCR_H / 2.0;
+    fake_draw(g, SCR_W / 2, SCR_H / 2);
+    fake_mouse_on(g);
+}
+
+static void fake_init_hw(FakeGuest *g, double gain, int accel)
+{
+    uint8_t img[ATI_IMG_SIZE];
+    Screen *s = &g->s;
+
+    memset(g, 0, sizeof(*g));
+    g->gain = gain;
+    g->accel = accel;
+    g->hw = true;
+    s->qts = qtest_init("-machine pc,vmport=off -nodefaults -display none"
+                        " -device ati-vga,addr=02.0");
+    s->bus = qpci_new_pc(s->qts, NULL);
+    s->dev = qpci_device_find(s->bus, QPCI_DEVFN(2, 0));
+    g_assert(s->dev);
+    qpci_device_enable(s->dev);
+    s->lfb = qpci_iomap(s->dev, 0, NULL);
+    g->mmio = qpci_iomap(s->dev, 2, NULL);
+
+    /* four images that differ, then 640x480 with the cursor on */
+    memset(img, 0xaa, sizeof(img));
+    qpci_memwrite(s->dev, s->lfb, ATI_IMG_ARROW, img, sizeof(img));
+    memset(img, 0x55, sizeof(img));
+    qpci_memwrite(s->dev, s->lfb, ATI_IMG_TEXT, img, sizeof(img));
+    memset(img, 0x33, sizeof(img));
+    qpci_memwrite(s->dev, s->lfb, ATI_IMG_RESIZE, img, sizeof(img));
+    memset(img, 0xcc, sizeof(img));
+    qpci_memwrite(s->dev, s->lfb, ATI_IMG_SCROLL, img, sizeof(img));
+    qpci_io_writel(s->dev, g->mmio, ATI_CRTC_GEN_CNTL, ATI_CRTC_ON);
+    qtest_inb(s->qts, 0x3da);
+    qtest_outb(s->qts, 0x3c0, 0x20);
+
+    g->fx = SCR_W / 2.0;
+    g->fy = SCR_H / 2.0;
+    fake_hw_cursor(g);
+    fake_mouse_on(g);
 }
 
 static gpointer fake_reply(gpointer opaque)
@@ -573,6 +678,7 @@ static void fake_move(FakeGuest *g, int x, int y, int slack, const char *want)
     g_test_message("to %d,%d, the guest has %d,%d: %s", x, y, g->x, g->y,
                    summary);
     g_assert(!want || strstr(summary, want));
+    g_assert(!strstr(summary, "could not be measured"));
     g_assert_cmpint(abs(g->x - x), <=, slack);
     g_assert_cmpint(abs(g->y - y), <=, slack);
     qobject_unref(rsp);
@@ -625,6 +731,35 @@ static void test_pointer_accel(void)
     fake_init(&g, 1, 4);
     fake_move(&g, 150, 100, 0, "steps of 1 count, and a count moves 1.00");
     fake_move(&g, 90, 160, 0, NULL);
+    screen_free(&g.s);
+}
+
+/*
+ * The closed loop on a hardware cursor whose image, and so hotspot,
+ * changes with the window under the pointer.  Homing measures the
+ * hotspot of the text cursor in the bottom-right corner; the arrow's
+ * must be measured on the way into the left half, or every click
+ * there lands 15 px off.  Moves that cross the border must not stop
+ * at its resize cursor; a move onto the border measures that one.  At
+ * the scrollbar on the right edge the guest stops the pointer short,
+ * so a step there must not be used to measure its cursor.
+ */
+static void test_pointer_hw_cursor(void)
+{
+    FakeGuest g;
+
+    fake_init_hw(&g, 1, 4);
+    fake_move(&g, 100, 300, 0, "homed first");
+    fake_move(&g, 500, 200, 0, NULL);
+    fake_move(&g, 330, 400, 0, NULL);
+    fake_move(&g, 300, 90, 0, NULL);
+    fake_move(&g, 20, 10, 0, NULL);
+    fake_move(&g, 319, 250, 0, NULL);
+    fake_move(&g, 600, 450, 0, NULL);
+    fake_move(&g, 311, 250, 0, NULL);
+    fake_move(&g, 636, 100, 0, NULL);
+    fake_move(&g, 400, 120, 0, NULL);
+    fake_move(&g, 634, 60, 0, NULL);
     screen_free(&g.s);
 }
 
@@ -3469,6 +3604,9 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/pointer/slow", test_pointer_slow);
     qtest_add_func("/mcp/pointer/fast", test_pointer_fast);
     qtest_add_func("/mcp/pointer/accel", test_pointer_accel);
+    if (qtest_has_device("ati-vga")) {
+        qtest_add_func("/mcp/pointer/hw-cursor", test_pointer_hw_cursor);
+    }
     qtest_add_func("/mcp/vm-stats", test_vm_stats);
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);

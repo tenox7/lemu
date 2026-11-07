@@ -1563,6 +1563,12 @@ static void mcp_pointer_result(McpInputResult *res, QemuConsole *con,
     } else if (pr->homed) {
         g_string_append(summary, " (homed first)");
     }
+    if (pr->hot_guess) {
+        g_string_append(summary, " (the guest changed the cursor image and"
+                        " where its tip is could not be measured, so the"
+                        " pointer may be off by up to the cursor's size:"
+                        " check with a screenshot)");
+    }
 }
 
 McpInputResult *coroutine_fn qmp_mouse_move(bool has_x, int64_t x,

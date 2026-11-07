@@ -251,6 +251,8 @@ static bool ati_cursor_state(VGACommonState *vga, QemuCursorState *cs)
 {
     ATIVGAState *s = container_of(vga, ATIVGAState, vga);
     uint32_t offs = s->regs.cur_hv_offs;
+    uint32_t img = s->regs.cur_offset & 0x07fffff0;
+    uint32_t len = ati_cursor_24bpp(s) ? 64 * 64 * 4 : 64 * 16;
 
     cs->visible = s->regs.crtc_gen_cntl & CRTC2_CUR_EN;
     /* less the part hidden beyond the left and top edges */
@@ -258,6 +260,9 @@ static bool ati_cursor_state(VGACommonState *vga, QemuCursorState *cs)
     cs->y = (int)(s->regs.cur_hv_pos & 0xffff) - (int)(offs & 0x3f);
     cs->w = 64;
     cs->h = 64;
+    if (img + len <= s->vga.vram_size) {
+        cs->shape = qemu_cursor_shape(0, s->vga.vram_ptr + img, len);
+    }
     return true;
 }
 

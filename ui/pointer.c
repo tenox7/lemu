@@ -48,6 +48,15 @@
 #define POINTER_GAIN_MIN        0.05    /* px per count we believe */
 #define POINTER_GAIN_MAX        20.0
 #define POINTER_GAIN_FIRST      0.25    /* the first homing covers this */
+#define POINTER_SHAPES          16      /* cursor images it keeps hotspots of */
+#define POINTER_PROBES          4       /* closed loop: steps sent again */
+#define POINTER_HOT_HOMINGS     2       /* closed loop: homings in one move */
+
+/* Closed loop: the hotspot of a cursor image, from its top-left corner */
+typedef struct PointerHot {
+    uint32_t shape;
+    int x, y;
+} PointerHot;
 
 typedef struct QemuPointer {
     QemuConsole *con;
@@ -58,9 +67,14 @@ typedef struct QemuPointer {
     uint64_t foreign;
     QemuPointerMethod method;
     bool unknown_told;          /* qemu_pointer_unknown_once() said so */
-    /* closed loop: hotspot minus the cursor image's top-left corner */
-    bool has_offset;
-    int off_x, off_y;
+    /*
+     * Closed loop: the hotspot of each cursor image seen.  A guest
+     * may load another image, with its hotspot elsewhere, for each
+     * window.
+     */
+    PointerHot hot[POINTER_SHAPES];
+    int n_hot;
+    int next_hot;               /* the one to replace when all are used */
     /* open loop: the biggest step the guest takes as it is; 0: unknown */
     bool cal_done;
     int cal_step;
@@ -79,7 +93,7 @@ static void pointer_reset(void *opaque)
 
     QLIST_FOREACH(p, &pointers, node) {
         p->known = false;
-        p->has_offset = false;
+        p->n_hot = 0;
         p->cal_done = false;    /* another guest may boot */
         p->unknown_told = false;
     }
@@ -187,8 +201,45 @@ void qemu_pointer_forget(QemuConsole *con)
 
     if (p) {
         p->known = false;
-        p->has_offset = false;
+        p->n_hot = 0;
     }
+}
+
+/* The hotspot of the cursor image @shape, if it was measured */
+static bool pointer_hot_get(QemuPointer *p, uint32_t shape, PointerHot *hot)
+{
+    int i;
+
+    for (i = 0; i < p->n_hot; i++) {
+        if (p->hot[i].shape == shape) {
+            *hot = p->hot[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void pointer_hot_set(QemuPointer *p, const PointerHot *hot,
+                            const char *how)
+{
+    int i;
+
+    for (i = 0; i < p->n_hot; i++) {
+        if (p->hot[i].shape == hot->shape) {
+            break;
+        }
+    }
+    if (i == p->n_hot) {
+        if (p->n_hot < POINTER_SHAPES) {
+            p->n_hot++;
+        } else {
+            i = p->next_hot;
+            p->next_hot = (p->next_hot + 1) % POINTER_SHAPES;
+        }
+    }
+    p->hot[i] = *hot;
+    trace_pointer_hotspot(qemu_console_get_index(p->con), hot->shape,
+                          hot->x, hot->y, how);
 }
 
 static int clamp_step(int d, int cap)
@@ -743,7 +794,8 @@ static bool coroutine_fn pointer_co_open_loop(QemuPointer *p,
 
 static bool cursor_equal(const QemuCursorState *a, const QemuCursorState *b)
 {
-    return a->x == b->x && a->y == b->y && a->visible == b->visible;
+    return a->x == b->x && a->y == b->y && a->visible == b->visible &&
+           a->shape == b->shape;
 }
 
 /* Sleep until the card's cursor moves away from @old and settles */
@@ -809,6 +861,142 @@ static bool coroutine_fn pointer_co_corner_cursor(QemuPointer *p,
     return true;
 }
 
+/*
+ * Learn the hotspot of the cursor image in the bottom-right corner:
+ * guests clamp the hotspot to the last pixel, so there it shows how far
+ * the hotspot is from the image's corner.
+ */
+static bool coroutine_fn pointer_co_home_hot(QemuPointer *p, QemuInputCtx *ctx,
+                                             int w, int h,
+                                             const QemuPointerOpts *o,
+                                             QemuCursorState *cs,
+                                             PointerHot *hot, Error **errp)
+{
+    if (!pointer_co_corner_cursor(p, ctx, w, h, o, cs, errp)) {
+        return false;
+    }
+    hot->shape = cs->shape;
+    hot->x = (w - 1) - cs->x;
+    hot->y = (h - 1) - cs->y;
+    if (hot->x < 0 || hot->x >= MAX(cs->w, 1) ||
+        hot->y < 0 || hot->y >= MAX(cs->h, 1)) {
+        hot->x = hot->y = 0;
+    }
+    pointer_hot_set(p, hot, "bottom-right corner");
+    return true;
+}
+
+/*
+ * Could the guest have stopped the pointer short at the screen's edge
+ * on the step @sx, @sy that ended in the cursor image @cs?  The pointer
+ * is somewhere in the image.
+ */
+static bool pointer_maybe_at_edge(const QemuCursorState *cs, int sx, int sy,
+                                  int w, int h)
+{
+    return (sx < 0 && cs->x <= 0) ||
+           (sx > 0 && cs->x + MAX(cs->w, 1) >= w) ||
+           (sy < 0 && cs->y <= 0) ||
+           (sy > 0 && cs->y + MAX(cs->h, 1) >= h);
+}
+
+/*
+ * The step @sx, @sy took the pointer from where @old showed it, with
+ * the hotspot @from, to where the guest shows another cursor image,
+ * @cs, whose hotspot is not known: the guest loaded that image for the
+ * window the pointer went into.  The image moved by the step plus the
+ * difference of the two hotspots, so the hotspot is known once it is
+ * known how far the step alone went.  Send the step again until the
+ * image is the same twice in a row, which shows that, or a known one;
+ * then each image on the way gets its hotspot.  Near the screen's
+ * edges, where a step may go less far, it learns nothing.  Returns 1
+ * with @hot set if the image at the end has a known hotspot, 0 if not,
+ * -1 on error.
+ */
+static int coroutine_fn pointer_co_learn_hot(QemuPointer *p, QemuInputCtx *ctx,
+                                             const QemuCursorState *old,
+                                             const PointerHot *from,
+                                             int sx, int sy, int w, int h,
+                                             QemuCursorState *cs,
+                                             PointerHot *hot,
+                                             QemuPointerResult *res,
+                                             Error **errp)
+{
+    QemuCursorState on[POINTER_PROBES + 1];     /* the image after each step */
+    int x0 = old->x + from->x, y0 = old->y + from->y;
+    int n = 1, dx = 0, dy = 0, i;
+    bool learn = false;
+    PointerHot k;
+
+    on[0] = *cs;
+    for (;;) {
+        QemuInputBatch *b;
+
+        if (pointer_maybe_at_edge(cs, sx, sy, w, h)) {
+            break;
+        }
+        if (n > 1 && cs->shape == on[n - 2].shape) {
+            /* the same image twice: it went as far as the pointer */
+            dx = cs->x - on[n - 2].x;
+            dy = cs->y - on[n - 2].y;
+            learn = true;
+            break;
+        }
+        if (n > 1 && pointer_hot_get(p, cs->shape, &k)) {
+            /* a known image: @n equal steps took the pointer here */
+            dx = cs->x + k.x - x0;
+            dy = cs->y + k.y - y0;
+            learn = !(dx % n) && !(dy % n);
+            dx /= n;
+            dy /= n;
+            break;
+        }
+        if (n > POINTER_PROBES) {
+            break;
+        }
+        b = qemu_input_batch_new(p->con);
+        qemu_input_batch_move(b, INPUT_EVENT_KIND_REL, sx, sy);
+        if (!qemu_input_co_run(ctx, b, errp)) {
+            return -1;
+        }
+        res->steps++;
+        if (!pointer_co_await_cursor(p, ctx, &on[n - 1], cs)) {
+            if (ctx->cancelled) {
+                error_setg(errp, "cancelled");
+                return -1;
+            }
+            return 0;
+        }
+        trace_pointer_cursor(qemu_console_get_index(p->con), sx, sy,
+                             cs->x, cs->y, cs->visible, cs->shape);
+        if (!cs->visible) {
+            return 0;
+        }
+        on[n++] = *cs;
+    }
+
+    /* the pointer went @dx, @dy with each step: measure each new image */
+    for (i = 0; learn && i < n; i++) {
+        PointerHot m = {
+            .shape = on[i].shape,
+            .x = x0 + (i + 1) * dx - on[i].x,
+            .y = y0 + (i + 1) * dy - on[i].y,
+        };
+
+        if (pointer_hot_get(p, m.shape, &k)) {
+            continue;
+        }
+        if (m.x < 0 || m.x >= MAX(on[i].w, 1) ||
+            m.y < 0 || m.y >= MAX(on[i].h, 1)) {
+            trace_pointer_hotspot(qemu_console_get_index(p->con), m.shape,
+                                  m.x, m.y, "outside the image: dropped");
+            continue;
+        }
+        pointer_hot_set(p, &m, "step sent again");
+    }
+    return pointer_hot_get(p, cs->shape, hot) ? 1 : 0;
+}
+
 static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
                                                 QemuInputCtx *ctx,
                                                 int x, int y, int w, int h,
@@ -817,45 +1005,41 @@ static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
                                                 Error **errp)
 {
     int capx = POINTER_LOOP_CAP, capy = POINTER_LOOP_CAP;
-    int stuck = 0;
+    int stuck = 0, homings = 0;
     QemuCursorState cs;
+    PointerHot hot;
+    bool hot_known;
     int i;
 
     qemu_console_hw_cursor_state(p->con, &cs);
-
-    if (!p->has_offset || o->home == QEMU_POINTER_HOME_ALWAYS) {
-        /*
-         * Learn the hotspot: guests clamp the hotspot to the last
-         * pixel, so in the bottom-right corner the offset shows.
-         */
-        if (!pointer_co_corner_cursor(p, ctx, w, h, o, &cs, errp)) {
+    hot_known = pointer_hot_get(p, cs.shape, &hot);
+    if (!hot_known || o->home == QEMU_POINTER_HOME_ALWAYS) {
+        if (!pointer_co_home_hot(p, ctx, w, h, o, &cs, &hot, errp)) {
             return false;
         }
-        p->off_x = (w - 1) - cs.x;
-        p->off_y = (h - 1) - cs.y;
-        if (p->off_x < 0 || p->off_x >= MAX(cs.w, 1) ||
-            p->off_y < 0 || p->off_y >= MAX(cs.h, 1)) {
-            p->off_x = p->off_y = 0;
-        }
-        p->has_offset = true;
+        hot_known = true;
+        homings++;
         res->homed = true;
     }
 
     for (i = 0; i < POINTER_LOOP_MAX; i++) {
-        int dx = x - (cs.x + p->off_x);
-        int dy = y - (cs.y + p->off_y);
+        int dx = x - (cs.x + hot.x);
+        int dy = y - (cs.y + hot.y);
         QemuCursorState old = cs;
+        PointerHot from = hot;
         QemuInputBatch *b;
-        int ndx, ndy;
+        int sx, sy, ndx, ndy, r;
 
         if (!dx && !dy) {
             pointer_set(p, x, y, w, h, QEMU_POINTER_CLOSED_LOOP);
             res->method = QEMU_POINTER_CLOSED_LOOP;
+            res->hot_guess = !hot_known;
             return true;
         }
+        sx = clamp_step(dx, capx);
+        sy = clamp_step(dy, capy);
         b = qemu_input_batch_new(p->con);
-        qemu_input_batch_move(b, INPUT_EVENT_KIND_REL,
-                              clamp_step(dx, capx), clamp_step(dy, capy));
+        qemu_input_batch_move(b, INPUT_EVENT_KIND_REL, sx, sy);
         if (!qemu_input_co_run(ctx, b, errp)) {
             p->known = false;
             return false;
@@ -872,9 +1056,42 @@ static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
             continue;
         }
         stuck = 0;
+        trace_pointer_cursor(qemu_console_get_index(p->con), sx, sy,
+                             cs.x, cs.y, cs.visible, cs.shape);
+
+        if (cs.shape != old.shape) {
+            /* another cursor image: is its hotspot known? */
+            r = pointer_hot_get(p, cs.shape, &hot);
+            if (!r && hot_known && old.visible && cs.visible) {
+                r = pointer_co_learn_hot(p, ctx, &old, &from, sx, sy, w, h,
+                                         &cs, &hot, res, errp);
+            }
+            if (r < 0) {
+                p->known = false;
+                return false;
+            }
+            if (r > 0) {
+                hot_known = true;
+            } else if (homings < POINTER_HOT_HOMINGS) {
+                /* measure again, from the corner */
+                if (!pointer_co_home_hot(p, ctx, w, h, o, &cs, &hot, errp)) {
+                    return false;
+                }
+                hot_known = true;
+                homings++;
+                res->homed = true;
+                capx = capy = POINTER_LOOP_CAP;
+                continue;
+            } else {
+                /* go on with the hotspot of the old image: a guess */
+                hot = from;
+                hot.shape = cs.shape;
+                hot_known = false;
+            }
+        }
         /* overshot: the guest accelerated the move, so move less */
-        ndx = x - (cs.x + p->off_x);
-        ndy = y - (cs.y + p->off_y);
+        ndx = x - (cs.x + hot.x);
+        ndy = y - (cs.y + hot.y);
         if (ndx && (ndx > 0) != (dx > 0)) {
             capx = MAX(1, capx / 2);
         }
@@ -884,8 +1101,8 @@ static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
     }
 
     /* the card's cursor stopped following: finish in open loop from here */
-    pointer_set(p, cs.x + p->off_x, cs.y + p->off_y, w, h,
-                QEMU_POINTER_OPEN_LOOP);
+    pointer_set(p, cs.x + hot.x, cs.y + hot.y, w, h, QEMU_POINTER_OPEN_LOOP);
+    res->hot_guess = !hot_known;
     {
         QemuPointerOpts oo = *o;
 
@@ -1024,14 +1241,20 @@ bool coroutine_fn qemu_pointer_co_locate(QemuConsole *con, QemuInputCtx *ctx,
         goto found_model;
     }
     if (qemu_console_hw_cursor_state(con, &cs) && cs.visible) {
-        if (p->has_offset) {
-            pointer_set(p, cs.x + p->off_x, cs.y + p->off_y, w, h,
+        PointerHot hot;
+
+        if (pointer_hot_get(p, cs.shape, &hot)) {
+            pointer_set(p, cs.x + hot.x, cs.y + hot.y, w, h,
                         QEMU_POINTER_CLOSED_LOOP);
             *how = "display card cursor";
         } else {
-            /* without the learned offset, the image corner is the guess */
+            /* without the hotspot, the image corner is the guess */
             pointer_set(p, cs.x, cs.y, w, h, QEMU_POINTER_CLOSED_LOOP);
-            *how = "display card cursor, image corner (approximate)";
+            *how = p->n_hot ?
+                "display card cursor, image corner (approximate: the hotspot"
+                " of this cursor image is not measured yet; a mouse-move"
+                " measures it)" :
+                "display card cursor, image corner (approximate)";
         }
         goto found_model;
     }
