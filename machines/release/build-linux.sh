@@ -3,10 +3,10 @@
 # in Docker: bundle the libraries into OUT/linux-x86_64 (OUT/linux-aarch64
 # for arm64) and list each binary's features.
 # Feature set = everything the 40p, 7006, pseries, jensen and rm200 builds had;
-# qemu-system-hppa (HP B160L) gets the same.
+# qemu-system-hppa (HP B160L) and qemu-system-i386 (PC) get the same.
 # usage: build-linux.sh amd64|arm64 SRC OUT
 set -e
-BINS="qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-system-mips64el qemu-system-mips64 qemu-system-hppa"
+BINS="qemu-system-i386 qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-system-mips64el qemu-system-mips64 qemu-system-hppa"
 if [ "$1" != --container ]; then
     [ $# -eq 3 ] || { echo "usage: $0 amd64|arm64 SRC OUT" >&2; exit 1; }
     mkdir -p "$3"
@@ -28,7 +28,7 @@ tar -C /src --exclude=./.git --exclude='./build*' -cf - . | tar -C /b -xf -
 cd /b/build
 # the source is copied without .git, so pass the git id for --version
 ../configure ${PKGVERSION:+--with-pkgversion=$PKGVERSION} --python=/usr/bin/python3.12 \
-    --target-list=ppc-softmmu,ppc64-softmmu,alpha-softmmu,mips64el-softmmu,mips64-softmmu,hppa-softmmu \
+    --target-list=i386-softmmu,ppc-softmmu,ppc64-softmmu,alpha-softmmu,mips64el-softmmu,mips64-softmmu,hppa-softmmu \
     --without-default-features --enable-system --enable-tcg --enable-hmp --enable-sdl \
     --enable-pixman --enable-slirp --enable-pa --enable-alsa --enable-malloc-trim --enable-membarrier \
     --enable-fdt=internal --enable-vnc --enable-vvfat --enable-qcow1 --enable-vdi --enable-vmdk \
