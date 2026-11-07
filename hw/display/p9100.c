@@ -964,6 +964,12 @@ static void p9100_quad(P9100State *s)
     p9100_update_irq(s);
 }
 
+/*
+ * The blitter works on bytes: x and the width are in bytes, not pixels, so
+ * a driver multiplies them by the bytes per pixel at 16 and 32 bpp, as the
+ * NT 3.51 driver and NetBSD's do. Points 1 and 3 are the last byte and row
+ * copied, not the ones after them.
+ */
 static void p9100_blit(P9100State *s)
 {
     uint32_t raster = s->de[DE_RASTER];
@@ -972,8 +978,8 @@ static void p9100_blit(P9100State *s)
     uint8_t *vram;
     int sx = MIN(s->x[0], s->x[1]), sy = MIN(s->y[0], s->y[1]);
     int dx = MIN(s->x[2], s->x[3]), dy = MIN(s->y[2], s->y[3]);
-    int w = MIN(abs(s->x[1] - s->x[0]), abs(s->x[3] - s->x[2]));
-    int h = MIN(abs(s->y[1] - s->y[0]), abs(s->y[3] - s->y[2]));
+    int w = MIN(abs(s->x[1] - s->x[0]), abs(s->x[3] - s->x[2])) + 1;
+    int h = MIN(abs(s->y[1] - s->y[0]), abs(s->y[3] - s->y[2])) + 1;
     P9100Clip clip;
     int row, step;
 
@@ -982,7 +988,10 @@ static void p9100_blit(P9100State *s)
     }
     vram = memory_region_get_ram_ptr(&s->vram);
 
+    /* The pixel clipping window, in bytes */
     p9100_clip_window(s, bypp, &clip);
+    clip.xmin *= bypp;
+    clip.xmax *= bypp;
 
     if (dx < clip.xmin) {
         w -= clip.xmin - dx;
@@ -997,7 +1006,7 @@ static void p9100_blit(P9100State *s)
     w = MIN(w, clip.xmax - dx);
     h = MIN(h, clip.ymax - dy);
 
-    w = MIN(w, p9100_max_x(s, bypp) - MAX(sx, dx));
+    w = MIN(w, (int)s->pitch - MAX(sx, dx));
     h = MIN(h, p9100_max_y(s) - MAX(sy, dy));
     if (w <= 0 || h <= 0 || sx < 0 || sy < 0) {
         return;
@@ -1014,16 +1023,16 @@ static void p9100_blit(P9100State *s)
     }
 
     for (; row >= 0 && row < h; row += step) {
-        size_t soff = (size_t)(sy + row) * s->pitch + (size_t)sx * bypp;
-        size_t doff = (size_t)(dy + row) * s->pitch + (size_t)dx * bypp;
-        size_t len = (size_t)w * bypp;
+        size_t soff = (size_t)(sy + row) * s->pitch + sx;
+        size_t doff = (size_t)(dy + row) * s->pitch + dx;
+        size_t len = w;
         int back = dx > sx;
         size_t i;
 
         for (i = 0; i < len; i++) {
             size_t k = back ? len - 1 - i : i;
-            unsigned lane = k % bypp;
-            uint8_t p = p9100_pattern_byte(s, dx + (int)(k / bypp), dy + row,
+            unsigned lane = (dx + k) % bypp;
+            uint8_t p = p9100_pattern_byte(s, (dx + (int)k) / bypp, dy + row,
                                            lane);
             uint8_t src = vram[soff + k];
             uint8_t d = vram[doff + k];
