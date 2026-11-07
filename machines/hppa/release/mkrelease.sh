@@ -4,16 +4,18 @@
 # qemu-system-hppa for macOS, Linux and Windows.
 # hpux1020: HP-UX 10.20 on the HP B160L; VMDIR holds the disk hpux.img (qcow2).
 # hpux905: HP-UX 9.05 on the HP 9000/715; VMDIR holds the disk hpux905.qcow2.
+# hpux907: HP-UX 9.07 on the HP 9000/715; VMDIR holds the disk hpux907.qcow2.
 # The pack converts the disk, which leaves its snapshots (savevm) out.
 # BINDIR is STAGE/hppa from ../../release/stage.sh.
-# usage: mkrelease.sh hpux1020|hpux905 VMDIR BINDIR OUT.tar.lz
+# usage: mkrelease.sh hpux1020|hpux905|hpux907 VMDIR BINDIR OUT.tar.lz
 set -e
-[ $# -eq 4 ] || { echo "usage: $0 hpux1020|hpux905 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
+[ $# -eq 4 ] || { echo "usage: $0 hpux1020|hpux905|hpux907 VMDIR BINDIR OUT.tar.lz" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 os=$1 vm=$2 bin=$3 out=$4
 case $os in
 hpux1020) name=hpux1020b160l-qemu img=$vm/hpux.img ;;
 hpux905) name=hpux905-715-qemu img=$vm/hpux905.qcow2 ;;
+hpux907) name=hpux907-715-qemu img=$vm/hpux907.qcow2 ;;
 *) echo "unknown OS: $os" >&2; exit 1 ;;
 esac
 t=$(mktemp -d)
