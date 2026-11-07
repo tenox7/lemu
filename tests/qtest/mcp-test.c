@@ -2978,6 +2978,156 @@ static void test_steps_debug(void)
     unlink(bios);
 }
 
+/* Match @i of a memory-search result */
+static QDict *search_match(QDict *ret, int i)
+{
+    QListEntry *e;
+    int n = 0;
+
+    QLIST_FOREACH_ENTRY(qdict_get_qlist(ret, "matches"), e) {
+        if (n++ == i) {
+            return qobject_to(QDict, qlist_entry_obj(e));
+        }
+    }
+    g_assert_not_reached();
+}
+
+static int64_t search_count(QTestState *qts, const char *args)
+{
+    QDict *ret = debug_ok(qts, "memory-search", args);
+    int64_t count = qdict_get_int(ret, "count");
+
+    qobject_unref(ret);
+    return count;
+}
+
+/*
+ * memory-search finds text and bytes in RAM and ROM, also across the
+ * pieces it copies, and never reads a device
+ */
+static void test_memory_search(void)
+{
+    static const char wide[] = { 'N', 0, 'T', 0, ' ', 0, 'O', 0, 'S', 0 };
+    g_autofree char *bios = debug_bios();
+    g_autofree char *big = NULL;
+    QTestState *qts;
+    QDict *ret, *m;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+    qtest_memwrite(qts, 0x2000, "Hello, LEMU", 11);
+    /* across the 64 KiB pieces it copies */
+    qtest_memwrite(qts, 0xfffd, "Chunky", 6);
+    qtest_memwrite(qts, 0x3000, wide, sizeof(wide));
+
+    /* all RAM and ROM */
+    ret = debug_ok(qts, "memory-search", "{'text': 'Hello'}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    g_assert_cmpint(qdict_get_int(ret, "searched"), >=, 128 * MiB);
+    m = search_match(ret, 0);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x2000");
+    g_assert_cmpstr(qdict_get_str(m, "region"), ==, "pc.ram");
+    g_assert(!qdict_haskey(m, "physical"));
+    g_assert(g_str_has_prefix(qdict_get_str(m, "bytes"),
+                              "48 65 6c 6c 6f 2c 20 4c"));
+    g_assert(g_str_has_prefix(qdict_get_str(m, "text"), "Hello, LEMU."));
+    g_assert(strstr(qdict_get_str(ret, "summary"), "|Hello, LEMU."));
+    qobject_unref(ret);
+
+    ret = debug_ok(qts, "memory-search", "{'text': 'Chunky'}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    g_assert_cmpstr(qdict_get_str(search_match(ret, 0), "address"), ==,
+                    "0xfffd");
+    qobject_unref(ret);
+
+    g_assert_cmpint(search_count(qts, "{'text': 'HELLO'}"), ==, 0);
+    g_assert_cmpint(search_count(qts, "{'text': 'hELLO, lemu',"
+                                 " 'ignore-case': true}"), ==, 1);
+
+    /* UTF-16, as Windows NT keeps its strings */
+    ret = debug_ok(qts, "memory-search", "{'text': 'nt os', 'wide': true,"
+                   " 'ignore-case': true}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    m = search_match(ret, 0);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x3000");
+    g_assert(g_str_has_prefix(qdict_get_str(m, "text"), "NT OS"));
+    qobject_unref(ret);
+    g_assert_cmpint(search_count(qts, "{'text': 'nt os', 'wide': true}"),
+                    ==, 0);
+
+    /* the reset code, in both places the BIOS shows */
+    ret = debug_ok(qts, "memory-search", "{'bytes': '40 eb fd'}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 2);
+    g_assert_cmpstr(qdict_get_str(search_match(ret, 0), "address"), ==,
+                    "0xffff0");
+    m = search_match(ret, 1);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0xfffffff0");
+    g_assert_cmpstr(qdict_get_str(m, "region"), ==, "pc.bios");
+    qobject_unref(ret);
+
+    /* the hlt filling the BIOS: counting stops, max lists fewer */
+    ret = debug_ok(qts, "memory-search", "{'bytes': 'f4f4', 'max': 3}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 100000);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "matches")), ==, 3);
+    g_assert(strstr(qdict_get_str(ret, "summary"), "or more"));
+    qobject_unref(ret);
+    ret = debug_ok(qts, "memory-search", "{'bytes': '40eb', 'max': 0}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 2);
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "matches")), ==, 0);
+    qobject_unref(ret);
+
+    /* a range: virtual (paging is off), then physical */
+    ret = debug_ok(qts, "memory-search", "{'text': 'Hello',"
+                   " 'address': '0x1000', 'length': 4101}");
+    g_assert_cmpint(qdict_get_int(ret, "count"), ==, 1);
+    m = search_match(ret, 0);
+    g_assert_cmpstr(qdict_get_str(m, "address"), ==, "0x2000");
+    g_assert_cmpstr(qdict_get_str(m, "physical"), ==, "0x2000");
+    qobject_unref(ret);
+    /* the match must fit in the range, and start in it */
+    g_assert_cmpint(search_count(qts, "{'text': 'Hello', 'address': '4096',"
+                                 " 'length': 4100, 'physical': true}"), ==, 0);
+    g_assert_cmpint(search_count(qts, "{'text': 'Hello',"
+                                 " 'address': '0x2001', 'physical': true}"),
+                    ==, 0);
+    g_assert_cmpint(search_count(qts, "{'text': 'Hello',"
+                                 " 'address': '0x2000', 'physical': true}"),
+                    ==, 1);
+
+    /* a device is never read */
+    ret = debug_ok(qts, "memory-search", "{'bytes': '00',"
+                   " 'address': '0xfec00000', 'length': 4096,"
+                   " 'physical': true}");
+    g_assert_cmpint(qdict_get_int(ret, "searched"), ==, 0);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "memory-search", "{'bytes': '00',"
+                   " 'address': '0xfec00000', 'length': 4096}");
+    g_assert_cmpint(qdict_get_int(ret, "searched"), ==, 0);
+    qobject_unref(ret);
+
+    debug_check_error(qts, "memory-search", "{}", "give bytes or text");
+    debug_check_error(qts, "memory-search", "{'bytes': '00', 'text': 'a'}",
+                      "not both");
+    debug_check_error(qts, "memory-search", "{'bytes': '00', 'wide': true}",
+                      "go with text");
+    debug_check_error(qts, "memory-search", "{'text': ''}", "empty");
+    debug_check_error(qts, "memory-search", "{'text': 'a', 'length': 16}",
+                      "goes with address");
+    debug_check_error(qts, "memory-search", "{'text': 'a', 'max': 501}",
+                      "max must be");
+    debug_check_error(qts, "memory-search", "{'text': 'a', 'address': 'zz'}",
+                      "not a number");
+    debug_check_error(qts, "memory-search", "{'text': 'a',"
+                      " 'address': '0x1000', 'length': 0}", "at least 1");
+    debug_check_error(qts, "memory-search", "{'text': 'a',"
+                      " 'address': '0x1000', 'length': 8589934592}",
+                      "at most 4 GiB");
+    big = g_strdup_printf("{'bytes': '%0514d'}", 0);
+    debug_check_error(qts, "memory-search", big, "at most 256 bytes");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
 /*
  * memory-write changes RAM and ROM but no device, and code made from
  * the old bytes goes away; debug-profile finds the loop
@@ -3619,6 +3769,7 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/screen/text", test_screen_text);
         qtest_add_func("/mcp/debug/run", test_debug_run);
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
+        qtest_add_func("/mcp/debug/search", test_memory_search);
         qtest_add_func("/mcp/steps/debug", test_steps_debug);
         qtest_add_func("/mcp/debug/retry", test_debug_retry);
         qtest_add_func("/mcp/debug/registers", test_debug_registers);

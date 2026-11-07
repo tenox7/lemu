@@ -1,6 +1,7 @@
 /*
  * Debug tools for MCP clients: run to an address, single steps, a
- * profile of where the CPUs run, and memory writes (see qapi/mcp.json).
+ * profile of where the CPUs run, memory writes and memory search (see
+ * qapi/mcp.json).
  * They do what agents used to do with GDB scripts on the GDB stub.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -22,6 +23,7 @@
 #include "qemu/rcu.h"
 #include "qemu/target-info.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "system/address-spaces.h"
 #include "system/cpus.h"
 #include "system/hw_accel.h"
@@ -261,6 +263,533 @@ McpMemoryWriteResult *qmp_memory_write(const char *address,
         res->summary = g_strdup_printf("%s, but it reads back different "
                                        "bytes (see after)", old);
     }
+    return res;
+}
+
+/*
+ * memory-search.  It copies guest RAM and ROM a piece at a time, never
+ * reading a device, and looks for the bytes in the copy.  Every few
+ * milliseconds it lets the main loop run, so the VM goes on and the
+ * search can be cancelled.
+ */
+
+#define SEARCH_MAX_BYTES        256
+#define SEARCH_CHUNK            (64 * KiB)
+#define SEARCH_LENGTH           (1 * MiB)
+#define SEARCH_VIRTUAL_MAX      (4 * GiB)
+#define SEARCH_LIST             20
+#define SEARCH_LIST_MAX         500
+#define SEARCH_COUNT_MAX        100000
+#define SEARCH_SHOWN            16      /* bytes shown from a match */
+#define SEARCH_SLICE_MS         20      /* then the main loop runs */
+
+/* Where a piece of a copy came from */
+typedef struct McpSpan {
+    size_t off;                 /* in the copy */
+    hwaddr pa;                  /* the physical address of that byte */
+    const char *region;
+} McpSpan;
+
+/* What to find; letters of text may match in either case */
+typedef struct McpPattern {
+    uint8_t bytes[SEARCH_MAX_BYTES];    /* lower case where @fold */
+    bool fold[SEARCH_MAX_BYTES];
+    size_t len;
+    bool any_fold;
+} McpPattern;
+
+/* RAM or ROM that can be read without asking a device */
+static bool mcp_ram_region(const MemoryRegion *mr)
+{
+    return memory_region_supports_direct_access(mr) && mr->ram_block &&
+           !memory_region_is_ram_device(mr) &&
+           !memory_region_is_protected(mr);
+}
+
+/*
+ * Copy RAM and ROM at physical @pa of @as into @buf, up to @len bytes;
+ * it stops at the first byte that is neither.  Adds where each piece
+ * came from to @spans, if given, with @off added to its place in @buf.
+ * Returns how many bytes it copied.
+ */
+static size_t mcp_ram_copy(AddressSpace *as, hwaddr pa, uint8_t *buf,
+                           size_t len, GArray *spans, size_t off)
+{
+    size_t done = 0;
+
+    while (done < len) {
+        MemoryRegionSection s = memory_region_find(as->root, pa + done,
+                                                   len - done);
+        bool ok = s.mr && s.offset_within_address_space == pa + done &&
+                  mcp_ram_region(s.mr);
+        size_t n = ok ? int128_get64(s.size) : 0;
+
+        if (ok) {
+            McpSpan sp = {
+                .off = off + done,
+                .pa = pa + done,
+                .region = memory_region_name(s.mr),
+            };
+
+            /* the reference memory_region_find took keeps the RAM */
+            memcpy(buf + done, (uint8_t *)memory_region_get_ram_ptr(s.mr) +
+                   s.offset_within_region, n);
+            if (spans) {
+                g_array_append_val(spans, sp);
+            }
+        }
+        if (s.mr) {
+            memory_region_unref(s.mr);
+        }
+        if (!ok) {
+            break;
+        }
+        done += n;
+    }
+    return done;
+}
+
+/* The first RAM or ROM in [@pa, @end) of @as, if there is any */
+static bool mcp_ram_next(AddressSpace *as, hwaddr pa, hwaddr end,
+                         hwaddr *next)
+{
+    while (pa < end) {
+        MemoryRegionSection s = memory_region_find(as->root, pa, end - pa);
+        hwaddr start = s.offset_within_address_space;
+        uint64_t size = s.mr ? int128_get64(s.size) : 0;
+        bool ok = s.mr && mcp_ram_region(s.mr);
+
+        if (s.mr) {
+            memory_region_unref(s.mr);
+        }
+        if (!size) {
+            return false;
+        }
+        if (ok) {
+            *next = start;
+            return true;
+        }
+        if (size >= end - start) {
+            return false;
+        }
+        pa = start + size;
+    }
+    return false;
+}
+
+static AddressSpace *mcp_debug_as(CPUState *cpu,
+                                  const TranslateForDebugResult *t)
+{
+    return cpu_get_address_space(cpu, cpu_asidx_from_attrs(cpu, t->attrs));
+}
+
+/* The size of the page @t is in, or 0 when it is all of memory */
+static uint64_t mcp_page_size(const TranslateForDebugResult *t)
+{
+    if (!t->lg_page_size) {
+        return qemu_target_page_size();
+    }
+    return t->lg_page_size < 64 ? 1ULL << t->lg_page_size : 0;
+}
+
+/* How many bytes from @addr on stay in a page of @page bytes */
+static uint64_t mcp_page_left(uint64_t addr, uint64_t page, uint64_t len)
+{
+    return page ? MIN(len, page - (addr & (page - 1))) : len;
+}
+
+/*
+ * Copy RAM and ROM from @addr on, up to @len bytes: physical, or
+ * virtual through the MMU of @cpu.  Stops at the first byte that is not
+ * mapped, or is not RAM or ROM.
+ */
+static size_t mcp_scan_copy(CPUState *cpu, uint64_t addr, uint8_t *buf,
+                            size_t len, GArray *spans)
+{
+    size_t done = 0;
+
+    if (spans) {
+        g_array_set_size(spans, 0);
+    }
+    if (!cpu) {
+        return mcp_ram_copy(&address_space_memory, addr, buf, len, spans, 0);
+    }
+    while (done < len) {
+        TranslateForDebugResult t;
+        size_t n, got;
+
+        if (!cpu_translate_for_debug(cpu, addr + done, &t)) {
+            break;
+        }
+        n = mcp_page_left(addr + done, mcp_page_size(&t), len - done);
+        got = mcp_ram_copy(mcp_debug_as(cpu, &t), t.physaddr, buf + done, n,
+                           spans, done);
+        done += got;
+        if (got < n) {
+            break;
+        }
+    }
+    return done;
+}
+
+/* Move @addr on to the next byte below @end that a copy can start at */
+static bool mcp_scan_skip(CPUState *cpu, uint64_t *addr, uint64_t end)
+{
+    uint64_t a = *addr;
+
+    if (!cpu) {
+        hwaddr next;
+
+        if (!mcp_ram_next(&address_space_memory, a, end, &next)) {
+            return false;
+        }
+        *addr = next;
+        return true;
+    }
+    while (a < end) {
+        TranslateForDebugResult t;
+        uint64_t page = qemu_target_page_size(), left;
+        hwaddr next;
+
+        if (cpu_translate_for_debug(cpu, a, &t)) {
+            page = mcp_page_size(&t);
+            left = mcp_page_left(a, page, end - a);
+            if (mcp_ram_next(mcp_debug_as(cpu, &t), t.physaddr,
+                             t.physaddr + left, &next)) {
+                *addr = a + (next - t.physaddr);
+                return true;
+            }
+        }
+        left = mcp_page_left(a, page, end - a);
+        if (left >= end - a) {
+            return false;
+        }
+        a += left;
+    }
+    return false;
+}
+
+static bool mcp_pattern_at(const McpPattern *p, const uint8_t *m)
+{
+    size_t i;
+
+    for (i = 0; i < p->len; i++) {
+        uint8_t c = p->fold[i] ? g_ascii_tolower(m[i]) : m[i];
+
+        if (c != p->bytes[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The first match in @buf that starts in [@from, @starts), else @starts */
+static size_t mcp_pattern_find(const McpPattern *p, const uint8_t *buf,
+                               size_t from, size_t starts)
+{
+    while (from < starts) {
+        if (!p->fold[0]) {
+            const uint8_t *q = memchr(buf + from, p->bytes[0], starts - from);
+
+            if (!q) {
+                return starts;
+            }
+            from = q - buf;
+        } else if (g_ascii_tolower(buf[from]) != p->bytes[0]) {
+            from++;
+            continue;
+        }
+        if (p->any_fold ? mcp_pattern_at(p, buf + from)
+                        : !memcmp(buf + from + 1, p->bytes + 1, p->len - 1)) {
+            return from;
+        }
+        from++;
+    }
+    return starts;
+}
+
+static void mcp_pattern_add(McpPattern *p, uint8_t byte, bool letter)
+{
+    p->fold[p->len] = letter;
+    p->bytes[p->len++] = letter ? g_ascii_tolower(byte) : byte;
+    p->any_fold |= letter;
+}
+
+static bool mcp_parse_pattern(const char *bytes, const char *text, bool wide,
+                              bool fold, bool big_endian, McpPattern *p,
+                              Error **errp)
+{
+    size_t i, len;
+
+    memset(p, 0, sizeof(*p));
+    if (bytes) {
+        g_autoptr(GByteArray) b = mcp_parse_bytes(bytes, errp);
+
+        if (!b) {
+            return false;
+        }
+        if (b->len > SEARCH_MAX_BYTES) {
+            error_setg(errp, "find at most %d bytes, not %u",
+                       SEARCH_MAX_BYTES, b->len);
+            return false;
+        }
+        for (i = 0; i < b->len; i++) {
+            mcp_pattern_add(p, b->data[i], false);
+        }
+        return true;
+    }
+    if (wide) {
+        g_autoptr(GError) err = NULL;
+        g_autofree gunichar2 *u = NULL;
+        glong n;
+
+        u = g_utf8_to_utf16(text, -1, NULL, &n, &err);
+        if (!u) {
+            error_setg(errp, "text is not UTF-8: %s", err->message);
+            return false;
+        }
+        len = n * 2;
+        if (len > SEARCH_MAX_BYTES) {
+            error_setg(errp, "find at most %d characters with wide, not %ld",
+                       SEARCH_MAX_BYTES / 2, n);
+            return false;
+        }
+        for (i = 0; i < (size_t)n; i++) {
+            bool letter = fold && u[i] < 0x80 && g_ascii_isalpha(u[i]);
+            uint8_t hi = u[i] >> 8, lo = u[i];
+
+            mcp_pattern_add(p, big_endian ? hi : lo, letter && !big_endian);
+            mcp_pattern_add(p, big_endian ? lo : hi, letter && big_endian);
+        }
+    } else {
+        len = strlen(text);
+        if (len > SEARCH_MAX_BYTES) {
+            error_setg(errp, "find at most %d bytes of text, not %zu",
+                       SEARCH_MAX_BYTES, len);
+            return false;
+        }
+        for (i = 0; i < len; i++) {
+            mcp_pattern_add(p, text[i], fold && g_ascii_isalpha(text[i]));
+        }
+    }
+    if (!p->len) {
+        error_setg(errp, "text is empty");
+        return false;
+    }
+    return true;
+}
+
+/* "Press spa.", or with @wide two bytes for each character */
+static char *mcp_search_text(const uint8_t *buf, size_t len, bool wide,
+                             bool big_endian)
+{
+    GString *s = g_string_new(NULL);
+    size_t i;
+
+    for (i = 0; i + wide < len; i += 1 + wide) {
+        unsigned c = !wide ? buf[i] : big_endian ? lduw_be_p(buf + i)
+                                                 : lduw_le_p(buf + i);
+
+        g_string_append_c(s, c >= 0x20 && c < 0x7f ? c : '.');
+    }
+    return g_string_free(s, false);
+}
+
+/* "50 72 65 73" */
+static char *mcp_search_bytes(const uint8_t *buf, size_t len)
+{
+    GString *s = g_string_new(NULL);
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        g_string_append_printf(s, "%s%02x", i ? " " : "", buf[i]);
+    }
+    return g_string_free(s, false);
+}
+
+McpMemorySearchResult *coroutine_fn
+qmp_memory_search(const char *bytes, const char *text, bool has_wide,
+                  bool wide, bool has_ignore_case, bool ignore_case,
+                  const char *address, bool has_length, uint64_t length,
+                  bool has_physical, bool physical, bool has_cpu,
+                  int64_t cpu_index, bool has_max, int64_t max, Error **errp)
+{
+    g_auto(QemuInputCtx) local = { 0 };
+    QemuInputCtx *ctx = mcp_current_input_ctx();
+    g_autoptr(GArray) spans = g_array_new(false, false, sizeof(McpSpan));
+    g_autoptr(GString) s = g_string_new(NULL);
+    g_autofree uint8_t *buf = NULL;
+    g_autofree char *where = NULL;
+    g_autofree char *size = NULL;
+    McpMemorySearchResult *res;
+    McpMemoryMatchList **tail, *ml;
+    McpPattern pat;
+    CPUState *cpu = NULL, *virt = NULL;
+    uint64_t start = 0, end = UINT64_MAX, pos, searched = 0;
+    int64_t count = 0, listed = 0, slice;
+    bool big_endian = target_big_endian();
+    size_t want;
+
+    wide = has_wide && wide;
+    ignore_case = has_ignore_case && ignore_case;
+    physical = has_physical && physical;
+    max = has_max ? max : SEARCH_LIST;
+    if (!bytes == !text) {
+        error_setg(errp, bytes ? "give bytes or text, not both" :
+                   "give bytes or text to find");
+        return NULL;
+    }
+    if (bytes && (wide || ignore_case)) {
+        error_setg(errp, "wide and ignore-case go with text, not bytes");
+        return NULL;
+    }
+    if (max < 0 || max > SEARCH_LIST_MAX) {
+        error_setg(errp, "max must be 0 to %d", SEARCH_LIST_MAX);
+        return NULL;
+    }
+    if (address) {
+        if (!mcp_parse_address(address, "address", &start, errp)) {
+            return NULL;
+        }
+        length = has_length ? length : SEARCH_LENGTH;
+        if (!length || length - 1 > UINT64_MAX - start) {
+            error_setg(errp, "length must be at least 1 and stay below "
+                       "2^64");
+            return NULL;
+        }
+        if (!physical && length > SEARCH_VIRTUAL_MAX) {
+            error_setg(errp, "search at most 4 GiB of virtual memory at a "
+                       "time");
+            return NULL;
+        }
+        /* the end, past the last byte; 2^64 is UINT64_MAX, one short */
+        end = length > UINT64_MAX - start ? UINT64_MAX : start + length;
+    } else if (has_length) {
+        error_setg(errp, "length goes with address");
+        return NULL;
+    }
+    if ((address && !physical) || wide) {
+        cpu = mcp_debug_cpu(has_cpu, cpu_index, errp);
+        if (!cpu) {
+            return NULL;
+        }
+        cpu_synchronize_state(cpu);
+        big_endian = cpu_internal_is_big_endian(cpu);
+    }
+    if (address && !physical) {
+        virt = cpu;
+    }
+    if (!mcp_parse_pattern(bytes, text, wide, ignore_case, big_endian, &pat,
+                           errp)) {
+        return NULL;
+    }
+    if (!ctx) {
+        qemu_input_ctx_init(&local, NULL);
+        ctx = &local;
+    }
+
+    res = g_new0(McpMemorySearchResult, 1);
+    tail = &res->matches;
+    buf = g_malloc(SEARCH_CHUNK + pat.len - 1);
+    slice = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    for (pos = start; pos < end && count < SEARCH_COUNT_MAX; ) {
+        size_t n, starts, adv, o;
+        bool full;
+
+        if (qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - slice >=
+            SEARCH_SLICE_MS) {
+            qemu_co_sleep_ns_wakeable(&ctx->sleep, QEMU_CLOCK_REALTIME,
+                                      SCALE_MS);
+            slice = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        }
+        if (ctx->cancelled) {
+            qapi_free_McpMemorySearchResult(res);
+            error_setg(errp, "cancelled");
+            return NULL;
+        }
+        want = MIN(SEARCH_CHUNK + pat.len - 1, end - pos);
+        n = mcp_scan_copy(virt, pos, buf, want, spans);
+        if (!n) {
+            uint64_t from = pos;
+
+            if (!mcp_scan_skip(virt, &pos, end)) {
+                break;
+            }
+            /* never stand still */
+            pos = MAX(pos, from + 1);
+            continue;
+        }
+        /* a match must fit; the last bytes of a full copy come again */
+        full = n == SEARCH_CHUNK + pat.len - 1;
+        starts = full ? SEARCH_CHUNK : n >= pat.len ? n - pat.len + 1 : 0;
+        adv = full ? SEARCH_CHUNK : n;
+        for (o = mcp_pattern_find(&pat, buf, 0, starts); o < starts;
+             o = mcp_pattern_find(&pat, buf, o + 1, starts)) {
+            uint8_t shown[SEARCH_SHOWN * 2];
+            const McpSpan *sp = NULL;
+            McpMemoryMatch *m;
+            size_t k, got;
+
+            if (++count > max) {
+                if (count >= SEARCH_COUNT_MAX) {
+                    break;
+                }
+                continue;
+            }
+            for (k = 0; k < spans->len; k++) {
+                if (g_array_index(spans, McpSpan, k).off <= o) {
+                    sp = &g_array_index(spans, McpSpan, k);
+                }
+            }
+            got = mcp_scan_copy(virt, pos + o, shown,
+                                SEARCH_SHOWN << wide, NULL);
+            m = g_new0(McpMemoryMatch, 1);
+            m->address = g_strdup_printf("0x%" PRIx64, pos + o);
+            if (virt) {
+                m->physical = g_strdup_printf("0x%" HWADDR_PRIx,
+                                              sp->pa + (o - sp->off));
+            }
+            m->region = g_strdup(sp->region);
+            m->bytes = mcp_search_bytes(shown, got);
+            m->text = mcp_search_text(shown, got, wide, big_endian);
+            QAPI_LIST_APPEND(tail, m);
+            listed++;
+        }
+        searched += adv;
+        pos += adv;
+    }
+    res->count = count;
+    res->searched = searched;
+
+    size = size_to_str(searched);
+    if (!address) {
+        where = g_strdup_printf("all RAM and ROM (%s)", size);
+    } else {
+        where = g_strdup_printf("%s0x%" PRIx64 "..0x%" PRIx64 " (%s of it %s"
+                                "RAM or ROM)", virt ? "" : "physical ",
+                                start, end - 1, size, virt ? "mapped " : "");
+    }
+    if (!count) {
+        g_string_printf(s, "Not found in %s", where);
+    } else {
+        g_string_printf(s, "Found %" PRId64 "%s in %s", count,
+                        count >= SEARCH_COUNT_MAX ? " or more (counting stops"
+                        " there)" : "", where);
+        if (listed < count) {
+            g_string_append_printf(s, "; the first %" PRId64, listed);
+        }
+    }
+    g_string_append(s, listed ? ":\n" : ".");
+    for (ml = res->matches; ml; ml = ml->next) {
+        McpMemoryMatch *m = ml->value;
+
+        g_string_append_printf(s, "%s (%s%s%s%s): %s  |%s|\n", m->address,
+                               m->physical ? "physical " : "",
+                               m->physical ? m->physical : "",
+                               m->physical ? ", " : "", m->region, m->bytes,
+                               m->text);
+    }
+    res->summary = g_strdup(g_strchomp(s->str));
     return res;
 }
 

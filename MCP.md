@@ -68,6 +68,7 @@ only when exactly one VM is running and you started it.
 | `debug-step` | Run one CPU an instruction at a time, and show each one |
 | `debug-profile` | Sample where the CPUs run, to find idle loops and hot spots |
 | `memory-write` | Patch guest RAM or ROM: code or data |
+| `memory-search` | Find text or bytes in guest RAM and ROM |
 | `register-write` | Set a register of a stopped CPU, or move it to another instruction (`pc`) |
 | `hmp`, `qmp` | Run any QEMU monitor command: registers, memory, disassembly, pause and go on |
 | `steps` | Run several of these tools in one call, in order; stop at the first wait that is not met |
@@ -138,6 +139,7 @@ Use these:
 | Stop at the same code in any process (any space) | `debug-run` with `address-mask` |
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
+| Find a message, a value or a signature in memory | `memory-search` (`wide` for Windows NT's UTF-16 strings) |
 | Change a register, or where the CPU goes on (the pc) | `register-write` |
 | Find the idle loop, or where the guest spends its time | `debug-profile` |
 | Pause and go on | `vm-power` `pause` and `resume`, or `hmp` `stop` and `cont` |

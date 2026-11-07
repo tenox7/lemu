@@ -2030,6 +2030,101 @@
   'features': [ 'mcp', 'mcp-destructive' ] }
 
 ##
+# @McpMemoryMatch:
+#     A place where @memory-search found the bytes.
+#
+# @address: where they start, in hex: physical, unless the search was
+#     in virtual memory
+#
+# @physical: the physical address, in hex, when @address is virtual
+#
+# @region: the RAM or ROM it is in, as QEMU calls it, such as "pc.ram"
+#
+# @bytes: 16 bytes from there (32 with @wide), in hex; fewer where
+#     RAM or ROM ends
+#
+# @text: those bytes as text, with a dot for each one that is not a
+#     printable character; with @wide, as 16-bit characters
+#
+# Since: 11.2
+##
+{ 'struct': 'McpMemoryMatch',
+  'data': { 'address': 'str', '*physical': 'str', 'region': 'str',
+            'bytes': 'str', 'text': 'str' } }
+
+##
+# @McpMemorySearchResult:
+#     What @memory-search returns.
+#
+# @matches: where it found them, in address order
+#
+# @count: how many it found, counting up to 100000; more than listed
+#     when there were more than @max
+#
+# @searched: how many bytes it looked at
+#
+# Since: 11.2
+##
+{ 'struct': 'McpMemorySearchResult',
+  'base': 'McpResult',
+  'data': { 'matches': [ 'McpMemoryMatch' ], 'count': 'int',
+            'searched': 'int' } }
+
+##
+# @memory-search:
+#     Find bytes or text in guest memory: a message a program shows, a
+#     value a variable holds, a structure with a known signature.  It
+#     reads RAM and ROM, never devices.  The guest may run while it
+#     searches, and change the memory under it: pause it first
+#     (vm-power) to see one moment.  To read what is around a match,
+#     use hmp ('xp', or 'x' for a virtual address).
+#
+# @bytes: the bytes in memory order, in hex, like "de ad be ef", up to
+#     256.  A big-endian guest (HP-UX, SunOS, AIX) stores the word
+#     0x12345678 as "12345678", a little-endian one (x86, Windows NT)
+#     as "78563412".  Give it or @text.
+#
+# @text: text to find, up to 256 bytes (128 characters with @wide)
+#
+# @wide: find @text as 16-bit characters (UTF-16) in the byte order
+#     the CPU runs in, as Windows NT keeps most of its strings
+#     (default: false)
+#
+# @ignore-case: letters A to Z in @text match in either case
+#     (default: false)
+#
+# @address: search from here on: hex with 0x, or decimal; a virtual
+#     address through the CPU's MMU, unless @physical.  Without it, it
+#     searches all RAM and ROM by physical address.
+#
+# @length: how many bytes from @address (default: 1048576, 1 MiB);
+#     virtual memory at most 4 GiB at a time
+#
+# @physical: @address is a physical address (default: false)
+#
+# @cpu: the CPU whose MMU maps a virtual @address (default: the one
+#     that stopped last, else the first)
+#
+# @max: list at most this many matches, up to 500; 0 only counts them
+#     (default: 20)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# @mcp-read-only: does not change the VM
+#
+# Since: 11.2
+##
+{ 'command': 'memory-search',
+  'data': { '*bytes': 'str', '*text': 'str', '*wide': 'bool',
+            '*ignore-case': 'bool', '*address': 'str', '*length': 'size',
+            '*physical': 'bool', '*cpu': 'int', '*max': 'int' },
+  'returns': 'McpMemorySearchResult',
+  'features': [ 'mcp', 'mcp-read-only' ],
+  'coroutine': true }
+
+##
 # @McpRegisterWriteResult:
 #     What @register-write returns.
 #
