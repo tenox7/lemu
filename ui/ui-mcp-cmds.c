@@ -288,6 +288,17 @@ McpResult *coroutine_fn qmp_screenshot(QObject *console, bool has_head,
 
 /* Waits */
 
+static ScreenRegion *mcp_region_new(const QemuFramesRect *r)
+{
+    ScreenRegion *sr = g_new0(ScreenRegion, 1);
+
+    sr->x = r->x;
+    sr->y = r->y;
+    sr->w = r->w;
+    sr->h = r->h;
+    return sr;
+}
+
 static McpWaitInfo *mcp_wait_info(const QemuFramesResult *r)
 {
     McpWaitInfo *w = g_new0(McpWaitInfo, 1);
@@ -303,24 +314,32 @@ static McpWaitInfo *mcp_wait_info(const QemuFramesResult *r)
     }
     w->changed_pixels = r->changed_pixels;
     if (r->has_box) {
-        w->box = g_new0(ScreenRegion, 1);
-        w->box->x = r->box.x;
-        w->box->y = r->box.y;
-        w->box->w = r->box.w;
-        w->box->h = r->box.h;
+        w->box = mcp_region_new(&r->box);
+    }
+    w->has_changes = true;
+    w->changes = r->changes;
+    if (r->changes) {
+        w->last_box = mcp_region_new(&r->last_box);
     }
     w->frame = r->frame;
     for (i = r->n_animations - 1; i >= 0; i--) {
-        ScreenRegion *a = g_new0(ScreenRegion, 1);
-
-        a->x = r->animations[i].x;
-        a->y = r->animations[i].y;
-        a->w = r->animations[i].w;
-        a->h = r->animations[i].h;
-        QAPI_LIST_PREPEND(w->animations, a);
+        QAPI_LIST_PREPEND(w->animations,
+                          mcp_region_new(&r->animations[i]));
         w->has_animations = true;
     }
     return w;
+}
+
+/* What kept a wait from settling */
+static void mcp_wait_still(GString *s, const QemuFramesResult *r)
+{
+    const QemuFramesRect *b = &r->last_box;
+
+    g_string_append_printf(s, ": %d change%s, the last %" PRId64 " ms ago"
+                           " at %d,%d %dx%d (to skip that area, pass it in"
+                           " ignore)", r->changes, r->changes > 1 ? "s" : "",
+                           r->elapsed_ms - r->stable_after_ms,
+                           b->x, b->y, b->w, b->h);
 }
 
 static void mcp_wait_summary(GString *s, QemuFramesUntil until,
@@ -360,18 +379,28 @@ static void mcp_wait_summary(GString *s, QemuFramesUntil until,
                                r->elapsed_ms);
         break;
     case QEMU_FRAMES_STABLE:
+        if (!r->changes) {
+            g_string_append_printf(s, "no change within %" PRId64 " ms,"
+                                   " which is less than stable-ms",
+                                   r->elapsed_ms);
+            break;
+        }
         g_string_append_printf(s, "screen still changing after %" PRId64
                                " ms", r->elapsed_ms);
+        mcp_wait_still(s, r);
         break;
     case QEMU_FRAMES_CHANGE_THEN_STABLE:
         if (r->changed_after_ms < 0) {
-            g_string_append_printf(s, "no change within %" PRId64 " ms",
+            g_string_append_printf(s, "no change within %" PRId64 " ms"
+                                   " (it waits for a change first: on a"
+                                   " still screen, use until stable)",
                                    r->elapsed_ms);
         } else {
             g_string_append_printf(s, "screen changed after %" PRId64
                                    " ms but was still changing after %"
                                    PRId64 " ms", r->changed_after_ms,
                                    r->elapsed_ms);
+            mcp_wait_still(s, r);
         }
         break;
     case QEMU_FRAMES_PIXEL:

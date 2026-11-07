@@ -86,7 +86,9 @@ The server sends these rules to every agent that connects:
   not a hang. Move the mouse, then look again.
 - **Don't sleep.** Use `wait-screen`, or `serial-expect` for serial
   text. One call can wait up to 25 minutes; for a longer install, call
-  it again. On a text screen (a BIOS, DOS, a boot menu), `wait-screen`
+  it again. Let a long call finish: a call you stop returns nothing,
+  not even what it saw so far. A wait that times out says what kept
+  changing. On a text screen (a BIOS, DOS, a boot menu), `wait-screen`
   until `text` waits for words.
 - **Starting and stopping:** after you start a VM from a shell, call
   `vm-wait`. After a guest shutdown, `vm-wait` until `gone` before you

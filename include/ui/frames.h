@@ -53,6 +53,8 @@ typedef struct QemuFramesResult {
     int changed_pixels;
     bool has_box;
     QemuFramesRect box;         /* union of the counted changes */
+    int changes;                /* how many changes were counted */
+    QemuFramesRect last_box;    /* the last of them, if any */
     uint64_t frame;
     /* areas that kept changing on their own during the wait */
     int n_animations;

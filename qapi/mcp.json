@@ -176,6 +176,11 @@
 #
 # @box: the area that changed
 #
+# @changes: how many changes were counted
+#
+# @last-box: where the last counted change was.  On a wait that did
+#     not settle, this is what kept changing.
+#
 # @frame: frame number at the end
 #
 # @animations: areas that kept changing on their own during the wait,
@@ -189,6 +194,7 @@
   'data': { 'matched': 'bool', 'elapsed-ms': 'int',
             '*changed-after-ms': 'int', '*stable-after-ms': 'int',
             'changed-pixels': 'int', '*box': 'ScreenRegion',
+            '*changes': 'int', '*last-box': 'ScreenRegion',
             'frame': 'int', '*animations': [ 'ScreenRegion' ],
             '*found': 'McpTextMatch' } }
 

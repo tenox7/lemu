@@ -76,6 +76,8 @@ struct QemuFramesWaiter {
     int pixels;
     bool has_box;
     QemuFramesRect box;
+    int changes;                /* counted changes */
+    QemuFramesRect last_box;    /* the last counted change */
     QemuFramesAnim anim[QEMU_FRAMES_ANIM_MAX];
     QLIST_ENTRY(QemuFramesWaiter) node;
 };
@@ -381,6 +383,8 @@ static void frames_offer_change(QemuFramesWaiter *wt, const uint8_t *mask,
     wt->last_ms = now;
     wt->pixels += count;
     frames_box_add(&wt->has_box, &wt->box, x0, y0, x1, y1);
+    wt->changes++;
+    wt->last_box = (QemuFramesRect) { x0, y0, x1 - x0, y1 - y0 };
 }
 
 static void frames_history_push(QemuFrames *f, QemuFramesUndo *u)
@@ -784,6 +788,8 @@ void coroutine_fn qemu_frames_co_wait_finish(QemuFrames *f,
     r->changed_pixels = wt->pixels;
     r->has_box = wt->has_box;
     r->box = wt->box;
+    r->changes = wt->changes;
+    r->last_box = wt->last_box;
     r->frame = f->frame;
     for (i = 0; i < QEMU_FRAMES_ANIM_MAX; i++) {
         if (frames_anim_seen(&wt->anim[i]) &&

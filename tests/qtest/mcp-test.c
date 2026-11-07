@@ -328,7 +328,7 @@ static void test_screen_change(void)
 /* Toggle a text-cursor-sized box every 150 ms during a "stable" wait */
 static bool blink_wait(Screen *s, bool ignore_blink)
 {
-    QDict *rsp, *ret;
+    QDict *rsp, *ret, *wait;
     bool matched;
     int i;
 
@@ -343,7 +343,20 @@ static bool blink_wait(Screen *s, bool ignore_blink)
     rsp = screen_wait_reply(s);
     ret = qdict_get_qdict(rsp, "return");
     g_assert(ret);
-    matched = qdict_get_bool(qdict_get_qdict(ret, "wait"), "matched");
+    wait = qdict_get_qdict(ret, "wait");
+    matched = qdict_get_bool(wait, "matched");
+    if (!matched) {
+        /* it says what kept changing */
+        QDict *last = qdict_get_qdict(wait, "last-box");
+
+        g_assert_cmpint(qdict_get_int(wait, "changes"), >=, 3);
+        g_assert_cmpint(qdict_get_int(last, "x"), ==, 200);
+        g_assert_cmpint(qdict_get_int(last, "y"), ==, 200);
+        g_assert_cmpint(qdict_get_int(last, "w"), ==, 8);
+        g_assert_cmpint(qdict_get_int(last, "h"), ==, 16);
+        g_assert(strstr(qdict_get_str(ret, "summary"),
+                        "ms ago at 200,200 8x16 (to skip that area"));
+    }
     qobject_unref(rsp);
     return matched;
 }
