@@ -15259,8 +15259,8 @@ static void gen_nt351_idle(DisasContext *ctx, CPUMIPSState *env)
     if (nt_idle_match(ctx, env, nt351_idle_loop, ARRAY_SIZE(nt351_idle_loop),
                       &insn)) {
         save_cpu_state(ctx, 1);
-        gen_helper_nt_idle(tcg_env, tcg_constant_tl(ctx->base.pc_next),
-                           tcg_constant_i32((int16_t)insn));
+        gen_helper_nt351_idle(tcg_env, tcg_constant_tl(ctx->base.pc_next),
+                              tcg_constant_i32((int16_t)insn));
     }
 }
 #endif

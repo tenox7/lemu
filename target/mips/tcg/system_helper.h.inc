@@ -176,6 +176,7 @@ DEF_HELPER_1(eretnc, void, env)
 DEF_HELPER_1(deret, void, env)
 DEF_HELPER_3(cache, void, env, tl, i32)
 DEF_HELPER_3(nt_idle, void, env, tl, s32)
+DEF_HELPER_3(nt351_idle, void, env, tl, s32)
 
 #ifdef TARGET_MIPS64
 /* Longson CSR */

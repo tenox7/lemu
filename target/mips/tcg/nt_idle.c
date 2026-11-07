@@ -156,7 +156,8 @@ static bool nt_idle_watched(CPUState *cs, vaddr next, vaddr dpc)
  * next thread at offset next. The vCPU resumes at resume and the loop
  * looks for work again.
  */
-void HELPER(nt_idle)(CPUMIPSState *env, target_ulong resume, int32_t next)
+static void nt_idle_halt(CPUMIPSState *env, target_ulong resume,
+                         int32_t next)
 {
     MIPSCPU *cpu = env_archcpu(env);
     CPUState *cs = env_cpu(env);
@@ -203,4 +204,23 @@ void HELPER(nt_idle)(CPUMIPSState *env, target_ulong resume, int32_t next)
     env->active_tc.PC = resume;
     cs->halted = 1;
     do_raise_exception(env, EXCP_HLT, 0);
+}
+
+void HELPER(nt_idle)(CPUMIPSState *env, target_ulong resume, int32_t next)
+{
+    nt_idle_halt(env, resume, next);
+}
+
+/*
+ * The top of the NT 3.51 idle loop, before its mtc0 s6,psr. The idle
+ * thread can come here with all interrupts masked, as when NT shuts down,
+ * and only that mtc0 unmasks them. So halt only when the mask is already
+ * the one in s6, or no interrupt could wake the vCPU.
+ */
+void HELPER(nt351_idle)(CPUMIPSState *env, target_ulong resume, int32_t next)
+{
+    if ((env->CP0_Status ^ env->active_tc.gpr[22]) & (0xff << CP0St_IM)) {
+        return;
+    }
+    nt_idle_halt(env, resume, next);
 }
