@@ -15215,6 +15215,21 @@ static const uint32_t nt351_idle_loop[][2] = {
 };
 
 /*
+ * The NT 3.1 idle loop keeps interrupts on and does not call the HAL. Its
+ * top loads KdDebuggerEnabled into t0 and polls the debugger when that is
+ * set. Then, at the target of its first branch, it checks the DPC list
+ * (beql s3,t0) and loads the next thread from the processor block at s2.
+ */
+static const uint32_t nt31_idle_loop[][2] = {
+    { 0x93880000, 0xffff0000 },     /* lbu   t0,n(gp)    debugger on */
+    { 0x50080000, 0xffff0000 },     /* beql  zero,t0,... off */
+    { 0x8e680000, 0xffffffff },     /* lw    t0,0(s3)    DPC list */
+    { 0x26f7ffff, 0xffffffff },     /* addiu s7,s7,-1    poll count */
+    { 0x5ee00000, 0xffff0000 },     /* bgtzl s7,...      */
+    { 0x8e680000, 0xffffffff },     /* lw    t0,0(s3)    */
+};
+
+/*
  * Do the words after the one at pc match the loop? Then return the last
  * one, the load of the next thread, whose offset helper_nt_idle needs.
  */
@@ -15249,6 +15264,41 @@ static void gen_nt_idle(DisasContext *ctx, CPUMIPSState *env)
         gen_helper_nt_idle(tcg_env, tcg_constant_tl(ctx->base.pc_next + 4),
                            tcg_constant_i32((int16_t)insn));
     }
+}
+
+/*
+ * End the TB after the load of the debugger flag, so that the helper may
+ * read the clock with -icount, and let helper_nt31_idle halt. The vCPU
+ * resumes at the branch on t0.
+ */
+static void gen_nt31_idle(DisasContext *ctx, CPUMIPSState *env)
+{
+    vaddr pc = ctx->base.pc_next;
+    vaddr target;
+    uint32_t insn;
+
+    if (!nt_idle_match(ctx, env, nt31_idle_loop, ARRAY_SIZE(nt31_idle_loop),
+                       &insn)) {
+        return;
+    }
+    insn = translator_ldl_end(env, &ctx->base, pc + 4, mo_endian(ctx));
+    target = pc + 8 + ((int16_t)insn << 2);
+    if (!translator_is_same_page(&ctx->base, target) ||
+        !translator_is_same_page(&ctx->base, target + 4)) {
+        return;
+    }
+    insn = translator_ldl_end(env, &ctx->base, target, mo_endian(ctx));
+    if ((insn & 0xffff0000) != 0x52680000) {     /* beql  s3,t0,... */
+        return;
+    }
+    insn = translator_ldl_end(env, &ctx->base, target + 4, mo_endian(ctx));
+    if ((insn & 0xffff0000) != 0x8e440000) {     /* lw    a0,n(s2) */
+        return;
+    }
+    save_cpu_state(ctx, 1);
+    gen_helper_nt31_idle(tcg_env, tcg_constant_tl(pc + 4),
+                         tcg_constant_i32((int16_t)insn));
+    ctx->base.is_jmp = DISAS_TOO_MANY;
 }
 
 /* Before the mtc0 that disables interrupts, let helper_nt_idle halt */
@@ -15291,6 +15341,10 @@ static void mips_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
         if (ctx->nt_idle && ctx->opcode == nt_idle_loop[0][0] && !is_slot &&
             ctx->base.is_jmp == DISAS_EXIT) {
             gen_nt_idle(ctx, env);
+        }
+        if (ctx->nt_idle && !is_slot && ctx->base.is_jmp == DISAS_NEXT &&
+            (ctx->opcode & nt31_idle_loop[0][1]) == nt31_idle_loop[0][0]) {
+            gen_nt31_idle(ctx, env);
         }
 #endif
     } else if (ctx->insn_flags & ASE_MICROMIPS) {

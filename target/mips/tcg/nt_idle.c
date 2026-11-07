@@ -12,7 +12,9 @@
  * enables interrupts, which halts the vCPU as WAIT would when there is no
  * work. In NT 3.51 HalProcessorIdle enables interrupts, so the translator
  * (gen_nt351_idle()) calls it at the top of the loop, before the mtc0 that
- * disables them again.
+ * disables them again. NT 3.1 keeps interrupts on in its idle loop and
+ * does not call the HAL there: the translator (gen_nt31_idle()) ends a TB
+ * after the load at the top of the loop and calls helper_nt31_idle().
  *
  * With more CPUs, NT gives an idle CPU a thread by writing its next thread,
  * and may queue a DPC for it, without an interrupt. So the other vCPUs
@@ -152,16 +154,15 @@ static bool nt_idle_watched(CPUState *cs, vaddr next, vaddr dpc)
 /*
  * Interrupts are on in the idle loop. If there is no work, halt
  * until the next interrupt or watched write: no interrupt pending, the DPC
- * list head at s3 points to itself and the processor block at s0 has no
+ * list head at s3 points to itself and the processor block at prcb has no
  * next thread at offset next. The vCPU resumes at resume and the loop
  * looks for work again.
  */
 static void nt_idle_halt(CPUMIPSState *env, target_ulong resume,
-                         int32_t next)
+                         target_ulong prcb, int32_t next)
 {
     MIPSCPU *cpu = env_archcpu(env);
     CPUState *cs = env_cpu(env);
-    target_ulong prcb = env->active_tc.gpr[16];
     target_ulong dpc = env->active_tc.gpr[19];
     int64_t now, deadline;
     uint32_t val;
@@ -208,7 +209,7 @@ static void nt_idle_halt(CPUMIPSState *env, target_ulong resume,
 
 void HELPER(nt_idle)(CPUMIPSState *env, target_ulong resume, int32_t next)
 {
-    nt_idle_halt(env, resume, next);
+    nt_idle_halt(env, resume, env->active_tc.gpr[16], next);
 }
 
 /*
@@ -222,5 +223,19 @@ void HELPER(nt351_idle)(CPUMIPSState *env, target_ulong resume, int32_t next)
     if ((env->CP0_Status ^ env->active_tc.gpr[22]) & (0xff << CP0St_IM)) {
         return;
     }
-    nt_idle_halt(env, resume, next);
+    nt_idle_halt(env, resume, env->active_tc.gpr[16], next);
+}
+
+/*
+ * After the load of KdDebuggerEnabled into t0 at the top of the NT 3.1
+ * idle loop. Its processor block is in s2. While the kernel debugger is on,
+ * the loop polls it, so spin then. Also spin while all hardware interrupts
+ * are masked, as nothing could wake the vCPU.
+ */
+void HELPER(nt31_idle)(CPUMIPSState *env, target_ulong resume, int32_t next)
+{
+    if (env->active_tc.gpr[8] || !(env->CP0_Status & (0xfc << CP0St_IM))) {
+        return;
+    }
+    nt_idle_halt(env, resume, env->active_tc.gpr[18], next);
 }
