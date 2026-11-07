@@ -33,6 +33,7 @@
 #include "exec/debug-cond.h"
 #include "exec/excp-watch.h"
 #include "exec/tb-history.h"
+#include "exec/tb-cover.h"
 #include "exec/translation-block.h"
 #include "tcg/tcg.h"
 #include "qemu/atomic.h"
@@ -425,6 +426,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     if (unlikely(cpu->tb_history)) {
         cpu_tb_history_add(cpu->tb_history, s.pc, tb->size);
     }
+    if (unlikely(cpu->tb_cover)) {
+        cpu_tb_cover_add(cpu->tb_cover, s.pc, tb_page_addr0(tb), tb->size);
+    }
 
     return tb->tc.ptr;
 }
@@ -465,6 +469,10 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
      */
     if (unlikely(cpu->tb_history) && !(tb_cflags(itb) & CF_NOIRQ)) {
         cpu_tb_history_add(cpu->tb_history, log_pc(cpu, itb), itb->size);
+    }
+    if (unlikely(cpu->tb_cover) && !(tb_cflags(itb) & CF_NOIRQ)) {
+        cpu_tb_cover_add(cpu->tb_cover, log_pc(cpu, itb), tb_page_addr0(itb),
+                         itb->size);
     }
 
     qemu_thread_jit_execute();

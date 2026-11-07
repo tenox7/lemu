@@ -56,13 +56,15 @@ void tcg_update_cflags(CPUState *cpu)
      *
      * For singlestep and -d nochain, suppress goto_tb so that
      * we can log -d cpu,exec after every TB.  The same lets the MCP
-     * debug tools note every block a CPU enters (cpu->tb_history).
+     * debug tools note every block a CPU enters (cpu->tb_history,
+     * cpu->tb_cover).
      */
     if (unlikely(cpu_single_stepping(cpu))) {
         cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR | CF_SINGLE_STEP | 1;
     } else if (qatomic_read(&one_insn_per_tb)) {
         cflags |= CF_NO_GOTO_TB | 1;
-    } else if (qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN) || cpu->tb_history) {
+    } else if (qemu_loglevel_mask(CPU_LOG_TB_NOCHAIN) || cpu->tb_history ||
+               cpu->tb_cover) {
         cflags |= CF_NO_GOTO_TB;
     }
 
