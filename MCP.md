@@ -138,6 +138,7 @@ Use these:
 | See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
 | See how the CPU got to where it stopped | `debug-run` with `history` |
 | Stop at the same code in any process (any space) | `debug-run` with `address-mask` |
+| Stop only when a register or memory holds a value (one process, one device) | `debug-run` or `debug-trace` with `condition` |
 | Single-step | `debug-step` |
 | Patch code or data | `memory-write` |
 | Find a message, a value or a signature in memory | `memory-search` (`wide` for Windows NT's UTF-16 strings) |
@@ -247,6 +248,16 @@ Use these:
   instruction. Then stop at a rare one with `numbers`, or at anything
   but the everyday ones (page faults, TLB misses, system calls) with
   `skip`. Interrupts from devices are not exceptions.
+- **Only when something holds:** `debug-run` and `debug-trace` take a
+  `condition`, such as `eax == 5` or `cr3 == 0x1f000 && u32[esp+4] !=
+  0`, to stop in one process or for one device. It takes numbers,
+  registers, symbols, memory with `u8[...]` to `u64[...]`, the low
+  bits of a value with `u8(...)` to `u64(...)`, and C's operators.
+  Numbers are unsigned; `s8` to `s64` make them signed: `s32(eax) < 0`,
+  `s16[sp+8] == -1`. The CPU works it out itself at each hit, so a hit
+  where it is false costs little and does not stop the VM; `skipped`
+  counts those. For watched memory it is worked out after the access,
+  for an exception in the handler.
 - **Changing registers:** `register-write` sets a register of a stopped
   CPU by the names a `memory` address takes, and returns the old value.
   `pc` moves the CPU to another instruction: to skip one, or to run one
@@ -285,8 +296,8 @@ Use these:
   `retry: true`. Run `debug-run` again to get to the next real
   arrival. `debug-profile` gives each hot spot's `physical` address
   too, so the same address in two processes is two entries.
-- **When you need GDB after all,** for example to stop only when a
-  register holds some value: `hmp` `gdbserver tcp:127.0.0.1:1234`
+- **When you need GDB after all,** for example for source lines or a
+  backtrace from debug info: `hmp` `gdbserver tcp:127.0.0.1:1234`
   turns the GDB stub on in a running VM, with no restart. Don't use
   the debug tools while a GDB client is attached.
 

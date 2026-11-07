@@ -30,6 +30,7 @@
 #include "exec/cpu-interrupt.h"
 #include "exec/page-protection.h"
 #include "exec/mmap-lock.h"
+#include "exec/debug-cond.h"
 #include "exec/excp-watch.h"
 #include "exec/tb-history.h"
 #include "exec/translation-block.h"
@@ -324,7 +325,13 @@ static bool check_for_breakpoints_slow(CPUState *cpu, vaddr pc,
             bool match_bp = false;
 
             if (bp->flags & BP_GDB) {
-                match_bp = true;
+                /*
+                 * The MCP debug tools may stop only when a condition
+                 * holds.  Else the instruction runs alone, so the next
+                 * arrival looks again.
+                 */
+                match_bp = cpu_debug_bp_ok(cpu);
+                match_page |= !match_bp;
             } else if (bp->flags & BP_CPU) {
 #ifdef CONFIG_USER_ONLY
                 g_assert_not_reached();
@@ -390,6 +397,15 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
      * The next TB, if we chain to it, will clear the flag again.
      */
     cpu->neg.can_do_io = true;
+
+    /*
+     * The MCP debug tools work out their condition once for each arrival
+     * at a breakpoint (debug-cond.h).  A lookup that misses goes on to
+     * cpu_exec_loop, which would look at it again: leave it all to that.
+     */
+    if (unlikely(cpu->debug_cond)) {
+        return tcg_code_gen_epilogue;
+    }
 
     TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
     s.cflags = curr_cflags(cpu);
@@ -758,7 +774,8 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *excp)
         cpu->exception_index = -1;
 
         /* the MCP debug tools stop in the handler (excp-watch.h) */
-        stop = unlikely(w) && cpu_excp_watch_match(w, taken);
+        stop = unlikely(w) && cpu_excp_watch_match(w, taken) &&
+               cpu_debug_cond_ok(cpu);
         if (stop) {
             w->number = taken;
             w->from = from;
@@ -837,9 +854,11 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
         bql_lock();
         if (cpu_test_interrupt(cpu, CPU_INTERRUPT_DEBUG)) {
             cpu_reset_interrupt(cpu, CPU_INTERRUPT_DEBUG);
-            cpu->exception_index = EXCP_DEBUG;
-            bql_unlock();
-            return true;
+            if (cpu_debug_watch_ok(cpu)) {
+                cpu->exception_index = EXCP_DEBUG;
+                bql_unlock();
+                return true;
+            }
         }
         if (replay_mode == REPLAY_MODE_PLAY && !replay_has_interrupt()) {
             /* Do nothing */

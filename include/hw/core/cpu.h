@@ -576,6 +576,8 @@ struct CPUState {
     struct CPUTBHistory *tb_history;
     /* The exceptions that stop it, for the MCP debug tools (excp-watch.h) */
     struct CPUExcpWatch *excp_watch;
+    /* When its debug hits stop it, for the MCP debug tools (debug-cond.h) */
+    struct CPUDebugCond *debug_cond;
 
     bool vcpu_dirty;
     AccelCPUState *accel;

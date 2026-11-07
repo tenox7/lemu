@@ -3202,6 +3202,240 @@ static void test_debug_symbols(void)
     unlink(bios);
 }
 
+/* debug-run at the loop's jmp refuses @cond, saying @want */
+static void debug_cond_error(QTestState *qts, const char *cond,
+                             const char *want)
+{
+    g_autofree char *args = g_strdup_printf("{'address': '0xfffffff1',"
+                                            " 'condition': '%s'}", cond);
+
+    debug_check_error(qts, "debug-run", args, want);
+}
+
+/* debug-run at the loop's jmp until @cond holds, with @skipped others */
+static QDict *debug_cond_run(QTestState *qts, const char *cond,
+                             int64_t skipped)
+{
+    g_autofree char *args = g_strdup_printf("{'address': '0xfffffff1',"
+                                            " 'condition': '%s'}", cond);
+    QDict *ret = debug_ok(qts, "debug-run", args);
+
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xfffffff1");
+    if (skipped >= 0) {
+        g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, skipped);
+    }
+    return ret;
+}
+
+/* The same, where the condition can't be worked out: the guest goes on */
+static void debug_cond_fails(QTestState *qts, const char *cond,
+                             const char *want)
+{
+    g_autofree char *args = g_strdup_printf("{'address': '0xfffffff1',"
+                                            " 'condition': '%s',"
+                                            " 'timeout-ms': 100}", cond);
+    QDict *ret = debug_ok(qts, "debug-run", args);
+
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), >, 0);
+    debug_summary_has(ret, " times, first because ");
+    debug_summary_has(ret, want);
+    qobject_unref(ret);
+}
+
+/*
+ * debug-run and debug-trace count only the hits where a condition holds,
+ * as the CPU works it out itself.  The loop BIOS counts in ax, so it
+ * gets to the jmp with ax 1, 2, 3...
+ */
+static void test_debug_condition(void)
+{
+    g_autofree char *bios = debug_bios();
+    g_autofree char *digits = g_strnfill(513, '1');
+    g_autoptr(GString) deep = g_string_new("1");
+    g_autoptr(GString) parts = g_string_new("1");
+    QTestState *qts;
+    QDict *ret;
+    int i;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    debug_cond_error(qts, "eax = 5", "'= 5' does not fit there; compare"
+                     " with ==");
+    debug_cond_error(qts, "eax == 1 )", "')' does not fit there");
+    debug_cond_error(qts, "foo == 1", "'foo' is not a register or a symbol"
+                     " (debug-symbols loads them); the registers are pc,"
+                     " eax,");
+    debug_cond_error(qts, "u24[0] == 1", "'u24[' is no memory read");
+    debug_cond_error(qts, "(eax == 1", "a ')' is missing");
+    debug_cond_error(qts, "u8[0 == 1", "a ']' is missing");
+    debug_cond_error(qts, "u8(eax == 1", "a ')' is missing");
+    debug_cond_error(qts, "eax ==", "is missing at the end");
+    debug_cond_error(qts, "12ab == 1", "'12ab' is not a number: write hex"
+                     " with 0x, or decimal");
+    debug_cond_error(qts, digits, "at most 512 characters");
+    for (i = 0; i < 40; i++) {
+        g_string_prepend_c(deep, '(');
+        g_string_append_c(deep, ')');
+    }
+    debug_cond_error(qts, deep->str, "nests deeper than 32");
+    for (i = 0; i < 70; i++) {
+        g_string_append(parts, "+1");
+    }
+    debug_cond_error(qts, parts->str, "has more than 128 parts");
+
+    /* ax 1 to 4 do not stop it */
+    ret = debug_cond_run(qts, "(eax & 0xffff) == 5", 4);
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 1);
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 5);
+    debug_summary_has(ret, "CPU 0 reached 0xfffffff1 (the condition was"
+                      " false 4 times); the VM is stopped");
+    qobject_unref(ret);
+
+    /* only the arrivals that meet it count */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xfffffff1', 'hits': 2,"
+                   " 'condition': '(eax & 1) == 0'}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 2);
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 1);
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 8);
+    debug_summary_has(ret, "(arrival 2; the condition was false 1 time)");
+    qobject_unref(ret);
+
+    ret = debug_ok(qts, "debug-trace", "{'address': '0xfffffff1', 'count': 3,"
+                   " 'registers': ['eax'], 'condition': '(eax & 3) == 0'}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 3);
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 9);
+    g_assert(qdict_get_bool(ret, "running"));
+    debug_summary_has(ret, "3 hits, as many as asked for; the condition was"
+                      " false 9 times; the guest runs on.");
+    debug_summary_has(ret, "#1 CPU 0 at 0xfffffff1: eax=0xc\n"
+                      "#2 CPU 0 at 0xfffffff1: eax=0x10\n"
+                      "#3 CPU 0 at 0xfffffff1: eax=0x14");
+    qobject_unref(ret);
+
+    /* a hit where it can't be worked out does not stop the VM */
+    debug_cond_fails(qts, "eax / 0 == 1", "it divided by zero");
+    debug_cond_fails(qts, "u8[0x7fffffffff] == 1",
+                     "memory at 0x7fffffffff could not be read");
+    debug_cond_fails(qts, "xmm0 == 0",
+                     "register xmm0 is not a number of up to 64 bits");
+
+    /* the guest ran on: from a known ax */
+    qobject_unref(debug_cond_run(qts, "u16(eax) == 0x7ff0", -1));
+
+    /* signed, ax goes negative at 0x8000 */
+    ret = debug_cond_run(qts, "s16(eax) < 0", 15);
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 0x8000);
+    qobject_unref(ret);
+    ret = debug_cond_run(qts, "u16($eax) == 0x8005 && s8(0xff) == -1 &&"
+                         " s8(0x80) >> 4 == s8(0xf8) && -7 / 2 != -3 &&"
+                         " s32(-7) / 2 == -3 && s32(-7) % 2 == -1 &&"
+                         " s64(0x8000000000000000) / -1 == 0x8000000000000000"
+                         " && 1 < 2 < 3 && !(2 > 3) && ~0 == -1", 4);
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 0x8005);
+    qobject_unref(ret);
+
+    /* memory, as the CPU sees it: the jmp itself */
+    ret = debug_cond_run(qts, "u8[0xfffffff1] == 0xeb && s8[pc + 1] == -3 &&"
+                         " u16[pc] == 0xfdeb && u32[0xfffffff0] == 0xf4fdeb40"
+                         " && u64[0xfffffff0] == 0xf4f4f4f4f4fdeb40 &&"
+                         " (eax & 0xff) == 0x10", 10);
+    qobject_unref(ret);
+
+    /* symbols are their addresses */
+    ret = debug_ok(qts, "debug-symbols", "{'text': 'fffffff1 T loop_jump\\n'}");
+    qobject_unref(ret);
+    ret = debug_cond_run(qts, "pc == loop_jump && (eax & 0xff) == 0x20", 15);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-symbols", "{'clear': true}");
+    qobject_unref(ret);
+
+    /* without one, no count */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xfffffff1'}");
+    g_assert(!qdict_haskey(ret, "skipped"));
+    qobject_unref(ret);
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
+ * A condition on watched memory is worked out after the access; on an
+ * exception, at the first instruction of its handler
+ */
+static void test_debug_condition_hits(void)
+{
+    g_autofree char *watch = debug_bios_watch();
+    g_autofree char *fault = debug_bios_fault();
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", watch);
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x1000',"
+                   " 'access': 'write'}, 'condition': 'u16(eax) == 7 &&"
+                   " u16[0x1000] == 7'}");
+    debug_check_watch(ret, "write", WATCH_WRITER, WATCH_READER);
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 6);
+    qobject_unref(ret);
+
+    /*
+     * At the writer with ax 8, and its write: two hits that do not meet
+     * it.  The CPU runs the write again for the watchpoint, but that is
+     * not one more.
+     */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf0008', 'watch':"
+                   " {'address': '0x1000', 'access': 'write'},"
+                   " 'condition': 'u16(eax) == 9'}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(!qdict_haskey(ret, "watch"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf0008");
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 2);
+    qobject_unref(ret);
+
+    /*
+     * The CPU steps past the writer first, and its write stops it before
+     * it looks at the condition itself: debug-run looks for it
+     */
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf0008', 'watch':"
+                   " {'address': '0x1000', 'access': 'write'},"
+                   " 'condition': 'u16(eax) == 11'}");
+    g_assert(!qdict_haskey(ret, "watch"));
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 3);
+    g_assert_cmpint(debug_reg(ret, "AX") & 0xffff, ==, 11);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'address': '0xf0008', 'watch':"
+                   " {'address': '0x1000', 'access': 'write'},"
+                   " 'condition': 'u16(eax) == 11'}");
+    debug_check_watch(ret, "write", WATCH_WRITER, WATCH_READER);
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 0);
+    qobject_unref(ret);
+    qtest_quit(qts);
+
+    /* in the handler, the CPU has pushed flags, cs and ip */
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", fault);
+    ret = debug_ok(qts, "debug-run", "{'exception': {}, 'condition':"
+                   " 'esp == 0x7bfa && u16[esp] == 0x1a'}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    debug_check_excp(ret, 0, FAULT_DIV, FAULT_HANDLER);
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 0);
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'exception': {}, 'condition':"
+                   " 'esp == 0x7c00', 'timeout-ms': 200}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(ret, "running"));
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), >, 0);
+    debug_summary_has(ret, "no CPU took an exception in 0.2 s (the"
+                      " condition was false ");
+    qobject_unref(ret);
+    qtest_quit(qts);
+    unlink(watch);
+    unlink(fault);
+}
+
 /*
  * For a 64-bit MIPS, which starts at 0xffffffffbfc00000: addiu $t0,
  * $t0, 1, then b back to it, with a nop in its delay slot.  The words
@@ -3258,6 +3492,44 @@ static void test_debug_symbols_sign(void)
     g_assert(back);
     /* the branch to loop, however the disassembler writes the address */
     g_assert(strstr(back, " <loop>"));
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
+ * Conditions on a 64-bit MIPS: registers are rN, the pc and symbols
+ * extend the sign.  The loop gets to the branch with t0 (r8) 1, 2, 3...
+ * Its blocks end by looking up the next one, which must not count an
+ * arrival twice.
+ */
+static void test_debug_condition_mips(void)
+{
+    g_autofree char *bios = debug_bios_mips();
+    QTestState *qts;
+    QDict *ret;
+
+    qts = qtest_initf("-accel tcg -machine malta -nodefaults -bios %s -S",
+                      bios);
+    ret = debug_ok(qts, "debug-symbols", "{'text': 'bfc00004 t loop_back'}");
+    qobject_unref(ret);
+
+    ret = debug_ok(qts, "debug-run", "{'address': 'loop_back', 'condition':"
+                   " 'r8 == 5 && pc == loop_back && pc == 0xffffffffbfc00004"
+                   " && u32[pc] == 0x1000fffe'}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xffffffffbfc00004");
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 4);
+    qobject_unref(ret);
+
+    /* from the stop: 6 meets it, 7 does not, 8 does */
+    ret = debug_ok(qts, "debug-trace", "{'address': 'loop_back', 'count': 2,"
+                   " 'registers': ['r8'], 'condition': '(r8 & 1) == 0'}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 2);
+    g_assert_cmpint(qdict_get_int(ret, "skipped"), ==, 1);
+    debug_summary_has(ret, "#1 CPU 0 at 0xffffffffbfc00004 <loop_back>:"
+                      " r8=0x6\n#2 CPU 0 at 0xffffffffbfc00004 <loop_back>:"
+                      " r8=0x8");
+    qobject_unref(ret);
     qtest_quit(qts);
     unlink(bios);
 }
@@ -4010,6 +4282,8 @@ int main(int argc, char **argv)
         if (qtest_has_accel("tcg")) {
             qtest_add_func("/mcp/debug/symbols-sign",
                            test_debug_symbols_sign);
+            qtest_add_func("/mcp/debug/condition-mips",
+                           test_debug_condition_mips);
         }
         return g_test_run();
     }
@@ -4050,6 +4324,9 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/memory", test_debug_memory);
         qtest_add_func("/mcp/debug/search", test_memory_search);
         qtest_add_func("/mcp/debug/symbols", test_debug_symbols);
+        qtest_add_func("/mcp/debug/condition", test_debug_condition);
+        qtest_add_func("/mcp/debug/condition-hits",
+                       test_debug_condition_hits);
         qtest_add_func("/mcp/steps/debug", test_steps_debug);
         qtest_add_func("/mcp/debug/retry", test_debug_retry);
         qtest_add_func("/mcp/debug/registers", test_debug_registers);

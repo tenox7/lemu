@@ -36,10 +36,12 @@
 #include "accel/tcg/cpu-ops.h"
 #include "exec/cpu-common.h"
 #include "exec/cpu-interrupt.h"
+#include "exec/debug-cond.h"
 #include "exec/excp-watch.h"
 #include "exec/tb-flush.h"
 #include "exec/tb-history.h"
 #include "exec/watchpoint.h"
+#include "qemu/bitops.h"
 #include "qemu/host-utils.h"
 #endif
 
@@ -1722,6 +1724,69 @@ typedef struct McpExcpSeen {
     uint64_t to;                /* the guest's handler */
 } McpExcpSeen;
 
+/*
+ * A condition on the hits of debug-run and debug-trace, such as
+ * "eax == 5 && u32[sp+4] != 0": numbers, registers, symbols, memory read
+ * with u8[...] to u64[...], the low bits of a value with u8(...) to
+ * u64(...), and C's operators, on 64-bit numbers.  They are unsigned;
+ * s8 to s64 in place of u8 to u64 extend the sign and make them signed,
+ * and a comparison, /, % or >> with a signed side works signed.  The
+ * CPU's own thread works it out at each hit (debug-cond.h), so it reads
+ * only that CPU and memory: symbols and register names become numbers
+ * as it is parsed.
+ */
+
+#define COND_TEXT_MAX           512
+#define COND_NODES_MAX          128
+#define COND_DEPTH_MAX          32
+
+typedef enum McpCondOp {
+    COND_NUM, COND_PC, COND_REG, COND_MEM, COND_CONV,
+    COND_NEG, COND_NOT, COND_INV,
+    COND_MUL, COND_DIV, COND_MOD, COND_ADD, COND_SUB, COND_SHL, COND_SHR,
+    COND_LT, COND_LE, COND_GT, COND_GE, COND_EQ, COND_NE,
+    COND_AND, COND_XOR, COND_OR, COND_LAND, COND_LOR,
+} McpCondOp;
+
+typedef struct McpCondNode {
+    McpCondOp op;
+    int size;                   /* COND_MEM, COND_CONV: bytes, < 0 signed */
+    bool sgn;                   /* its value is signed */
+    int a, b;                   /* the operands, as node numbers */
+    uint64_t num;               /* COND_NUM: it; COND_REG: GDB's number */
+} McpCondNode;
+
+typedef enum McpCondFail {
+    COND_OK,
+    COND_NO_MEMORY,             /* at @where */
+    COND_NO_REGISTER,           /* GDB's number @where */
+    COND_ZERO_DIVIDE,
+} McpCondFail;
+
+typedef struct McpCond {
+    CPUDebugCond base;
+    CPUState *cpu;              /* one like the CPUs, for register names */
+    McpCondNode node[COND_NODES_MAX];
+    int n_nodes;
+    int root;
+    /* the CPUs' threads count as they work it out */
+    uint64_t n_false;
+    uint64_t n_failed;
+    int failed;                 /* @fail and @where are set */
+    McpCondFail fail;           /* the first time it could not */
+    uint64_t where;
+    /*
+     * By CPU index: the pc + 1 where that CPU's thread last found that it
+     * holds, or 0.  A CPU that stopped for it stopped rightly, even if
+     * another CPU has changed its memory since.
+     */
+    int n_met;
+    uint64_t *met;
+} McpCond;
+
+static bool mcp_cond_test(CPUState *cpu, CPUDebugCond *base);
+static bool mcp_cond_holds(McpCond *c, CPUState *cpu);
+
 typedef struct McpBreak {
     CPUState *only;
     int n_addrs;                /* the addresses to stop at */
@@ -1737,7 +1802,17 @@ typedef struct McpBreak {
     CPUExcpWatch excp;          /* each CPU watched gets a copy */
     int ehits;                  /* CPUs that took one as the time ran out */
     McpExcpSeen eseen;
+    McpCond *cond;              /* a hit counts only when this holds */
 } McpBreak;
+
+/*
+ * Whether the hit of @cpu, stopped, meets the condition of @b, if it has
+ * one.  Not counted: its thread counted it.
+ */
+static bool mcp_debug_cond(McpBreak *b, CPUState *cpu)
+{
+    return !b->cond || mcp_cond_holds(b->cond, cpu);
+}
 
 /*
  * Which address of @b @cpu stands at, about to run the instruction
@@ -1764,6 +1839,12 @@ static int mcp_debug_addr_index(McpBreak *b, CPUState *cpu)
 static bool mcp_debug_is_at(McpBreak *b, CPUState *cpu)
 {
     return mcp_debug_addr_index(b, cpu) >= 0;
+}
+
+/* At the address, and the condition holds: an arrival */
+static bool mcp_debug_is_hit(McpBreak *b, CPUState *cpu)
+{
+    return mcp_debug_is_at(b, cpu) && mcp_debug_cond(b, cpu);
 }
 
 /* The address a CPU of @b stopped at, as the summary shows it */
@@ -1850,6 +1931,7 @@ static void mcp_debug_insert(McpBreak *b)
             g_free(cpu->excp_watch);
             cpu->excp_watch = g_memdup2(&b->excp, sizeof(b->excp));
         }
+        cpu->debug_cond = b->cond ? &b->cond->base : NULL;
     }
     if (b->n_addrs) {
         tb_flush__exclusive_or_serial();
@@ -1925,6 +2007,15 @@ static bool mcp_watch_take(McpBreak *b, CPUState *cpu, McpWatchSeen *seen)
     if (!wp || !mcp_watch_ours(b, cpu, wp)) {
         return false;
     }
+    /*
+     * The CPU looks at the condition as it takes its debug interrupt.  If
+     * the VM stopped first, it never will: look for it, and count it.
+     */
+    if (b->cond && cpu_test_interrupt(cpu, CPU_INTERRUPT_DEBUG) &&
+        !mcp_cond_test(cpu, &b->cond->base)) {
+        mcp_watch_clear_hit(cpu, wp);
+        return false;
+    }
     seen->cpu = cpu;
     seen->addr = wp->hitaddr;
     seen->pc = wp->hitpc;
@@ -1993,6 +2084,7 @@ static void mcp_debug_remove(McpBreak *b)
             g_free(cpu->excp_watch);
             cpu->excp_watch = NULL;
         }
+        cpu->debug_cond = NULL;
     }
 }
 
@@ -2027,7 +2119,7 @@ static void mcp_debug_late_hits(McpBreak *b)
     b->hits = 0;
     b->ehits = 0;
     CPU_FOREACH(cpu) {
-        b->hits += mcp_debug_is_at(b, cpu);
+        b->hits += mcp_debug_is_hit(b, cpu);
         if (mcp_excp_take(b, cpu, &s) && !b->ehits++) {
             b->eseen = s;
         }
@@ -2088,6 +2180,21 @@ static int mcp_reg_number(CPUState *cpu, const char *name)
         return n;
     }
     return -1;
+}
+
+/* GDB's name of register @n, else rN */
+static char *mcp_reg_name(GArray *names, int n)
+{
+    unsigned int i;
+
+    for (i = 0; i < names->len; i++) {
+        GDBRegDesc *r = &g_array_index(names, GDBRegDesc, i);
+
+        if (r->gdb_reg == n && r->name) {
+            return g_strdup(r->name);
+        }
+    }
+    return g_strdup_printf("r%d", n);
 }
 
 /*
@@ -2300,6 +2407,622 @@ static McpMem *mcp_parse_memory(CPUState *cpu, McpDebugMemoryList *list,
     }
     *count = n;
     return g_steal_pointer(&mem);
+}
+
+/*
+ * Node @i of @c for @cpu into *@v, or why it can't be worked out, with
+ * the register or the address in *@where
+ */
+static McpCondFail mcp_cond_eval(CPUState *cpu, const McpCond *c, int i,
+                                 uint64_t *v, uint64_t *where)
+{
+    const McpCondNode *n = &c->node[i];
+    McpCondFail f;
+    uint64_t a, b;
+    bool sgn;
+
+    switch (n->op) {
+    case COND_NUM:
+        *v = n->num;
+        return COND_OK;
+    case COND_PC:
+        *v = cpu->cc->get_pc(cpu);
+        return COND_OK;
+    case COND_REG: {
+        g_autoptr(GByteArray) buf = g_byte_array_new();
+
+        gdb_read_register(cpu, buf, n->num);
+        if (!mcp_reg_decode(cpu, buf, v)) {
+            *where = n->num;
+            return COND_NO_REGISTER;
+        }
+        return COND_OK;
+    }
+    case COND_MEM: {
+        bool be = cpu_internal_is_big_endian(cpu);
+        int size = abs(n->size), k;
+        uint8_t m[8];
+
+        f = mcp_cond_eval(cpu, c, n->a, &a, where);
+        if (f) {
+            return f;
+        }
+        if (cpu_memory_rw_debug(cpu, a, m, size, false)) {
+            *where = a;
+            return COND_NO_MEMORY;
+        }
+        *v = 0;
+        for (k = 0; k < size; k++) {
+            *v = *v << 8 | m[be ? k : size - 1 - k];
+        }
+        if (n->size < 0) {
+            *v = sextract64(*v, 0, size * 8);
+        }
+        return COND_OK;
+    }
+    case COND_CONV:
+        f = mcp_cond_eval(cpu, c, n->a, &a, where);
+        if (f) {
+            return f;
+        }
+        *v = n->size < 0 ? sextract64(a, 0, -n->size * 8) :
+                           extract64(a, 0, n->size * 8);
+        return COND_OK;
+    case COND_NEG:
+    case COND_NOT:
+    case COND_INV:
+        f = mcp_cond_eval(cpu, c, n->a, &a, where);
+        if (f) {
+            return f;
+        }
+        *v = n->op == COND_NEG ? -a : n->op == COND_NOT ? !a : ~a;
+        return COND_OK;
+    case COND_LAND:
+    case COND_LOR:
+        f = mcp_cond_eval(cpu, c, n->a, &a, where);
+        if (f) {
+            return f;
+        }
+        /* && stops at a false one, || at a true one */
+        if ((n->op == COND_LAND) == !a) {
+            *v = !!a;
+            return COND_OK;
+        }
+        f = mcp_cond_eval(cpu, c, n->b, &b, where);
+        if (f) {
+            return f;
+        }
+        *v = !!b;
+        return COND_OK;
+    default:
+        break;
+    }
+    f = mcp_cond_eval(cpu, c, n->a, &a, where);
+    if (!f) {
+        f = mcp_cond_eval(cpu, c, n->b, &b, where);
+    }
+    if (f) {
+        return f;
+    }
+    /* signed when a side is; a shift goes by the value it shifts */
+    sgn = n->op == COND_SHL || n->op == COND_SHR ? c->node[n->a].sgn :
+          c->node[n->a].sgn || c->node[n->b].sgn;
+    switch (n->op) {
+    case COND_MUL:
+        *v = a * b;
+        break;
+    case COND_DIV:
+    case COND_MOD:
+        if (!b) {
+            return COND_ZERO_DIVIDE;
+        }
+        if (!sgn) {
+            *v = n->op == COND_DIV ? a / b : a % b;
+        } else if (a == (uint64_t)INT64_MIN && b == UINT64_MAX) {
+            /* the one that does not fit, and traps on some hosts */
+            *v = n->op == COND_DIV ? a : 0;
+        } else {
+            *v = n->op == COND_DIV ? (int64_t)a / (int64_t)b :
+                                     (int64_t)a % (int64_t)b;
+        }
+        break;
+    case COND_ADD:
+        *v = a + b;
+        break;
+    case COND_SUB:
+        *v = a - b;
+        break;
+    case COND_SHL:
+        *v = b < 64 ? a << b : 0;
+        break;
+    case COND_SHR:
+        if (sgn) {
+            *v = (int64_t)a >> MIN(b, 63);
+        } else {
+            *v = b < 64 ? a >> b : 0;
+        }
+        break;
+    case COND_LT:
+        *v = sgn ? (int64_t)a < (int64_t)b : a < b;
+        break;
+    case COND_LE:
+        *v = sgn ? (int64_t)a <= (int64_t)b : a <= b;
+        break;
+    case COND_GT:
+        *v = sgn ? (int64_t)a > (int64_t)b : a > b;
+        break;
+    case COND_GE:
+        *v = sgn ? (int64_t)a >= (int64_t)b : a >= b;
+        break;
+    case COND_EQ:
+        *v = a == b;
+        break;
+    case COND_NE:
+        *v = a != b;
+        break;
+    case COND_AND:
+        *v = a & b;
+        break;
+    case COND_XOR:
+        *v = a ^ b;
+        break;
+    case COND_OR:
+        *v = a | b;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    return COND_OK;
+}
+
+/*
+ * Whether the hit of @cpu meets the condition, counted: from the CPU's
+ * own thread at each hit (debug-cond.h), or from the main loop for a hit
+ * the CPU never looks at.  The CPU is not running either way.
+ */
+static bool mcp_cond_test(CPUState *cpu, CPUDebugCond *base)
+{
+    McpCond *c = container_of(base, McpCond, base);
+    uint64_t v = 0, where = 0;
+    McpCondFail f = mcp_cond_eval(cpu, c, c->root, &v, &where);
+    bool met = !f && v;
+
+    if (f) {
+        qatomic_inc(&c->n_failed);
+        if (!qatomic_xchg(&c->failed, 1)) {
+            c->fail = f;
+            c->where = where;
+        }
+    } else if (!v) {
+        qatomic_inc(&c->n_false);
+    }
+    if (cpu->cpu_index < c->n_met) {
+        qatomic_set(&c->met[cpu->cpu_index],
+                    met ? (uint64_t)cpu->cc->get_pc(cpu) + 1 : 0);
+    }
+    return met;
+}
+
+/*
+ * Whether it holds for @cpu, stopped: as its own thread found right here,
+ * or else as things are now.  Not counted.
+ */
+static bool mcp_cond_holds(McpCond *c, CPUState *cpu)
+{
+    uint64_t v = 0, where;
+
+    if (cpu->cpu_index < c->n_met &&
+        qatomic_read(&c->met[cpu->cpu_index]) ==
+        (uint64_t)cpu->cc->get_pc(cpu) + 1) {
+        return true;
+    }
+    return !mcp_cond_eval(cpu, c, c->root, &v, &where) && v;
+}
+
+/* The hit of @cpu is dealt with: when it gets here again, look again */
+static void mcp_cond_forget(McpCond *c, CPUState *cpu)
+{
+    if (c && cpu->cpu_index < c->n_met) {
+        qatomic_set(&c->met[cpu->cpu_index], 0);
+    }
+}
+
+static void mcp_cond_free(McpCond *c)
+{
+    if (c) {
+        g_free(c->met);
+        g_free(c);
+    }
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(McpCond, mcp_cond_free)
+
+typedef struct McpCondParser {
+    McpCond *c;
+    const char *text;
+    const char *p;
+    int depth;
+    Error **errp;
+} McpCondParser;
+
+/* A new node, or -1 */
+static int mcp_cond_node(McpCondParser *ps, McpCondOp op, int a, int b,
+                         uint64_t num)
+{
+    McpCondNode *n;
+
+    if (ps->c->n_nodes == COND_NODES_MAX) {
+        error_setg(ps->errp, "condition '%s' has more than %d parts",
+                   ps->text, COND_NODES_MAX);
+        return -1;
+    }
+    n = &ps->c->node[ps->c->n_nodes];
+    n->op = op;
+    n->a = a;
+    n->b = b;
+    n->num = num;
+    /* signed when a side is, as for the comparisons */
+    switch (op) {
+    case COND_NEG:
+    case COND_INV:
+    case COND_SHL:
+    case COND_SHR:
+        n->sgn = ps->c->node[a].sgn;
+        break;
+    case COND_MUL:
+    case COND_DIV:
+    case COND_MOD:
+    case COND_ADD:
+    case COND_SUB:
+    case COND_AND:
+    case COND_XOR:
+    case COND_OR:
+        n->sgn = ps->c->node[a].sgn || ps->c->node[b].sgn;
+        break;
+    default:
+        n->sgn = false;
+        break;
+    }
+    return ps->c->n_nodes++;
+}
+
+/* The operator at the place the parser got to, the longest, or NULL */
+static const char *mcp_cond_peek(McpCondParser *ps)
+{
+    static const char *const ops[] = {
+        "||", "&&", "==", "!=", "<=", ">=", "<<", ">>",
+        "|", "^", "&", "<", ">", "+", "-", "*", "/", "%", "!", "~",
+        "(", ")", "[", "]",
+    };
+    size_t i;
+
+    while (qemu_isspace(*ps->p)) {
+        ps->p++;
+    }
+    for (i = 0; i < ARRAY_SIZE(ops); i++) {
+        if (g_str_has_prefix(ps->p, ops[i])) {
+            return ops[i];
+        }
+    }
+    return NULL;
+}
+
+/* Whether operator @op comes next; it is then taken */
+static bool mcp_cond_take(McpCondParser *ps, const char *op)
+{
+    const char *t = mcp_cond_peek(ps);
+
+    if (!t || strcmp(t, op)) {
+        return false;
+    }
+    ps->p += strlen(op);
+    return true;
+}
+
+static int mcp_cond_binary(McpCondParser *ps, int min_prec);
+
+/*
+ * The bytes that @word reads, as in u32[...], or keeps, as in u32(...);
+ * negative when signed.  0 when it is no size.
+ */
+static int mcp_cond_size(const char *word)
+{
+    static const struct {
+        const char *name;
+        int size;
+    } sizes[] = {
+        { "u8", 1 }, { "u16", 2 }, { "u32", 4 }, { "u64", 8 },
+        { "s8", -1 }, { "s16", -2 }, { "s32", -4 }, { "s64", -8 },
+    };
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(sizes); i++) {
+        if (!g_ascii_strcasecmp(word, sizes[i].name)) {
+            return sizes[i].size;
+        }
+    }
+    return 0;
+}
+
+/* A register or a symbol */
+static int mcp_cond_name(McpCondParser *ps, const char *word)
+{
+    const char *name = word[0] == '$' ? word + 1 : word;
+    const McpSym *sym;
+    int reg;
+
+    if (!g_ascii_strcasecmp(name, "pc")) {
+        return mcp_cond_node(ps, COND_PC, -1, -1, 0);
+    }
+    reg = *name ? mcp_reg_number(ps->c->cpu, name) : -1;
+    if (reg >= 0) {
+        return mcp_cond_node(ps, COND_REG, -1, -1, reg);
+    }
+    sym = mcp_sym_find(word, false);
+    if (sym) {
+        return mcp_cond_node(ps, COND_NUM, -1, -1, mcp_sym_place(sym));
+    }
+    {
+        g_autofree char *names = mcp_reg_names(ps->c->cpu);
+
+        error_setg(ps->errp, "condition '%s': '%s' is not a register or a"
+                   " symbol (debug-symbols loads them); the registers are %s",
+                   ps->text, word, names);
+    }
+    return -1;
+}
+
+/* A number, a name, u32[...], u32(...) or (...) */
+static int mcp_cond_primary(McpCondParser *ps)
+{
+    static const char name_chars[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789_.$@?";
+    g_autofree char *word = NULL;
+    const char *start, *close;
+    McpCondOp op;
+    uint64_t num;
+    size_t len;
+    int size, a, r;
+
+    if (mcp_cond_take(ps, "(")) {
+        r = mcp_cond_binary(ps, 1);
+        if (r >= 0 && !mcp_cond_take(ps, ")")) {
+            error_setg(ps->errp, "condition '%s': a ')' is missing",
+                       ps->text);
+            return -1;
+        }
+        return r;
+    }
+    mcp_cond_peek(ps);
+    start = ps->p;
+    if (qemu_isdigit(*start)) {
+        len = strspn(start, "0123456789abcdefABCDEFxX");
+        word = g_strndup(start, len);
+        ps->p += len;
+        if (!mcp_parse_address(word, "number", &num, NULL)) {
+            error_setg(ps->errp, "condition '%s': '%s' is not a number:"
+                       " write hex with 0x, or decimal", ps->text, word);
+            return -1;
+        }
+        return mcp_cond_node(ps, COND_NUM, -1, -1, num);
+    }
+    len = strspn(start, name_chars);
+    if (!len) {
+        if (*start) {
+            error_setg(ps->errp, "condition '%s': a number, a register or a"
+                       " symbol must come before '%s'", ps->text, start);
+        } else {
+            error_setg(ps->errp, "condition '%s': a number, a register or a"
+                       " symbol is missing at the end", ps->text);
+        }
+        return -1;
+    }
+    word = g_strndup(start, len);
+    ps->p += len;
+    size = mcp_cond_size(word);
+    if (mcp_cond_take(ps, "[")) {
+        op = COND_MEM;
+        close = "]";
+    } else if (size && mcp_cond_take(ps, "(")) {
+        op = COND_CONV;
+        close = ")";
+    } else {
+        return mcp_cond_name(ps, word);
+    }
+    if (!size) {
+        error_setg(ps->errp, "condition '%s': '%s[' is no memory read: write"
+                   " u8[...], u16[...], u32[...] or u64[...], or s8 to s64"
+                   " for signed numbers", ps->text, word);
+        return -1;
+    }
+    a = mcp_cond_binary(ps, 1);
+    if (a < 0) {
+        return -1;
+    }
+    if (!mcp_cond_take(ps, close)) {
+        error_setg(ps->errp, "condition '%s': a '%s' is missing", ps->text,
+                   close);
+        return -1;
+    }
+    r = mcp_cond_node(ps, op, a, -1, 0);
+    if (r >= 0) {
+        ps->c->node[r].size = size;
+        ps->c->node[r].sgn = size < 0;
+    }
+    return r;
+}
+
+/* -x, !x, ~x, or a primary */
+static int mcp_cond_unary(McpCondParser *ps)
+{
+    static const struct {
+        const char *op;
+        McpCondOp code;
+    } ops[] = {
+        { "-", COND_NEG }, { "!", COND_NOT }, { "~", COND_INV },
+    };
+    size_t i;
+    int r = -2;
+
+    if (++ps->depth > COND_DEPTH_MAX) {
+        error_setg(ps->errp, "condition '%s' nests deeper than %d",
+                   ps->text, COND_DEPTH_MAX);
+        return -1;
+    }
+    for (i = 0; i < ARRAY_SIZE(ops) && r == -2; i++) {
+        if (mcp_cond_take(ps, ops[i].op)) {
+            r = mcp_cond_unary(ps);
+            if (r >= 0) {
+                r = mcp_cond_node(ps, ops[i].code, r, -1, 0);
+            }
+        }
+    }
+    if (r == -2) {
+        r = mcp_cond_primary(ps);
+    }
+    ps->depth--;
+    return r;
+}
+
+/* Operators that bind at least as tight as @min_prec, as in C */
+static int mcp_cond_binary(McpCondParser *ps, int min_prec)
+{
+    static const struct {
+        const char *op;
+        McpCondOp code;
+        int prec;
+    } ops[] = {
+        { "||", COND_LOR, 1 }, { "&&", COND_LAND, 2 }, { "|", COND_OR, 3 },
+        { "^", COND_XOR, 4 }, { "&", COND_AND, 5 }, { "==", COND_EQ, 6 },
+        { "!=", COND_NE, 6 }, { "<", COND_LT, 7 }, { "<=", COND_LE, 7 },
+        { ">", COND_GT, 7 }, { ">=", COND_GE, 7 }, { "<<", COND_SHL, 8 },
+        { ">>", COND_SHR, 8 }, { "+", COND_ADD, 9 }, { "-", COND_SUB, 9 },
+        { "*", COND_MUL, 10 }, { "/", COND_DIV, 10 }, { "%", COND_MOD, 10 },
+    };
+    int left = mcp_cond_unary(ps);
+
+    while (left >= 0) {
+        const char *t = mcp_cond_peek(ps);
+        size_t i;
+        int right;
+
+        for (i = 0; t && i < ARRAY_SIZE(ops) && strcmp(ops[i].op, t); i++) {
+            /* find it */
+        }
+        if (!t || i == ARRAY_SIZE(ops) || ops[i].prec < min_prec) {
+            break;
+        }
+        ps->p += strlen(t);
+        right = mcp_cond_binary(ps, ops[i].prec + 1);
+        if (right < 0) {
+            return -1;
+        }
+        left = mcp_cond_node(ps, ops[i].code, left, right, 0);
+    }
+    return left;
+}
+
+/* @text as a condition for CPUs like @cpu, or NULL */
+static McpCond *mcp_cond_parse(CPUState *cpu, const char *text, Error **errp)
+{
+    g_autoptr(McpCond) c = g_new0(McpCond, 1);
+    McpCondParser ps = {
+        .c = c, .text = text, .p = text, .errp = errp,
+    };
+    CPUState *each;
+
+    if (strlen(text) > COND_TEXT_MAX) {
+        error_setg(errp, "a condition has at most %d characters",
+                   COND_TEXT_MAX);
+        return NULL;
+    }
+    if (!cpu) {
+        error_setg(errp, "this VM has no CPU");
+        return NULL;
+    }
+    CPU_FOREACH(each) {
+        c->n_met = MAX(c->n_met, each->cpu_index + 1);
+    }
+    c->met = g_new0(uint64_t, c->n_met);
+    c->cpu = cpu;
+    c->root = mcp_cond_binary(&ps, 1);
+    if (c->root < 0) {
+        return NULL;
+    }
+    mcp_cond_peek(&ps);
+    if (*ps.p) {
+        error_setg(errp, "condition '%s': '%s' does not fit there%s", text,
+                   ps.p, *ps.p == '=' ? "; compare with ==" : "");
+        return NULL;
+    }
+    c->base.test = mcp_cond_test;
+    return g_steal_pointer(&c);
+}
+
+/*
+ * How often the condition let a hit go by, for a summary: "the condition
+ * was false 4 times", or NULL when it never did
+ */
+static char *mcp_cond_str(McpCond *c)
+{
+    int64_t f = c ? qatomic_read(&c->n_false) : 0;
+    int64_t e = c ? qatomic_read(&c->n_failed) : 0;
+    GString *s;
+
+    if (!f && !e) {
+        return NULL;
+    }
+    s = g_string_new("the condition ");
+    if (f) {
+        g_string_append_printf(s, "was false %" PRId64 " time%s", f,
+                               f == 1 ? "" : "s");
+    }
+    if (e) {
+        g_string_append_printf(s, "%scould not be worked out %" PRId64
+                               " time%s, first because ", f ? "; it " : "",
+                               e, e == 1 ? "" : "s");
+        switch (c->fail) {
+        case COND_NO_MEMORY:
+            g_string_append_printf(s, "memory at 0x%" PRIx64 " could not be"
+                                   " read", c->where);
+            break;
+        case COND_NO_REGISTER: {
+            g_autoptr(GArray) names = gdb_get_register_list(c->cpu);
+            g_autofree char *name = mcp_reg_name(names, c->where);
+
+            g_string_append_printf(s, "register %s is not a number of up to"
+                                   " 64 bits", name);
+            break;
+        }
+        case COND_ZERO_DIVIDE:
+            g_string_append(s, "it divided by zero");
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+    return g_string_free(s, false);
+}
+
+/*
+ * " (@count; the condition was false 4 times)", leaving out what there
+ * is not
+ */
+static void mcp_cond_append(GString *s, const char *count, McpCond *c)
+{
+    g_autofree char *cond = mcp_cond_str(c);
+
+    if (count || cond) {
+        g_string_append_printf(s, " (%s%s%s)", count ? count : "",
+                               count && cond ? "; " : "", cond ? cond : "");
+    }
+}
+
+/* The hits that did not meet the condition */
+static int64_t mcp_cond_skipped(McpCond *c)
+{
+    return c ? qatomic_read(&c->n_false) + qatomic_read(&c->n_failed) : 0;
 }
 
 #define WATCH_LEN               4
@@ -2780,7 +3503,8 @@ static void mcp_run_arrivals(McpRun *r)
     CPUState *cpu;
 
     CPU_FOREACH(cpu) {
-        if (mcp_debug_is_at(&r->b, cpu)) {
+        if (mcp_debug_is_hit(&r->b, cpu)) {
+            mcp_cond_forget(r->b.cond, cpu);
             mcp_run_hit(r, cpu, NULL, NULL,
                         mcp_debug_retry(cpu, cpu->cc->get_pc(cpu)));
         }
@@ -3144,6 +3868,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
                                          const char *address_mask,
                                          McpWatches *watch,
                                          McpExceptions *exception,
+                                         const char *condition,
                                          bool has_hits, int64_t hits,
                                          bool has_cpu, int64_t cpu_index,
                                          bool has_memory,
@@ -3154,6 +3879,8 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
 {
     g_auto(QemuInputCtx) local = { 0 };
     g_autoptr(GString) s = g_string_new(NULL);
+    g_autoptr(McpCond) cond = NULL;
+    g_autofree char *count = NULL;
     g_autofree McpMem *mem = NULL;
     McpRun r = { .ctx = mcp_current_input_ctx() };
     McpBreak *b = &r.b;
@@ -3188,6 +3915,13 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
     if (!mcp_run_parse(&r, address, address_mask, exception, has_cpu,
                        cpu_index, errp)) {
         return NULL;
+    }
+    if (condition) {
+        cond = mcp_cond_parse(b->only ? b->only : first_cpu, condition, errp);
+        if (!cond) {
+            return NULL;
+        }
+        b->cond = cond;
     }
     mem = mcp_parse_memory(b->only ? b->only : first_cpu, memory, &n_mem,
                            errp);
@@ -3230,6 +3964,8 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
     res->reached = r.result == RUN_REACHED;
     res->has_hits = true;
     res->hits = r.n_hits;
+    res->has_skipped = cond != NULL;
+    res->skipped = mcp_cond_skipped(cond);
     if (at) {
         mcp_debug_set_cpu(res, at);
     }
@@ -3255,9 +3991,9 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         g_string_printf(s, "CPU %d ", at->cpu_index);
         mcp_run_append_hit(s, &r);
         if (hits > 1) {
-            g_string_append_printf(s, " (%s %" PRId64 ")", hit_word,
-                                   r.n_hits);
+            count = g_strdup_printf("%s %" PRId64, hit_word, r.n_hits);
         }
+        mcp_cond_append(s, count, cond);
         if (r.by_watch) {
             g_autofree char *insn = mcp_debug_insn(at, seen->pc);
 
@@ -3295,18 +4031,21 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
         mcp_debug_what(s, b);
         g_string_append_printf(s, " in %.1f s", timeout_ms / 1000.0);
         if (hits > 1) {
-            g_string_append_printf(s, " (%" PRId64 " of %" PRId64 " %ss)",
-                                   r.n_hits, hits, hit_word);
+            count = g_strdup_printf("%" PRId64 " of %" PRId64 " %ss",
+                                    r.n_hits, hits, hit_word);
         }
+        mcp_cond_append(s, count, cond);
         g_string_append(s, "; the VM keeps running");
         break;
     case RUN_STOPPED:
         if (at) {
             g_string_printf(s, "CPU %d ", at->cpu_index);
             mcp_run_append_hit(s, &r);
-            g_string_append_printf(s, " as the time ran out (%s %" PRId64
-                                   " of %" PRId64 "); the VM is stopped",
-                                   hit_word, r.n_hits, hits);
+            count = g_strdup_printf("%s %" PRId64 " of %" PRId64, hit_word,
+                                    r.n_hits, hits);
+            g_string_append(s, " as the time ran out");
+            mcp_cond_append(s, count, cond);
+            g_string_append(s, "; the VM is stopped");
         } else {
             if (res->running) {
                 g_string_assign(s, "something else started the VM");
@@ -3316,6 +4055,7 @@ McpDebugStop *coroutine_fn qmp_debug_run(McpAddresses *address,
             }
             g_string_append(s, " before a CPU ");
             mcp_debug_what(s, b);
+            mcp_cond_append(s, NULL, cond);
         }
         break;
     default:
@@ -3623,6 +4363,7 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
                                        const char *address_mask,
                                        McpWatches *watch,
                                        McpExceptions *exception,
+                                       const char *condition,
                                        bool has_count, int64_t count,
                                        bool has_list, int64_t list,
                                        bool has_cpu, int64_t cpu_index,
@@ -3643,6 +4384,8 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
                                                         g_int_equal, NULL,
                                                         g_free);
     g_autoptr(GPtrArray) sorted = NULL;
+    g_autoptr(McpCond) cond = NULL;
+    g_autofree char *cond_str = NULL;
     g_autofree McpMem *mem = NULL;
     McpTracer t = {
         .r.ctx = mcp_current_input_ctx(),
@@ -3691,6 +4434,13 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
     if (!cpu) {
         error_setg(errp, "this VM has no CPU");
         return NULL;
+    }
+    if (condition) {
+        cond = mcp_cond_parse(cpu, condition, errp);
+        if (!cond) {
+            return NULL;
+        }
+        b->cond = cond;
     }
     for (rl = registers, n = 0; rl; rl = rl->next) {
         if (++n > TRACE_REGS_MAX) {
@@ -3747,6 +4497,8 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
 
     res = g_new0(McpTrace, 1);
     res->hits = t.r.n_hits;
+    res->has_skipped = cond != NULL;
+    res->skipped = mcp_cond_skipped(cond);
     res->ms = ms;
     res->running = runstate_is_running();
     res->entries = t.entries;
@@ -3765,6 +4517,10 @@ McpTrace *coroutine_fn qmp_debug_trace(McpAddresses *address,
     if (t.r.n_retries) {
         g_string_append_printf(s, " (%" PRId64 " right after an interruption"
                                " there)", t.r.n_retries);
+    }
+    cond_str = mcp_cond_str(cond);
+    if (cond_str) {
+        g_string_append_printf(s, "; %s", cond_str);
     }
     if (res->running) {
         g_string_append(s, "; the guest runs on.");
@@ -4317,21 +5073,6 @@ static McpRegChange mcp_reg_change(CPUState *cpu, const McpCpuSeen *was,
         return REG_MOVED;
     }
     return REG_OTHER;
-}
-
-/* GDB's name of register @n, else rN */
-static char *mcp_reg_name(GArray *names, int n)
-{
-    unsigned int i;
-
-    for (i = 0; i < names->len; i++) {
-        GDBRegDesc *r = &g_array_index(names, GDBRegDesc, i);
-
-        if (r->gdb_reg == n && r->name) {
-            return g_strdup(r->name);
-        }
-    }
-    return g_strdup_printf("r%d", n);
 }
 
 /* A register's value: a number, else GDB's bytes in hex */

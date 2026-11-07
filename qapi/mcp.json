@@ -1511,6 +1511,9 @@
 # @hits: how often a CPU got to an address or touched watched memory
 #     (debug-run)
 #
+# @skipped: hits that did not meet the condition (debug-run with
+#     @condition)
+#
 # @steps: instructions done (debug-step)
 #
 # @running: the VM is still running
@@ -1537,7 +1540,8 @@
   'base': 'McpResult',
   'data': { 'reached': 'bool', '*cpu': 'int', '*pc': 'str',
             '*symbol': 'str',
-            '*hits': 'int', '*steps': 'int', 'running': 'bool',
+            '*hits': 'int', '*skipped': 'int', '*steps': 'int',
+            'running': 'bool',
             '*retry': 'bool', '*watch': 'McpWatchHit',
             '*exception': 'McpExceptionHit', '*history': [ 'str' ] },
   'if': 'CONFIG_TCG' }
@@ -1712,8 +1716,26 @@
 #     a crash, an illegal instruction or a trap the guest does not
 #     expect.
 #
+# @condition: count a hit only when this holds, such as "eax == 5"
+#     or "cr3 == 0x1f000 && u32[esp+4] != 0": to stop in one process,
+#     or for one device.  It is worked out where the CPU would stop:
+#     at the address, after the access to the watched memory, or at
+#     the first instruction of the exception's handler.  It takes
+#     numbers (hex with 0x, or decimal), registers (named as in a
+#     @memory address), symbols from @debug-symbols (their
+#     addresses), memory as the CPU sees it with u8[...], u16[...],
+#     u32[...] or u64[...], the low bits of a value with u8(...) to
+#     u64(...), and C's operators, on 64-bit numbers.  They are
+#     unsigned; s8 to s64 in place of u8 to u64 extend the sign and
+#     make them signed, as in "s32(eax) < 0", and a comparison, /, %
+#     or >> with a signed side works signed.  The CPU works it out
+#     itself at each hit, so a hit where it is false does not stop
+#     the VM.  A hit where it can't be worked out, as when its memory
+#     can't be read, counts as false; the summary says why.
+#
 # @hits: stop at this arrival, watched access or exception, counting
-#     from 1 (default: 1)
+#     from 1; with @condition, only the ones that meet it count
+#     (default: 1)
 #
 # @cpu: watch only this CPU (default: all)
 #
@@ -1736,7 +1758,7 @@
 { 'command': 'debug-run',
   'data': { '*address': 'McpAddresses', '*address-mask': 'str',
             '*watch': 'McpWatches', '*exception': 'McpExceptions',
-            '*hits': 'int',
+            '*condition': 'str', '*hits': 'int',
             '*cpu': 'int', '*memory': [ 'McpDebugMemory' ],
             '*history': 'int', '*timeout-ms': 'int' },
   'returns': 'McpDebugStop',
@@ -1801,6 +1823,9 @@
 #
 # @hits: the hits it saw
 #
+# @skipped: hits it left out because they did not meet the condition
+#     (with @condition)
+#
 # @ms: how long it traced, in milliseconds
 #
 # @running: the VM is running
@@ -1819,7 +1844,8 @@
 ##
 { 'struct': 'McpTrace',
   'base': 'McpResult',
-  'data': { 'hits': 'int', 'ms': 'int', 'running': 'bool',
+  'data': { 'hits': 'int', '*skipped': 'int', 'ms': 'int',
+            'running': 'bool',
             '*instructions': [ 'McpTraceInstruction' ],
             '*exceptions': [ 'McpExceptionCount' ],
             'entries': [ 'McpTraceEntry' ] },
@@ -1849,6 +1875,10 @@
 #     Use it to learn which ones a guest takes, and how often, before
 #     debug-run stops at a rare one.
 #
+# @condition: log and count a hit only when this holds, written as
+#     for debug-run.  The CPU works it out itself, so a hit where it
+#     is false does not stop the VM.
+#
 # @count: stop after this many hits, up to 100000 (default: 1000)
 #
 # @list: list this many hits in full, up to 500; after them, only the
@@ -1875,7 +1905,7 @@
 { 'command': 'debug-trace',
   'data': { '*address': 'McpAddresses', '*address-mask': 'str',
             '*watch': 'McpWatches', '*exception': 'McpExceptions',
-            '*count': 'int',
+            '*condition': 'str', '*count': 'int',
             '*list': 'int', '*cpu': 'int', '*registers': [ 'str' ],
             '*memory': [ 'McpDebugMemory' ], '*duration-ms': 'int' },
   'returns': 'McpTrace',
