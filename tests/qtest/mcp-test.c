@@ -2480,7 +2480,7 @@ static void test_debug_dma(void)
     debug_summary_has(ret, "0000a000: 0x554d4551\n");
     qobject_unref(ret);
 
-    /* a physical address: devices only */
+    /* a physical address */
     ret = debug_dma_call(qts, "debug-run",
                          "{'watch': {'address': '0xa000', 'physical': true}}");
     debug_dma_device(ret, "main-loop");
@@ -2529,7 +2529,7 @@ static void test_debug_dma(void)
                       " writes to 0xa000 for ");
     debug_summary_has(ret, ": 2 hits (2 by devices), as many as asked for;");
     debug_summary_has(ret, "By instruction:\n       2 x no instruction: a"
-                      " device wrote\n");
+                      " device did it\n");
     debug_summary_has(ret, "#1 a device wrote to 0xa000 (physical 0xa000)"
                       " from the main loop, 4 bytes in all (now 0x554d4551);"
                       " CPU 0 at ");
@@ -2539,25 +2539,229 @@ static void test_debug_dma(void)
     /* nothing writes 0xb000 */
     ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0xb000',"
                    " 'physical': true}, 'timeout-ms': 200}");
-    debug_summary_has(ret, "no device wrote to physical 0xb000 in 0.2 s;");
+    debug_summary_has(ret, "no CPU wrote to physical 0xb000, and no device"
+                      " wrote to physical 0xb000 in 0.2 s;");
     qobject_unref(ret);
 
-    /* the PCI hole is not RAM */
+    /* a physical address catches the CPU's writes and reads too */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x8000',"
+                   " 'length': 2, 'physical': true}}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    g_assert(qdict_get_bool(qdict_get_qdict(ret, "watch"), "physical"));
+    g_assert_cmpstr(qdict_get_str(qdict_get_qdict(ret, "watch"), "pc"), ==,
+                    "0xf0004");
+    debug_summary_has(ret, "CPU 0 wrote to physical 0x8000; the VM is stopped"
+                      " after the instruction that did it:\n");
+    debug_summary_has(ret, "Memory at physical 0x8000:\n");
+    qobject_unref(ret);
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x8002',"
+                   " 'length': 1, 'physical': true, 'access': 'read'}}");
+    g_assert_cmpstr(qdict_get_str(qdict_get_qdict(ret, "watch"), "pc"), ==,
+                    "0xf0008");
+    debug_summary_has(ret, "CPU 0 read physical 0x8002;");
+    qobject_unref(ret);
+
+    /* the PCI hole: devices' registers, if any were there */
     ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0xd0000000',"
                    " 'physical': true}, 'timeout-ms': 100}");
-    debug_summary_has(ret, "\n\nDevices' writes were not watched at physical"
-                      " 0xd0000000 and maybe further on: it is not RAM.");
+    debug_summary_has(ret, "no CPU wrote to physical 0xd0000000, and no"
+                      " device wrote to physical 0xd0000000 in 0.1 s;");
+    debug_summary_has(ret, "\n\nNo device was at physical 0xd0000000 as the"
+                      " run began.");
+    g_assert(!strstr(qdict_get_str(ret, "summary"), "address spaces are"));
     qobject_unref(ret);
 
-    debug_check_error(qts, "debug-run", "{'watch': {'address': '0xa000',"
-                      " 'physical': true, 'access': 'read'}}",
-                      "a physical address catches only devices' writes");
-    debug_check_error(qts, "debug-run", "{'watch': {'address': '0xa000',"
-                      " 'physical': true, 'devices': false}}",
-                      "a physical address catches only devices' writes");
-    debug_check_error(qts, "debug-run", "{'watch': {'address': '0xa000',"
-                      " 'access': 'read', 'devices': true}}",
-                      "devices' reads are not watched");
+    /* the CPU's own memory space is physical */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0xb000',"
+                   " 'space': 'memory'}, 'timeout-ms': 100}");
+    debug_summary_has(ret, "no CPU wrote to physical 0xb000, and no device"
+                      " wrote to physical 0xb000 in 0.1 s;");
+    qobject_unref(ret);
+
+    debug_check_error(qts, "debug-run", "{'watch': {'address': '0x60',"
+                      " 'space': 'nope'}}",
+                      "there is no address space 'nope'; they are: ");
+    debug_check_error(qts, "debug-run", "{'watch': {'address': '0x60',"
+                      " 'space': 'I/O', 'physical': true}}",
+                      "give physical or space, not both");
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/*
+ * The registers of a device in another address space, the I/O ports:
+ * the guest's out instructions, and qtest's from the main loop
+ */
+static void test_debug_ports(void)
+{
+    g_autofree char *bios = debug_bios_dma();
+    QTestState *qts;
+    QDict *ret, *watch, *dev;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga none "
+                      "-bios %s -S", bios);
+
+    /* a CPU's out: no watchpoint sees it, so it stops after its block */
+    debug_dma_send(qts, "debug-run", "{'watch': {'address': '0x518',"
+                   " 'space': 'I/O'}}");
+    qtest_writeb(qts, DMA_GO, 1);
+    ret = debug_wait_ok(qts);
+    g_assert(qdict_get_bool(ret, "reached"));
+    watch = qdict_get_qdict(ret, "watch");
+    g_assert_cmpstr(qdict_get_str(watch, "address"), ==, "0x518");
+    g_assert_cmpstr(qdict_get_str(watch, "space"), ==, "I/O");
+    g_assert_cmpstr(qdict_get_str(watch, "access"), ==, "write");
+    g_assert_cmpstr(qdict_get_str(watch, "value"), ==, "0x900000");
+    g_assert_cmpint(qdict_get_int(watch, "size"), ==, 4);
+    g_assert_cmpstr(qdict_get_str(watch, "region"), ==,
+                    "fwcfg.dma (fw_cfg_io)");
+    g_assert_cmpstr(qdict_get_str(watch, "offset"), ==, "0x4");
+    g_assert(qdict_get_bool(watch, "block-end"));
+    g_assert(!qdict_haskey(watch, "pc"));
+    g_assert(!qdict_haskey(watch, "device"));
+    /* x86's out ends its block */
+    g_assert_cmpstr(qdict_get_str(ret, "pc"), ==, "0xf0027");
+    debug_summary_has(ret, "CPU 0 wrote 0x900000 to I/O 0x518: 4 bytes at"
+                      " 0x4 in fwcfg.dma (fw_cfg_io); the VM is stopped"
+                      " where the CPU's block of code ended: right after"
+                      " the instruction that did it, or a few instructions"
+                      " on\n");
+    /* the I/O ports are not shown as memory */
+    g_assert(!strstr(qdict_get_str(ret, "summary"), "Memory at"));
+    qobject_unref(ret);
+
+    /* qtest's from the main loop: a device's access */
+    ret = debug_dma_call(qts, "debug-run", "{'watch': {'address': '0x518',"
+                         " 'space': 'I/O'}}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    watch = qdict_get_qdict(ret, "watch");
+    dev = qdict_get_qdict(watch, "device");
+    g_assert(dev);
+    g_assert_cmpstr(qdict_get_str(dev, "from"), ==, "main-loop");
+    g_assert(!qdict_haskey(dev, "physical"));
+    g_assert_cmpint(qdict_get_int(dev, "length"), ==, 4);
+    debug_summary_has(ret, "to I/O 0x518 from the main loop: 4 bytes at 0x4"
+                      " in fwcfg.dma (fw_cfg_io); the VM is stopped right"
+                      " after it; CPU 0:\n");
+    qobject_unref(ret);
+
+    /* devices left out: only CPUs' accesses count */
+    ret = debug_dma_call(qts, "debug-run", "{'watch': {'address': '0x518',"
+                         " 'space': 'I/O', 'devices': false},"
+                         " 'timeout-ms': 500}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    debug_summary_has(ret, "no CPU wrote to I/O 0x518 in 0.5 s;");
+    g_assert(!strstr(qdict_get_str(ret, "summary"), "No device was"));
+    qobject_unref(ret);
+
+    /* a port no device has: the summary says so, and where to look */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0x2f8',"
+                   " 'space': 'I/O'}, 'timeout-ms': 100}");
+    g_assert(!qdict_get_bool(ret, "reached"));
+    debug_summary_has(ret, "\n\nNo device was at I/O 0x2f8 as the run began."
+                      " The address spaces are: ");
+    debug_summary_has(ret, "I/O, ");
+    debug_summary_has(ret, "; hmp's \"info mtree\" shows what each holds.");
+    qobject_unref(ret);
+
+    /*
+     * debug-trace counts them by register and by block of code; the
+     * ports have fw_cfg's two regions, and none between them
+     */
+    debug_dma_send(qts, "debug-trace", "{'watch': {'address': '0x510',"
+                   " 'length': 16, 'space': 'I/O'}, 'count': 2,"
+                   " 'duration-ms': 10000}");
+    qtest_writeb(qts, DMA_GO, 1);
+    ret = debug_wait_ok(qts);
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 2);
+    debug_summary_has(ret, "Traced writes to I/O 0x510 (16 bytes), and"
+                      " devices' writes to I/O 0x510 for ");
+    g_assert(!strstr(qdict_get_str(ret, "summary"), "No device was"));
+    debug_summary_has(ret, "By instruction:\n       1 x in the block of code"
+                      " that ended before 0xf001c\n       1 x in the block"
+                      " of code that ended before 0xf0027\n");
+    debug_summary_has(ret, "By device register:\n       1 x write to 0x0 in"
+                      " fwcfg.dma (fw_cfg_io), I/O 0x514 (last 0x0)\n"
+                      "       1 x write to 0x4 in fwcfg.dma (fw_cfg_io),"
+                      " I/O 0x518 (last 0x900000)\n");
+    debug_summary_has(ret, "#1 CPU 0 at 0xf001c wrote 0x0 to I/O 0x514: 4"
+                      " bytes at 0x0 in fwcfg.dma (fw_cfg_io) (in the block"
+                      " of code that ended here)\n");
+    qobject_unref(ret);
+    qtest_quit(qts);
+    unlink(bios);
+}
+
+/* f000:0000: write a byte to the VGA's memory at 0xb8000, read the next */
+static char *debug_bios_vga(void)
+{
+    static const uint8_t code[] = {
+        0xb8, 0x00, 0xb8,                       /* f0000 mov ax,0xb800 */
+        0x8e, 0xd8,                             /* f0003 mov ds,ax */
+        0xc6, 0x06, 0x00, 0x00, 0x41,           /* f0005 mov byte [0],0x41 */
+        0xa0, 0x01, 0x00,                       /* f000a mov al,[1] */
+        0xeb, 0xf6,                             /* f000d jmp f0005 */
+    };
+
+    return debug_bios_code(code, sizeof(code));
+}
+
+/*
+ * The registers of a device in memory: a VGA's memory, which is not RAM
+ * as the machine starts.  A CPU's watchpoint stops right after the
+ * instruction, and the summary has the value.
+ */
+static void test_debug_mmio(void)
+{
+    g_autofree char *bios = debug_bios_vga();
+    QTestState *qts;
+    QDict *ret, *watch;
+
+    qts = qtest_initf("-accel tcg -machine pc -nodefaults -vga std "
+                      "-bios %s -S", bios);
+
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0xb8000',"
+                   " 'length': 1, 'physical': true}}");
+    g_assert(qdict_get_bool(ret, "reached"));
+    watch = qdict_get_qdict(ret, "watch");
+    g_assert_cmpstr(qdict_get_str(watch, "pc"), ==, "0xf0005");
+    g_assert_cmpstr(qdict_get_str(watch, "value"), ==, "0x41");
+    g_assert_cmpint(qdict_get_int(watch, "size"), ==, 1);
+    g_assert_cmpstr(qdict_get_str(watch, "region"), ==, "vga-lowmem (VGA)");
+    g_assert_cmpstr(qdict_get_str(watch, "offset"), ==, "0x18000");
+    g_assert(!qdict_haskey(watch, "block-end"));
+    debug_summary_has(ret, "CPU 0 wrote 0x41 to physical 0xb8000: a byte at"
+                      " 0x18000 in vga-lowmem (VGA); the VM is stopped after"
+                      " the instruction that did it:\n");
+    /* a read may change a device: not done */
+    debug_summary_has(ret, "Memory at physical 0xb8000: a device's"
+                      " registers, not read, as a read may change the"
+                      " device\n");
+    qobject_unref(ret);
+
+    /* a read, through a virtual address */
+    ret = debug_ok(qts, "debug-run", "{'watch': {'address': '0xb8001',"
+                   " 'length': 1, 'access': 'read'}}");
+    watch = qdict_get_qdict(ret, "watch");
+    g_assert_cmpstr(qdict_get_str(watch, "pc"), ==, "0xf000a");
+    g_assert(qdict_haskey(watch, "value"));
+    debug_summary_has(ret, " from 0xb8001: a byte at 0x18001 in vga-lowmem"
+                      " (VGA); the VM is stopped after the instruction that"
+                      " did it:\n");
+    qobject_unref(ret);
+
+    /* debug-trace counts the accesses by register */
+    ret = debug_ok(qts, "debug-trace", "{'watch': {'address': '0xb8000',"
+                   " 'length': 2, 'physical': true, 'access': 'access'},"
+                   " 'count': 4}");
+    g_assert_cmpint(qdict_get_int(ret, "hits"), ==, 4);
+    debug_summary_has(ret, "By device register:\n       2 x write to 0x18000"
+                      " in vga-lowmem (VGA), physical 0xb8000 (last 0x41)\n"
+                      "       2 x read of 0x18001 in vga-lowmem (VGA),"
+                      " physical 0xb8001 (last 0x");
+    debug_summary_has(ret, "#1 CPU 0 at 0xf0005 wrote 0x41 to physical"
+                      " 0xb8000: a byte at 0x18000 in vga-lowmem (VGA)");
+    qobject_unref(ret);
     qtest_quit(qts);
     unlink(bios);
 }
@@ -4590,6 +4794,8 @@ int main(int argc, char **argv)
         qtest_add_func("/mcp/debug/registers", test_debug_registers);
         qtest_add_func("/mcp/debug/watch", test_debug_watch);
         qtest_add_func("/mcp/debug/dma", test_debug_dma);
+        qtest_add_func("/mcp/debug/ports", test_debug_ports);
+        qtest_add_func("/mcp/debug/mmio", test_debug_mmio);
         qtest_add_func("/mcp/debug/trace", test_debug_trace);
         qtest_add_func("/mcp/debug/history", test_debug_history);
         qtest_add_func("/mcp/debug/mask", test_debug_mask);

@@ -136,6 +136,7 @@ Use these:
 | See which exceptions the guest takes, and how often | `debug-trace` with `exception: {}` |
 | Find what writes or reads some memory (a watchpoint) | `debug-run` with `watch` |
 | Find when a device (DMA) writes some memory | `debug-run` with `watch`; `physical: true` for a physical address |
+| See what a driver does to its device: which registers or I/O ports, which values | `debug-trace` with `watch` on the registers; `space: "I/O"` for I/O ports |
 | See every call of a function, or every write to some memory, as the guest runs | `debug-trace` |
 | See how the CPU got to where it stopped | `debug-run` with `history` |
 | Stop at the same code in any process (any space) | `debug-run` with `address-mask` |
@@ -244,9 +245,25 @@ Use these:
   or QEMU wrote for a CPU, as for a page table; `io-thread`), and how
   many bytes it wrote in all. `devices: false` leaves devices out.
   `physical: true` watches a physical address, such as a buffer from
-  a device's descriptor; only devices are watched there. The memory
-  is watched where its pages are mapped as the call begins. Devices'
-  reads are not watched.
+  a device's descriptor; a CPU's access through any virtual address
+  that maps it stops there too. The memory is watched where its pages
+  are mapped as the call begins. Devices' reads of RAM are not seen.
+- **A device's registers and I/O ports:** a `watch` on memory where a
+  device has its registers stops right after a CPU's access, as for
+  RAM. The result also has the `value` read or written, its `size`,
+  the device's memory `region` (as `hmp` `info mtree` names it, with
+  the device's type) and the `offset` in it, which tells the register.
+  That memory is not read for the summary, as a read may change the
+  device. For I/O ports, add `space: "I/O"`, or the address space that
+  `info mtree` shows the ports in, such as `raven-io` on the PReP 40p.
+  The CPU stops right after the instruction where it can, and else at
+  the end of its block of code (`block-end: true`): right after the
+  instruction or a few instructions on, as for an x86 `in` or `out`.
+  Where a machine has its ports in the CPU's memory but in no address
+  space of their own, watch them there with `physical: true`.
+  Accesses that no CPU makes, by a device or by QEMU, stop it too,
+  unless `devices: false`. If no device is at the address, the
+  summary says so and lists the address spaces.
 - **Several at once:** `address` takes a list of up to 64 addresses,
   and `watch` a list of up to 16 areas. `debug-run` stops at whichever
   a CPU gets to or touches first; `debug-trace` logs them all and
@@ -297,8 +314,10 @@ Use these:
   `duration-ms`. For watched memory it counts which instructions
   touched it, and lists the first access by each one, so a rare
   writer behind a busy loop still shows; devices' writes are counted
-  apart, as `device-writes`. Each hit stops the VM for a moment: a
-  busy address slows the guest while it traces.
+  apart, as `device-writes`. On a device's registers it also counts
+  the accesses by register, with the last value of each: what a driver
+  does to its device. Each hit stops the VM for a moment: a busy
+  address slows the guest while it traces.
 - **TLB misses and page faults:** when the CPU has no mapping for an
   address right now, the debug tools say so instead of showing the
   instruction or the memory there. Kernels are often mapped 1:1: ask

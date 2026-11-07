@@ -1579,22 +1579,32 @@
 #
 # @access: what stops the VM (default: write)
 #
-# @physical: @address is physical, as hmp's xp reads it.  Only
-#     devices' writes are caught there, as CPUs watch virtual
-#     addresses; @access must be write (default: false)
+# @physical: @address is physical, as hmp's xp reads it: CPUs'
+#     accesses are caught through any virtual address that maps it,
+#     as found by memory-search (default: false)
 #
-# @devices: also stop when a device writes to it itself (DMA), or QEMU
-#     writes to it for a CPU outside its instructions, as some CPUs do
-#     for their page tables.  Devices' reads are not watched.  The
-#     memory is watched where its pages were mapped as the call began
-#     (default: true with @access write or access)
+# @space: @address is in this address space, named as hmp's "info
+#     mtree" names it, such as "I/O" for the I/O ports of x86 and PCI
+#     machines: to watch a device's registers there.  Each access is
+#     seen, whoever makes it.  Where a CPU sees that space in its own
+#     memory, as through an I/O window, the CPU stops right after the
+#     instruction that did it; elsewhere, as for x86's in and out, at
+#     the end of its block of code.  The CPU's own memory space is the
+#     same as @physical.
+#
+# @devices: also stop when no CPU does it: when a device writes to it
+#     itself (DMA), or QEMU writes to it for a CPU, as some CPUs do
+#     for their page tables; and for a device's registers, when a
+#     device or QEMU reads or writes them.  Devices' reads of RAM are
+#     not seen.  The memory is watched where its pages were mapped as
+#     the call began (default: true)
 #
 # Since: 11.2
 ##
 { 'struct': 'McpWatch',
   'data': { 'address': 'str', '*length': 'int',
             '*access': 'McpWatchAccess', '*physical': 'bool',
-            '*devices': 'bool' },
+            '*space': 'str', '*devices': 'bool' },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1682,14 +1692,15 @@
 
 ##
 # @McpDeviceWrite:
-#     A write to watched memory that no instruction did: a device's
-#     (DMA), or QEMU's for a CPU.
+#     An access to watched memory that no CPU did: a device's write to
+#     RAM (DMA), QEMU's for a CPU, or a device's or QEMU's access to a
+#     device's registers.
 #
-# @physical: the physical address of the first watched byte it wrote,
-#     in hex
+# @physical: the physical address of the first watched byte it
+#     touched, in hex; none in another address space
 #
-# @length: how many bytes that one write wrote in all; it may have
-#     written more than the watched memory
+# @length: how many bytes that one access touched in all; it may have
+#     touched more than the watched memory
 #
 # @from: "cpu" when it came during an I/O access by CPU @cpu, or QEMU
 #     wrote for that CPU (as for a page table); "main-loop" for a
@@ -1701,7 +1712,7 @@
 # Since: 11.2
 ##
 { 'struct': 'McpDeviceWrite',
-  'data': { 'physical': 'str', 'length': 'int', 'from': 'str',
+  'data': { '*physical': 'str', 'length': 'int', 'from': 'str',
             '*cpu': 'int' },
   'if': 'CONFIG_TCG' }
 
@@ -1711,18 +1722,40 @@
 #
 # @address: the first watched byte it touched, in hex
 #
+# @physical: @address is physical
+#
+# @space: the address space of @address, when the watch named one
+#
 # @access: "read" or "write"
 #
 # @pc: the instruction that did it, in hex; the CPU has run it.  None
-#     when a device wrote it.
+#     when a device did it, or with @block-end.
 #
-# @device: who wrote it, when a device did, not an instruction
+# @block-end: true when a CPU did it but no watchpoint caught the
+#     instruction, as for x86's in and out: the CPU stopped at the end
+#     of its block of code, right after the instruction that did it or
+#     a few instructions on
+#
+# @device: who did it, when no CPU did
+#
+# @value: for a device's registers, the value read or written, in hex
+#
+# @size: for a device's registers, how many bytes the access had
+#
+# @region: for a device's registers, the memory region they are in, as
+#     "info mtree" names it, and in brackets the type of the device
+#     that has it
+#
+# @offset: for a device's registers, where the access was in @region,
+#     in hex: which register
 #
 # Since: 11.2
 ##
 { 'struct': 'McpWatchHit',
-  'data': { 'address': 'str', 'access': 'str', '*pc': 'str',
-            '*device': 'McpDeviceWrite' },
+  'data': { 'address': 'str', '*physical': 'bool', '*space': 'str',
+            'access': 'str', '*pc': 'str', '*block-end': 'bool',
+            '*device': 'McpDeviceWrite', '*value': 'str', '*size': 'int',
+            '*region': 'str', '*offset': 'str' },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1755,7 +1788,11 @@
 #     device that writes to it itself (DMA) stops the VM too, right
 #     after the write, unless @devices is false: the summary says
 #     where the write came from, and the CPU shown is the one whose
-#     I/O access it came in, if any.
+#     I/O access it came in, if any.  For a device's registers, in
+#     memory or in a @space such as the I/O ports, the summary also
+#     gives the value read or written and which device and register
+#     it was; their memory is not read, as a read may change the
+#     device.
 #
 # @exception: stop right after a CPU takes one of these exceptions,
 #     at the first instruction of the guest's handler; the summary
@@ -1831,7 +1868,8 @@
 # @watch: what it or a device did to the watched memory, when that was
 #     the hit
 #
-# @value: the watched word after that, in hex
+# @value: for a device's registers, the value read or written; else
+#     the watched word after that, in hex
 #
 # @exception: the exception it took, when that was the hit; the
 #     registers and memory are those at the handler
@@ -1863,10 +1901,41 @@
 # @instruction: the instruction, as it was the first time it could be
 #     read
 #
+# @block-end: true when no watchpoint caught these accesses (see
+#     @McpWatchHit): @pc is where the CPU's block of code that did
+#     them ended, and the instruction is in that block
+#
 # Since: 11.2
 ##
 { 'struct': 'McpTraceInstruction',
-  'data': { 'pc': 'str', 'count': 'int', '*instruction': 'str' },
+  'data': { 'pc': 'str', 'count': 'int', '*instruction': 'str',
+            '*block-end': 'bool' },
+  'if': 'CONFIG_TCG' }
+
+##
+# @McpTraceRegister:
+#     A device's register that watched accesses went to, and how often
+#     (@debug-trace).
+#
+# @address: the first watched byte the first of them touched, in hex,
+#     as the watch has it
+#
+# @region: the memory region of the register, named as in
+#     @McpWatchHit; none where nothing is
+#
+# @offset: where the accesses were in @region, in hex
+#
+# @access: "read" or "write"
+#
+# @count: how often
+#
+# @value: the value the last one read or wrote, in hex
+#
+# Since: 11.2
+##
+{ 'struct': 'McpTraceRegister',
+  'data': { 'address': 'str', '*region': 'str', '*offset': 'str',
+            'access': 'str', 'count': 'int', 'value': 'str' },
   'if': 'CONFIG_TCG' }
 
 ##
@@ -1878,7 +1947,8 @@
 # @skipped: hits it left out because they did not meet the condition
 #     (with @condition)
 #
-# @device-writes: of the hits, the writes by devices (with @watch)
+# @device-writes: of the hits, the ones no CPU did: devices' writes,
+#     and their accesses to registers (with @watch)
 #
 # @ms: how long it traced, in milliseconds
 #
@@ -1892,6 +1962,9 @@
 # @exceptions: when exceptions were traced, how often CPUs took each
 #     one, most first
 #
+# @device-registers: when watched memory has a device's registers,
+#     how often each register was read and written, most first
+#
 # @entries: the hits it lists
 #
 # Since: 11.2
@@ -1903,6 +1976,7 @@
             'running': 'bool',
             '*instructions': [ 'McpTraceInstruction' ],
             '*exceptions': [ 'McpExceptionCount' ],
+            '*device-registers': [ 'McpTraceRegister' ],
             'entries': [ 'McpTraceEntry' ] },
   'if': 'CONFIG_TCG' }
 
@@ -1924,7 +1998,9 @@
 #
 # @watch: log the accesses to this memory, or to each area of a list,
 #     with the instruction that did each one, and devices' writes to
-#     it, as for debug-run
+#     it, as for debug-run.  For a device's registers it also counts
+#     the accesses by register, with the last value: use it to see
+#     what a driver does to its device.
 #
 # @exception: log these exceptions as CPUs take them, and count them
 #     by number and by the instruction that took them; {} for all.
