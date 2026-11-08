@@ -1380,11 +1380,6 @@ static bool i82596_check_medium_status(I82596State *s)
         return false;
     }
 
-    if (!I596_LOOPBACK && (qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) % 100 < 5)) {
-        s->collision_events++;
-        return false;
-    }
-
     return true;
 }
 
