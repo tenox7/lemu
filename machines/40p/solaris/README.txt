@@ -9,6 +9,7 @@ GNU tools in /usr/local/bin: bash 3.2.57, gmake 3.81, grep 2.5.4, gzip 1.3.12, g
 Sun cc links print "unsupported # of bits for relocation" lines from the 2.5.1 linker: the program still works, but C++ exceptions do not. With g++ they do.
 gcc does not link -lw -lintl as Sun cc does: add them for gettext or wide characters.
 Wabi 2.1 is a November 1995 evaluation copy: with today's date it says it has expired.
+NCSA Mosaic 2.7b5 web browser: right-click the desktop, then Programs > Mosaic Web Browser (or run /usr/local/bin/Mosaic). It has no HTTPS, so only http:// sites work, such as http://68k.news/ and http://theoldnet.com/.
 QEMU halts the CPU while Solaris is idle, so an idle VM uses about 3% of a host core.
 macOS: if the binary is blocked, run xattr -cr . in this folder.
 
