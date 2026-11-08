@@ -180,7 +180,6 @@ static void examine_scb(I82596State *s);
 static bool i82596_check_medium_status(I82596State *s);
 static int i82596_csma_backoff(I82596State *s, int retry_count);
 static uint16_t i82596_calculate_crc16(const uint8_t *data, size_t len);
-static size_t i82596_append_crc(I82596State *s, uint8_t *buffer, size_t len);
 static void i82596_bus_throttle_timer(void *opaque);
 static void i82596_flush_queue_timer(void *opaque);
 static int i82596_flush_packet_queue(I82596State *s);
@@ -605,7 +604,12 @@ static int i82596_tx_copy_buffers(I82596State *s, hwaddr tfd_addr,
     return total_len;
 }
 
-static int i82596_tx_process_frame(I82596State *s, bool insert_crc)
+/*
+ * The frame goes to the net layer without the FCS, as from every other NIC:
+ * the CRC the chip inserts belongs to the wire, and two more bytes make a
+ * full-size frame too long for vmnet, which then drops it.
+ */
+static int i82596_tx_process_frame(I82596State *s)
 {
     uint32_t total_len = s->tx_frame_len;
 
@@ -631,10 +635,6 @@ static int i82596_tx_process_frame(I82596State *s, bool insert_crc)
         size_t pad_len = I596_MIN_FRAME_LEN - total_len;
         memset(s->tx_buffer + total_len, 0, pad_len);
         total_len = I596_MIN_FRAME_LEN;
-    }
-
-    if (insert_crc) {
-        total_len = i82596_append_crc(s, s->tx_buffer, total_len);
     }
 
     s->tx_frame_len = total_len;
@@ -701,15 +701,12 @@ static void i82596_transmit(I82596State *s, uint32_t addr)
     int collision_count = 0;
     int frame_len;
     bool success = true;
-    bool insert_crc;
 
     i82596_tx_tfd_read(s, tfd_addr, &tfd);
     trace_i82596_tx_tfd(tfd_addr, tfd.status_bits, tfd.command,
                         tfd.link_addr, tfd.tbd_addr);
 
     s->current_tx_desc = tfd_addr;
-    insert_crc = (I596_NOCRC_INS == 0) && ((tfd.command & 0x10) == 0) &&
-                 !I596_LOOPBACK;
     collision_count = i82596_tx_csma_cd(s, &tx_status);
     if (collision_count < 0) {
         success = false;
@@ -721,7 +718,7 @@ static void i82596_transmit(I82596State *s, uint32_t addr)
         success = false;
         goto tx_complete;
     }
-    frame_len = i82596_tx_process_frame(s, insert_crc);
+    frame_len = i82596_tx_process_frame(s);
     if (frame_len <= 0) {
         tx_status |= TX_ABORTED_ERRORS;
         success = false;
@@ -1216,15 +1213,24 @@ rx_complete:
         rfd.actual_count |= I596_EOF;
     }
 
-    i82596_rx_desc_write(s, rfd_addr, &rfd, (simplified_mode || I596_LOOPBACK));
+    /*
+     * A flexible RFD holds the frame's own header in its data area. Writing
+     * the descriptor's header fields back, as loopback did, put there what
+     * the RFD held before, and HP-UX failed its loopback test on that.
+     */
+    i82596_rx_desc_write(s, rfd_addr, &rfd, simplified_mode);
 
-    if (rfd.command & CMD_SUSP) {
+    /*
+     * After the RFD marked EL or S the RU stops, and says so with FR for
+     * the frame, RNR and an interrupt. Without the interrupt the driver
+     * never learnt of either, and receiving stopped for good.
+     */
+    if (rfd.command & (CMD_SUSP | CMD_EOL)) {
+        if (packet_completed) {
+            s->scb_status |= SCB_STATUS_FR;
+        }
         i82596_update_rx_state(s, RX_SUSPENDED);
-        return size;
-    }
-
-    if (rfd.command & CMD_EOL) {
-        i82596_update_rx_state(s, RX_SUSPENDED);
+        i82596_update_scb_irq(s, true);
         return size;
     }
 
@@ -1236,6 +1242,16 @@ rx_complete:
         }
 
         s->scb_status |= SCB_STATUS_FR;
+        i82596_update_scb_irq(s, true);
+    }
+
+    /*
+     * Out of receive buffers: the RU leaves the ready state and says so
+     * with RNR, and the driver starts it again with fresh RBDs. Staying
+     * ready lost every frame longer than the RFD's own data area for good.
+     */
+    if (rx_status & RFD_STATUS_NOBUFS) {
+        i82596_update_rx_state(s, RX_NO_RESOURCES);
         i82596_update_scb_irq(s, true);
     }
     trace_i82596_rx_complete(s->crc_err, s->align_err, s->resource_err);
@@ -1399,25 +1415,6 @@ static uint16_t i82596_calculate_crc16(const uint8_t *data, size_t len)
         }
     }
     return crc;
-}
-
-static size_t i82596_append_crc(I82596State *s, uint8_t *buffer, size_t len)
-{
-    if (len + 4 > PKT_BUF_SZ) {
-        return len;
-    }
-
-    if (I596_CRC16_32) {
-        uint32_t crc = crc32(~0, buffer, len);
-        crc = cpu_to_be32(crc);
-        memcpy(&buffer[len], &crc, sizeof(crc));
-        return len + sizeof(crc);
-    } else {
-        uint16_t crc = i82596_calculate_crc16(buffer, len);
-        crc = cpu_to_be16(crc);
-        memcpy(&buffer[len], &crc, sizeof(crc));
-        return len + sizeof(crc);
-    }
 }
 
 static void i82596_update_statistics(I82596State *s, bool is_tx,
