@@ -983,6 +983,29 @@ static int pcnet_tdte_poll(PCNetState *s)
 
 #define MIN_BUF_SIZE 60
 
+/*
+ * Whether the receive buffers the card owns, from the current descriptor
+ * on, hold len bytes. The chip chains a frame through as many as it needs.
+ * If even the whole ring is too small, say yes and let the frame overflow.
+ */
+static bool pcnet_rx_room(PCNetState *s, int len)
+{
+    struct pcnet_RMD rmd;
+    int i;
+
+    for (i = 0; i < CSR_RCVRL(s); i++) {
+        RMDLOAD(&rmd, PHYSADDR(s, pcnet_rdra_addr(s, CSR_RCVRC(s) - i)));
+        if (!GET_FIELD(rmd.status, RMDS, OWN)) {
+            return false;
+        }
+        len -= 4096 - GET_FIELD(rmd.buf_length, RMDL, BCNT);
+        if (len <= 0) {
+            return true;
+        }
+    }
+    return true;
+}
+
 ssize_t pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
 {
     PCNetState *s = qemu_get_nic_opaque(nc);
@@ -1029,14 +1052,16 @@ ssize_t pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
             }
         }
 
-        if (!(CSR_CRST(s) & 0x8000)) {
+        if (!(CSR_CRST(s) & 0x8000) ||
+            (!s->looptest && !pcnet_rx_room(s, MIN(size, 4092) + 4))) {
 #ifdef PCNET_DEBUG_RMD
             printf("pcnet - no buffer: RCVRC=%d\n", CSR_RCVRC(s));
 #endif
             /*
-             * Ring full: hold the packet until the guest returns buffers.
-             * Host backends burst far faster than a wire, so dropping it
-             * stalls NFS and TCP on retransmit timeouts.
+             * Ring full, or too few free buffers for this frame: hold the
+             * packet until the guest returns buffers. Host backends burst
+             * far faster than a wire, so dropping it stalls NFS and TCP on
+             * retransmit timeouts.
              */
             if (!s->looptest) {
                 if (!timer_pending(s->poll_timer)) {
@@ -1105,26 +1130,23 @@ ssize_t pcnet_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
 
             remaining = size;
             PCNET_RECV_STORE();
-            if ((remaining > 0) && CSR_NRDA(s)) {
-                hwaddr nrda = CSR_NRDA(s);
+            /*
+             * Chain on through as many buffers as the frame needs, as the
+             * chip does, not just the two it looks ahead to (NRDA, NNRD).
+             * Solaris's pcn driver gives it 128-byte buffers.
+             */
+            while (remaining > 0 && pktcount < CSR_RCVRL(s)) {
+                hwaddr nrda = pcnet_rdra_addr(s, CSR_RCVRC(s) - pktcount);
+
 #ifdef PCNET_DEBUG_RMD
                 PRINT_RMD(&rmd);
 #endif
                 RMDLOAD(&rmd, PHYSADDR(s,nrda));
-                if (GET_FIELD(rmd.status, RMDS, OWN)) {
-                    crda = nrda;
-                    PCNET_RECV_STORE();
-#ifdef PCNET_DEBUG_RMD
-                    PRINT_RMD(&rmd);
-#endif
-                    if ((remaining > 0) && (nrda=CSR_NNRD(s))) {
-                        RMDLOAD(&rmd, PHYSADDR(s,nrda));
-                        if (GET_FIELD(rmd.status, RMDS, OWN)) {
-                            crda = nrda;
-                            PCNET_RECV_STORE();
-                        }
-                    }
+                if (!GET_FIELD(rmd.status, RMDS, OWN)) {
+                    break;
                 }
+                crda = nrda;
+                PCNET_RECV_STORE();
             }
 
 #undef PCNET_RECV_STORE
