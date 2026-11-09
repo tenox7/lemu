@@ -1254,10 +1254,13 @@ static uint64_t artist_reg_read(void *opaque, hwaddr addr, unsigned size)
     case FIFO1:
     case FIFO2:
         /*
-         * FIFO ready flag. we're not emulating the FIFOs
-         * so we're always ready
+         * Free FIFO slots. We're not emulating the FIFOs, so we're always
+         * ready. Drivers poll until at least as many slots are free as they
+         * are about to write: 16 was too few for the HP-UX 9.07 X server
+         * (HP OpenView NNM's map waits for 20), so it spun forever. Keep the
+         * 0x10 bit set.
          */
-        val = 0x10;
+        val = 0x7f;
         break;
 
     case HORIZ_BACKPORCH:
