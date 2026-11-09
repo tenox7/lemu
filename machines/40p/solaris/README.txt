@@ -10,6 +10,7 @@ Sun cc links print "unsupported # of bits for relocation" lines from the 2.5.1 l
 gcc does not link -lw -lintl as Sun cc does: add them for gettext or wide characters.
 Wabi 2.1 is a November 1995 evaluation copy: with today's date it says it has expired.
 NCSA Mosaic 2.7b5 web browser: right-click the desktop, then Programs > Mosaic Web Browser (or run /usr/local/bin/Mosaic). It has no HTTPS, so only http:// sites work, such as http://68k.news/ and http://theoldnet.com/.
+Also in Programs: SimCity (Micropolis Legacy with the DUX SimCity 2.17 data, or run simcity), the TenoxVNC 1.1 VNC viewer (tenoxvnc host:display) and SNG 1.1.1, the System & Network Grapher (sng, as root; it writes sng.ini in the current folder).
 QEMU halts the CPU while Solaris is idle, so an idle VM uses about 3% of a host core.
 macOS: if the binary is blocked, run xattr -cr . in this folder.
 
