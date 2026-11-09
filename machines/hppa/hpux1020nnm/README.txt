@@ -1,0 +1,18 @@
+HP-UX 10.20 with HP OpenView Network Node Manager 6.1 on QEMU's HP B160L (four PA-7300LC CPUs, 512 MB, Artist graphics, SCSI disk, Tulip network)
+
+Run ./run.sh (macOS 26+ arm64, Linux x86_64/aarch64 with glibc 2.34+ and X11/XWayland) or run.cmd (Windows 10+ x64).
+Log in as root, password root, at the HP VUE login in the QEMU window (1280x1024, about 90 s after the start), telnet localhost 10233 or rsh localhost port 10534.
+Installed: the December 1999 Workstation ACE; HP C (ANSI C), C++, FORTRAN 77, Fortran 90 and Pascal; SoftBench 6.0; GlancePlus C.03 (permanent key: glance, gpm); Netscape Navigator 4.05 and Enterprise Server; Lotus Notes R4; FrameMaker 6.0; CorelDRAW 3.5; Wabi 2.2; SoftWindows 2.0 (MS-DOS 6.22, Windows 3.11); SoftPC 3.1 (MS-DOS 5.00); Advanced Server/9000; TN3270. gcc 4.2.2 is in /usr/local/pa11_32/bin, GNU tools (bash, gmake, gtar, gzip, binutils) and more in /usr/local/bin, perl in /usr/contrib/bin.
+HP OpenView Network Node Manager 6.1 (NNM, the SNMP network map) is installed in /opt/OV and starts at boot, with a 250-node licence. Its databases were emptied: NNM finds the QEMU NAT network (192.168.1.0) by itself, with HP-UX and the host side. Open the map: in an hpterm type /opt/OV/bin/ovw. /opt/OV/bin/ovstatus -c shows the NNM daemons; /opt/OV/bin/ovstop and ovstart stop and start them.
+After a boot the HP-UX SNMP agent (snmpdm) sometimes stops answering: /opt/OV/bin/snmpget localhost system.sysUpTime.0 times out, netmon stops with "Can't talk to snmpdm" and HP-UX's own node turns red in the map. As root: /sbin/init.d/SnmpMaster stop; if snmpdm still runs (ps -e | grep snmpdm), kill -9 it. Then run /sbin/init.d/SnmpMaster start, SnmpHpunix start, SnmpMib2 start and SnmpTrpDst start (all in /sbin/init.d), check that the snmpget above answers, and then run /opt/OV/bin/ovstart netmon.
+Apps: the small arrow above the Apps icon on the front panel (next to Wabi) opens launchers for Lotus Notes, Netscape, FrameMaker, CorelDRAW, NEdit, SNG, SoftBench, SAM, Image Viewer, Screen Capture and Whiteboard. The arrow above Wabi opens SoftWindows and SoftPC, the arrow above the terminal icon TN3270 and TenoxVNC. In an hpterm, notes, framemaker, coreldraw, softwindows and spc start the same programs. Only one Notes can run at a time; if it is frozen, Apps > Lotus Notes offers to restart it. In SoftWindows, type win at the C:\> prompt to start Windows 3.11.
+Click in the QEMU window to grab the mouse; Ctrl-Alt-G (Ctrl-Option-G on a Mac) lets it go.
+Extra QEMU options are passed through, e.g. ./run.sh -display vnc=127.0.0.1:1. With -display none the VUE login still runs, out of sight: use telnet or rsh.
+The terminal holds the QEMU monitor. quit there stops QEMU at once.
+Network is QEMU user mode NAT on 192.168.1.0/24: HP-UX is 192.168.1.235 (hostname hpux), the host side is 192.168.1.2. HP-UX's default route points at 192.168.1.1, which does not answer, so HP-UX reaches only 192.168.1.x.
+HP-UX 10.20 refuses the 2026 hardware clock ("time-of-day register time is out-of-range") and goes on from the time of its last shutdown, in January 2020.
+Run shutdown -h -y 0 as root. When HP-UX says "System has halted", type quit in the monitor.
+macOS: if the binary is blocked, run xattr -cr . in this folder.
+
+AI agents (macOS, Linux): in this folder, claude mcp add lemu -s user -- "$PWD/bin/macos-arm64/qemu-system-hppa" -mcp-bridge (on Linux bin/linux-x86_64 or bin/linux-aarch64) lets an agent such as Claude Code see the screen and use the keyboard, mouse and serial ports of the running VM. See MCP.md in the QEMU source.
+QEMU source: https://github.com/tenox7/lemu branch master (GPLv2, see bin/COPYING). qemu-system-hppa --version names the commit.
