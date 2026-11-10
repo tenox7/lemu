@@ -8,7 +8,7 @@ qemu\windows-x64\qemu-system-mips64el.exe ^
  -bios NTPROM.RAW ^
  -global ds1225y.filename=nvram.bin ^
  -monitor stdio ^
- -nic user,model=dp83932 ^
+ -nic user,model=dp83932,hostfwd=tcp:127.0.0.1:36514-:514,hostfwd=tcp:127.0.0.1:36389-:3389 ^
  -drive file=nt351.qcow2,if=none,id=hd0,format=qcow2 ^
  -device scsi-hd,drive=hd0,scsi-id=0 ^
  -drive if=none,id=cd0,media=cdrom,readonly=on ^

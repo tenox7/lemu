@@ -21,6 +21,6 @@ exec "$q" \
  -device ide-cd,drive=cd0,bus=ide.1,unit=0 \
  -drive if=floppy,index=0,id=fd0 \
  -boot order=c,menu=off \
- -netdev user,id=n0 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 \
+ -netdev user,id=n0,hostfwd=tcp:127.0.0.1:35514-:514,hostfwd=tcp:127.0.0.1:35389-:3389 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 \
  -monitor stdio \
  "$@"

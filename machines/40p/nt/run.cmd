@@ -7,7 +7,7 @@ bin\windows-x86_64\qemu-system-ppc.exe ^
  -drive file=nvram.bin,if=none,id=nvram,format=raw -global isa-m48t59.drive=nvram ^
  -vga none -device s3-trio64,romfile=fw/gxt110p.bin ^
  -monitor stdio ^
- -nic none -netdev user,id=n0 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 ^
+ -nic none -netdev user,id=n0,hostfwd=tcp:127.0.0.1:46514-:514,hostfwd=tcp:127.0.0.1:46389-:3389 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 ^
  -drive if=floppy,index=0,id=fd0 ^
  -drive file=nt40.qcow2,if=none,id=hd0,format=qcow2 ^
  -device scsi-hd,drive=hd0,scsi-id=0 ^

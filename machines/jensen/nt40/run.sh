@@ -22,5 +22,5 @@ exec "$q" \
  -drive if=none,id=cd0,media=cdrom,readonly=on \
  -device scsi-cd,bus=scsi0.0,scsi-id=4,drive=cd0 \
  -drive if=floppy,index=0,id=fd0 \
- -netdev user,id=n0 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 \
+ -netdev user,id=n0,hostfwd=tcp:127.0.0.1:45514-:514,hostfwd=tcp:127.0.0.1:45389-:3389 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 \
  "$@"

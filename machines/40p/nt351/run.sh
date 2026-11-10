@@ -17,7 +17,7 @@ exec "$q" \
  -rtc base=localtime \
  -vga none -device p9100 \
  -monitor stdio \
- -nic none -netdev user,id=n0 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 \
+ -nic none -netdev user,id=n0,hostfwd=tcp:127.0.0.1:38514-:514,hostfwd=tcp:127.0.0.1:38389-:3389 -device ne2k_isa,iobase=0x300,irq=5,netdev=n0 \
  -drive if=floppy,index=0,id=fd0 \
  -drive file=nt351.qcow2,if=none,id=hd0,format=qcow2 \
  -device scsi-hd,drive=hd0,scsi-id=0 \

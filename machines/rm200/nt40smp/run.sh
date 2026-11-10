@@ -14,7 +14,7 @@ exec $Q \
 	-accel tcg,thread=multi \
 	-bios 'RM200C-NT-SMP.BIN' \
 	-monitor stdio \
-	-nic user,model=pcnet \
+	-nic user,model=pcnet,hostfwd=tcp:127.0.0.1:42514-:514,hostfwd=tcp:127.0.0.1:42389-:3389 \
 	-drive file=nt40-smp.hda,if=none,id=hd0,format=raw \
 	-device scsi-hd,drive=hd0,scsi-id=0 \
 	"$@"

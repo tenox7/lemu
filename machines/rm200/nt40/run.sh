@@ -13,7 +13,7 @@ exec $Q \
 	-rtc base=localtime \
 	-bios 'RM200C-NT-AM29F040@PLCC32.BIN' \
 	-monitor stdio \
-	-nic user,model=pcnet \
+	-nic user,model=pcnet,hostfwd=tcp:127.0.0.1:41514-:514,hostfwd=tcp:127.0.0.1:41389-:3389 \
 	-drive file=nt40.hda,if=none,id=hd0,format=raw \
 	-device scsi-hd,drive=hd0,scsi-id=0 \
 	"$@"

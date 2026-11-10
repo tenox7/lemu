@@ -8,7 +8,7 @@ qemu\windows-x64\qemu-system-mips64el.exe ^
  -rtc base=localtime ^
  -bios "RM200C-NT-AM29F040@PLCC32.BIN" ^
  -monitor stdio ^
- -nic user,model=pcnet ^
+ -nic user,model=pcnet,hostfwd=tcp:127.0.0.1:39514-:514,hostfwd=tcp:127.0.0.1:39389-:3389 ^
  -drive file=nt351.qcow2,if=none,id=hd0,format=qcow2 ^
  -device scsi-hd,drive=hd0,scsi-id=0 ^
  -drive if=none,id=cd0,media=cdrom,readonly=on ^
