@@ -11,7 +11,7 @@ APPVER=3.51 makes the SDK's win32.mak build programs for NT 3.51. The SDK tools 
 Developer Studio asks for the VC++ CD when it starts (the help is on that CD): press Cancel.
 QEMU halts the CPU while NT is idle, so an idle VM uses about 3% of a host core.
 The clock runs 28 years behind (the firmware rejects current years). Network is QEMU user mode NAT (NE2000, DHCP, 10.0.2.15).
-rsh: the ntrshd service (rsh and rcp server, github.com/tenox7/ntrshd) starts at boot and runs commands as Administrator. 127.0.0.1:37514 on this computer goes to it, e.g. rsh-mcp (github.com/tenox7/rsh-mcp) with host 127.0.0.1 and port 37514. 127.0.0.1:37389 goes to port 3389 (RDP) in NT, for an RDP server you install there.
+rsh: the ntrshd service (rsh and rcp server, github.com/tenox7/ntrshd) starts at boot and runs commands as Administrator. It is unauthenticated: it asks for no password, so anyone who can reach its port can run any command as Administrator. 127.0.0.1:37514 on this computer goes to it, e.g. rsh-mcp (github.com/tenox7/rsh-mcp) with host 127.0.0.1 and port 37514. 127.0.0.1:37389 goes to port 3389 (RDP) in NT, for an RDP server you install there. Both listen on 127.0.0.1 only, so other computers can't reach them.
 QEMU monitor: Ctrl-Alt-2 (back with Ctrl-Alt-1). CD-ROM and floppy are empty: change cd0 file.iso, change fd0 file.img.
 Send Ctrl-Alt-Del from the monitor with: sendkey ctrl-alt-delete
 macOS: if the binary is blocked, run xattr -cr . in this folder.

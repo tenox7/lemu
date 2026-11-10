@@ -11,7 +11,7 @@ Developer Studio asks for the VC++ CD when it starts (the help is on that CD): p
 fw/bios-nt351.bin is SeaBIOS with the E820 memory map and the MP table turned off: NT 3.51 setup crashes with the stock one.
 QEMU halts the CPU while NT is idle, so an idle VM uses about 2% of a host core.
 The clock is the host's local time. Network is QEMU user mode NAT (NE2000, DHCP, 10.0.2.15).
-rsh: the ntrshd service (rsh and rcp server, github.com/tenox7/ntrshd) starts at boot and runs commands as Administrator. 127.0.0.1:35514 on this computer goes to it, e.g. rsh-mcp (github.com/tenox7/rsh-mcp) with host 127.0.0.1 and port 35514. 127.0.0.1:35389 goes to port 3389 (RDP) in NT, for an RDP server you install there.
+rsh: the ntrshd service (rsh and rcp server, github.com/tenox7/ntrshd) starts at boot and runs commands as Administrator. It is unauthenticated: it asks for no password, so anyone who can reach its port can run any command as Administrator. 127.0.0.1:35514 on this computer goes to it, e.g. rsh-mcp (github.com/tenox7/rsh-mcp) with host 127.0.0.1 and port 35514. 127.0.0.1:35389 goes to port 3389 (RDP) in NT, for an RDP server you install there. Both listen on 127.0.0.1 only, so other computers can't reach them.
 macOS: if the binary is blocked, run xattr -cr . in this folder.
 
 AI agents (macOS, Linux): in this folder, claude mcp add lemu -s user -- "$PWD/bin/macos-arm64/qemu-system-i386" -mcp-bridge (on Linux bin/linux-x86_64 or bin/linux-aarch64) lets an agent such as Claude Code see the screen and use the keyboard, mouse and serial ports of the running VM. See MCP.md in the QEMU source.
