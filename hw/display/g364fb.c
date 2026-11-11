@@ -480,6 +480,7 @@ static bool g364fb_cursor_state(void *opaque, QemuCursorState *cs)
     cs->y = s->cursor_position & 0xfff;
     cs->w = 64;
     cs->h = 64;
+    cs->shape = qemu_cursor_shape(0, s->cursor, sizeof(s->cursor));
     return true;
 }
 

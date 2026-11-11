@@ -2203,22 +2203,28 @@ static inline void cirrus_cursor_compute_yrange(CirrusVGAState *s)
     }
 }
 
+/* The cursor image the card shows, @len bytes */
+static const uint8_t *cirrus_cursor_image(CirrusVGAState *s, size_t *len)
+{
+    const uint8_t *src = s->vga.vram_ptr + s->real_vram_size - 16 * KiB;
+
+    if (s->vga.sr[0x12] & CIRRUS_CURSOR_LARGE) {
+        *len = 1024;
+        return src + (s->vga.sr[0x13] & 0x3c) * 256;
+    }
+    *len = 256;
+    return src + (s->vga.sr[0x13] & 0x3f) * 256;
+}
+
 /*
  * Has the guest changed the cursor image since the last frame? NT changes it in
  * place (arrow to hourglass and back) without moving the pointer.
  */
 static bool cirrus_cursor_image_changed(CirrusVGAState *s)
 {
-    const uint8_t *src = s->vga.vram_ptr + s->real_vram_size - 16 * KiB;
     size_t len;
+    const uint8_t *src = cirrus_cursor_image(s, &len);
 
-    if (s->vga.sr[0x12] & CIRRUS_CURSOR_LARGE) {
-        src += (s->vga.sr[0x13] & 0x3c) * 256;
-        len = 1024;
-    } else {
-        src += (s->vga.sr[0x13] & 0x3f) * 256;
-        len = 256;
-    }
     if (!memcmp(s->last_hw_cursor_image, src, len)) {
         return false;
     }
@@ -2295,12 +2301,15 @@ static bool cirrus_cursor_state(VGACommonState *s1, QemuCursorState *cs)
 {
     CirrusVGAState *s = container_of(s1, CirrusVGAState, vga);
     int size = (s->vga.sr[0x12] & CIRRUS_CURSOR_LARGE) ? 64 : 32;
+    size_t len;
+    const uint8_t *img = cirrus_cursor_image(s, &len);
 
     cs->visible = s->vga.sr[0x12] & CIRRUS_CURSOR_SHOW;
     cs->x = s->vga.hw_cursor_x;
     cs->y = s->vga.hw_cursor_y;
     cs->w = size;
     cs->h = size;
+    cs->shape = qemu_cursor_shape(0, img, len);
     return true;
 }
 

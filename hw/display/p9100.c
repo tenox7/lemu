@@ -564,20 +564,26 @@ static void p9100_invalidate_display(void *opaque)
     memory_region_set_dirty(&s->vram, 0, s->vram_size);
 }
 
-/* Where p9100_cursor_overlay() puts the cursor image */
+/* Where p9100_cursor_overlay() puts the cursor image, and which image */
 static bool p9100_cursor_state(void *opaque, QemuCursorState *cs)
 {
     P9100State *s = opaque;
     const uint8_t *idx = s->dac_indexed;
     uint8_t ctl = idx[RGB525_IDX_CURSOR_CTL];
+    int dim = RGB525_CURSOR_DIM(ctl);
+    unsigned part = dim == 32 ? RGB525_CURSOR_PART(ctl) * (32 * 32 / 4) : 0;
 
     cs->visible = ctl & 0x3;
     cs->x = ((idx[RGB525_IDX_CURSOR_XH] << 8) | idx[RGB525_IDX_CURSOR_XL]) -
             idx[RGB525_IDX_CURSOR_HOTX];
     cs->y = ((idx[RGB525_IDX_CURSOR_YH] << 8) | idx[RGB525_IDX_CURSOR_YL]) -
             idx[RGB525_IDX_CURSOR_HOTY];
-    cs->w = RGB525_CURSOR_DIM(ctl);
-    cs->h = cs->w;
+    cs->w = dim;
+    cs->h = dim;
+    /* the image shown, how it is drawn, and its hotspot registers */
+    cs->shape = qemu_cursor_shape(0, s->dac_cursor + part, dim * dim / 4);
+    cs->shape = qemu_cursor_shape(cs->shape, &ctl, 1);
+    cs->shape = qemu_cursor_shape(cs->shape, idx + RGB525_IDX_CURSOR_HOTX, 2);
     return true;
 }
 

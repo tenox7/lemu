@@ -117,7 +117,56 @@ static int s3_cursor_top(S3928State *s)
         ((s->vga.cr[0x48] & 7) << 8) | s->vga.cr[0x49];
 }
 
-/* Where s3_cursor_draw_line() puts the cursor image */
+/*
+ * Where the VRAM cursor keeps the AND mask byte of column @col (0..63) in
+ * row @row; the XOR mask byte is 2 bytes further on.
+ */
+static unsigned s3_vram_cursor_addr(VGACommonState *vga, int row, unsigned col)
+{
+    unsigned base = (((vga->cr[0x4c] << 8) | vga->cr[0x4d]) & 0xfff) * 1024;
+    unsigned addr = base + row * 16 + (col / 16) * 4;
+
+    /* CR45.4 stores the masks at the right of 1280-pixel scanlines. */
+    if (vga->cr[0x45] & 0x10) {
+        if (vga->cr[0x3a] & 0x10) {
+            addr = (addr & ~0xe00) | ((addr & 0x200) << 2) | 0x600;
+        } else if ((vga->gr[5] & 0x60) == 0x20) {
+            addr = (addr & ~0xf00) | ((addr & 0x300) << 2) | 0x300;
+        }
+    }
+    return addr + (col & 15) / 8;
+}
+
+/* Which image the cursor shows, for QemuCursorState.shape */
+static uint32_t s3_cursor_shape(S3928State *s)
+{
+    VGACommonState *vga = &s->vga;
+    uint32_t shape;
+    int row;
+    unsigned col;
+
+    if (s3_cursor_external(s)) {
+        uint8_t mode = s->dac_command[2] & 3;
+        unsigned size = s3_cursor_size(s);
+
+        shape = qemu_cursor_shape(0, s3_cursor_ram(s), size * size / 4);
+        return qemu_cursor_shape(shape, &mode, 1);
+    }
+    shape = qemu_cursor_shape(0, &vga->cr[0x55], 1);
+    for (row = 0; row < 64; row++) {
+        for (col = 0; col < 64; col += 8) {
+            unsigned addr = s3_vram_cursor_addr(vga, row, col);
+
+            if (addr + 2 < vga->vram_size) {
+                shape = qemu_cursor_shape(shape, vga->vram_ptr + addr, 1);
+                shape = qemu_cursor_shape(shape, vga->vram_ptr + addr + 2, 1);
+            }
+        }
+    }
+    return shape;
+}
+
+/* Where s3_cursor_draw_line() puts the cursor image, and which image */
 static bool s3_cursor_state(VGACommonState *vga, QemuCursorState *cs)
 {
     S3928State *s = container_of(vga, S3928State, vga);
@@ -125,6 +174,7 @@ static bool s3_cursor_state(VGACommonState *vga, QemuCursorState *cs)
     int bpp, x, step;
 
     cs->visible = s3_cursor_enabled(s);
+    cs->shape = s3_cursor_shape(s);
     if (s3_cursor_external(s)) {
         cs->x = (int)s->cursor_x - size;
         cs->y = (int)s->cursor_y - size;
@@ -173,7 +223,6 @@ static void s3_vram_cursor_line(S3928State *s, uint32_t *pixels, int y,
     int x = ((vga->cr[0x46] & 7) << 8) | vga->cr[0x47];
     int xoff = vga->cr[0x4e] & 63;
     unsigned step = (bpp == 15 || bpp == 16) && !(vga->cr[0x45] & 4) ? 2 : 1;
-    unsigned base = (((vga->cr[0x4c] << 8) | vga->cr[0x4d]) & 0xfff) * 1024;
     uint32_t colors[2] = { s->hwcursor_bg, s->hwcursor_fg };
     int i;
 
@@ -204,19 +253,10 @@ static void s3_vram_cursor_line(S3928State *s, uint32_t *pixels, int y,
     }
     for (i = 0; x + i < width && xoff + i * step < 64; i++) {
         unsigned col = xoff + i * step;
-        unsigned addr = base + row * 16 + (col / 16) * 4;
+        unsigned addr = s3_vram_cursor_addr(vga, row, col);
         unsigned bit = 7 - (col & 7);
         unsigned and_bit, xor_bit;
 
-        /* CR45.4 stores the masks at the right of 1280-pixel scanlines. */
-        if (vga->cr[0x45] & 0x10) {
-            if (vga->cr[0x3a] & 0x10) {
-                addr = (addr & ~0xe00) | ((addr & 0x200) << 2) | 0x600;
-            } else if ((vga->gr[5] & 0x60) == 0x20) {
-                addr = (addr & ~0xf00) | ((addr & 0x300) << 2) | 0x300;
-            }
-        }
-        addr += (col & 15) / 8;
         if (addr + 2 >= vga->vram_size) {
             continue;
         }
