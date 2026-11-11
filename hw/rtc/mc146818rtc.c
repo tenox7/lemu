@@ -656,6 +656,37 @@ static inline int rtc_from_bcd(MC146818RtcState *s, int a)
     }
 }
 
+/*
+ * Without a century byte the year register holds the years since
+ * base_year.  Past 99 its tens digit goes on past 9, the way OS/2 for
+ * PowerPC writes 2026 with base year 1900 (0xc6 for 126).  A year before
+ * base_year keeps only its last two digits (0x95 for 1995 with base year
+ * 2000), so two digits read back as the year from 1970 to 2069 that
+ * ends in them.
+ */
+static int rtc_year_to_reg(int year, int base_year)
+{
+    int v = year - base_year;
+
+    return v < 0 ? (v % 100 + 100) % 100 : v;
+}
+
+static int rtc_year_from_reg(MC146818RtcState *s)
+{
+    int v = s->cmos_data[RTC_YEAR];
+    int year;
+
+    /* not rtc_from_bcd(): from 0xc0 up these are years, not "don't care" */
+    if (!(s->cmos_data[RTC_REG_B] & REG_B_DM)) {
+        v = (v >> 4) * 10 + (v & 0x0f);
+    }
+    year = s->base_year + v;
+    if (v < 100) {
+        year = 1970 + ((year - 1970) % 100 + 100) % 100;
+    }
+    return year;
+}
+
 static void rtc_get_time(MC146818RtcState *s, struct tm *tm)
 {
     tm->tm_sec = rtc_from_bcd(s, s->cmos_data[RTC_SECONDS]);
@@ -670,12 +701,12 @@ static void rtc_get_time(MC146818RtcState *s, struct tm *tm)
     tm->tm_wday = rtc_from_bcd(s, s->cmos_data[RTC_DAY_OF_WEEK]) - 1;
     tm->tm_mday = rtc_from_bcd(s, s->cmos_data[RTC_DAY_OF_MONTH]);
     tm->tm_mon = rtc_from_bcd(s, s->cmos_data[RTC_MONTH]) - 1;
-    tm->tm_year =
-        rtc_from_bcd(s, s->cmos_data[RTC_YEAR]) + s->base_year - 1900;
     if (s->century_byte) {
-        tm->tm_year += rtc_from_bcd(s, s->cmos_data[RTC_CENTURY]) * 100;
-    } else if (tm->tm_year < 70) {
-        tm->tm_year += 100;
+        tm->tm_year = rtc_from_bcd(s, s->cmos_data[RTC_YEAR]) +
+                      rtc_from_bcd(s, s->cmos_data[RTC_CENTURY]) * 100 +
+                      s->base_year - 1900;
+    } else {
+        tm->tm_year = rtc_year_from_reg(s) - 1900;
     }
 }
 
@@ -710,10 +741,13 @@ static void rtc_set_cmos(MC146818RtcState *s, const struct tm *tm)
     s->cmos_data[RTC_DAY_OF_WEEK] = rtc_to_bcd(s, tm->tm_wday + 1);
     s->cmos_data[RTC_DAY_OF_MONTH] = rtc_to_bcd(s, tm->tm_mday);
     s->cmos_data[RTC_MONTH] = rtc_to_bcd(s, tm->tm_mon + 1);
-    year = tm->tm_year + 1900 - s->base_year;
-    s->cmos_data[RTC_YEAR] = rtc_to_bcd(s, s->century_byte ? year % 100 : year);
     if (s->century_byte) {
+        year = tm->tm_year + 1900 - s->base_year;
+        s->cmos_data[RTC_YEAR] = rtc_to_bcd(s, year % 100);
         s->cmos_data[RTC_CENTURY] = rtc_to_bcd(s, year / 100);
+    } else {
+        year = rtc_year_to_reg(tm->tm_year + 1900, s->base_year);
+        s->cmos_data[RTC_YEAR] = rtc_to_bcd(s, year);
     }
 }
 
