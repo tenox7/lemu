@@ -40,6 +40,8 @@
 #define POINTER_LOOP_MAX        300     /* closed-loop iterations */
 #define POINTER_POLL_MS         10
 #define POINTER_SETTLE_MS       150
+#define POINTER_IMAGE_HOLD_MS   60      /* a new cursor image holds this long */
+#define POINTER_IMAGE_SETTLE_MS 600     /* and settles in this time at most */
 #define POINTER_CAL_DIST        48      /* counts each step test covers */
 #define POINTER_CAL_SLACK       2       /* px two travels may differ */
 #define POINTER_CAL_MIN_PX      4       /* px the step test must travel */
@@ -798,30 +800,44 @@ static bool cursor_equal(const QemuCursorState *a, const QemuCursorState *b)
            a->shape == b->shape;
 }
 
-/* Sleep until the card's cursor moves away from @old and settles */
+/*
+ * Sleep until the card's cursor moves away from @old and settles: holds
+ * still for one poll.  A new image, or a cursor shown or hidden, must
+ * hold still longer, since the guest may load the image first and move
+ * it later.  NT 3.51 on the G364 loads it, then waits for the next frame
+ * (every 30 ms) before it moves it.
+ */
 static bool coroutine_fn pointer_co_await_cursor(QemuPointer *p,
                                                  QemuInputCtx *ctx,
                                                  const QemuCursorState *old,
                                                  QemuCursorState *cs)
 {
     bool moved = false;
-    int waited;
+    int waited = 0, still = 0;
 
-    for (waited = 0; waited < POINTER_SETTLE_MS; waited += POINTER_POLL_MS) {
-        QemuCursorState prev;
+    for (;;) {
+        QemuCursorState prev = *cs;
+        bool image;
 
         qemu_co_sleep_ns_wakeable(&ctx->sleep, QEMU_CLOCK_REALTIME,
                                   POINTER_POLL_MS * SCALE_MS);
         if (ctx->cancelled) {
             return false;
         }
-        prev = *cs;
+        waited += POINTER_POLL_MS;
         qemu_console_hw_cursor_state(p->con, cs);
-        if (moved && cursor_equal(&prev, cs)) {
-            break;          /* moved, then held still for one poll */
+        still = cursor_equal(&prev, cs) ? still + POINTER_POLL_MS : 0;
+        image = cs->shape != old->shape || cs->visible != old->visible;
+        if (moved &&
+            still >= (image ? POINTER_IMAGE_HOLD_MS : POINTER_POLL_MS)) {
+            break;          /* moved, then held still */
         }
         if (!cursor_equal(old, cs)) {
             moved = true;
+        }
+        if (waited >= (moved && image ? POINTER_IMAGE_SETTLE_MS :
+                                        POINTER_SETTLE_MS)) {
+            break;
         }
     }
     return moved;
