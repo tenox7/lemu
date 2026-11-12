@@ -569,7 +569,7 @@ static void m1543_superio_class_init(ObjectClass *klass, const void *data)
 static const TypeInfo m1543_superio_info = {
     .name          = TYPE_M1543_SUPERIO,
     .parent        = TYPE_ISA_SUPERIO,
-    .class_size    = sizeof(M1543SuperIOState),
+    .instance_size = sizeof(M1543SuperIOState),
     .instance_init = m1543_superio_initfn,
     .class_init    = m1543_superio_class_init,
 };
