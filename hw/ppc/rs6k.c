@@ -18,6 +18,7 @@
 #include "cpu.h"
 #include "system/address-spaces.h"
 #include "system/reset.h"
+#include "system/qtest.h"
 #include "system/system.h"
 #include "hw/ppc/rs6k_iocc.h"
 #include "hw/ppc/rs6k_sio.h"
@@ -996,7 +997,9 @@ static void rs6k_init(MachineState *machine)
     memory_region_add_subregion(sysmem, ROS_ADDR, &s->ros);
     s->ros_image = g_malloc0(ROS_SIZE);
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, fw);
-    if (!filename || load_image_size(filename, s->ros_image, ROS_SIZE) < 0) {
+    /* The ROS is not in the tree: qtest runs the machine without it */
+    if ((!filename || load_image_size(filename, s->ros_image, ROS_SIZE) < 0)
+        && !qtest_enabled()) {
         error_report("could not load ROS image '%s'", fw);
         exit(1);
     }
