@@ -4,6 +4,14 @@
 OpenBIOS. An idle guest uses 2 to 4% of a host core, the screen can be any
 size, and the keyboard and mouse behave like the real ones.
 
+## Kit
+
+[sunos414/run.sh](sunos414/run.sh) and [run.cmd](sunos414/run.cmd) start the
+kit `sunos414-lemu` (see [README.txt](sunos414/README.txt));
+[release/mkrelease.sh](release/mkrelease.sh) packs it from the one build of
+[../release](../release/README.md). They use LEMU's OpenBIOS and the disk
+`sunos414.qcow2` at SCSI target 0.
+
 ## Options
 
 | Option | What it does |
