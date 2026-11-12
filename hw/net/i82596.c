@@ -222,39 +222,83 @@ static void set_uint32(I82596State *s, uint32_t addr, uint32_t val)
     set_uint16(s, addr + 2, val >> 16);
 }
 
+/*
+ * Address fields of the SCB, command blocks and RX/TX descriptors.  In
+ * big-endian mode (SYSBUS BE, 82596CA) the chip reads them as 32-bit
+ * big-endian words; otherwise as two 16-bit halves, low half first.  The
+ * ISCP and SCB addresses and the SCB counters are always two halves.
+ * Big-endian mode puts the high half first and leaves each half in the
+ * board's byte order, which on a big-endian board is a 32-bit BE word.
+ */
+#define I596_SYSBUS_BE  0x80
+
+static uint32_t get_addr(I82596State *s, uint32_t addr)
+{
+    if (s->sysbus & I596_SYSBUS_BE) {
+        uint32_t hi = get_uint16(s, addr);
+        uint32_t lo = get_uint16(s, addr + 2);
+        return (hi << 16) | lo;
+    }
+    return get_uint32(s, addr);
+}
+
+static void set_addr(I82596State *s, uint32_t addr, uint32_t val)
+{
+    if (s->sysbus & I596_SYSBUS_BE) {
+        set_uint16(s, addr, val >> 16);
+        set_uint16(s, addr + 2, (uint16_t) val);
+    } else {
+        set_uint32(s, addr, val);
+    }
+}
+
+/* SCB error counters (linear mode), counted in memory like the chip does */
+#define SCB_CRC_ERRS        12
+#define SCB_ALIGN_ERRS      16
+#define SCB_RESOURCE_ERRS   20
+#define SCB_OVERRUN_ERRS    24
+#define SCB_RCVCDT_ERRS     28
+#define SCB_SHORT_ERRS      32
+
+static void i82596_count_error(I82596State *s, int offset)
+{
+    if (s->scb) {
+        set_uint32(s, s->scb + offset, get_uint32(s, s->scb + offset) + 1);
+    }
+}
+
 /* Centralized error detection and update mechanism */
 static void i82596_record_error(I82596State *s, uint16_t error_type, bool is_tx)
 {
     if (is_tx) {
         if (error_type & TX_ABORTED_ERRORS) {
             s->tx_aborted_errors++;
-            set_uint32(s, s->scb + 28, s->tx_aborted_errors);
         }
     } else {
         if (error_type & RX_CRC_ERRORS) {
             s->crc_err++;
-            set_uint32(s, s->scb + 16, s->crc_err);
+            i82596_count_error(s, SCB_CRC_ERRS);
         }
 
         if (error_type & (RX_LENGTH_ERRORS | RX_LENGTH_ERRORS_ALT |
                           RX_FRAME_ERRORS)) {
             s->align_err++;
-            set_uint32(s, s->scb + 18, s->align_err);
+            i82596_count_error(s, SCB_ALIGN_ERRS);
         }
 
         if (error_type & RFD_STATUS_NOBUFS) {
             s->resource_err++;
-            set_uint32(s, s->scb + 20, s->resource_err);
+            i82596_count_error(s, SCB_RESOURCE_ERRS);
         }
 
         if (error_type & (RX_OVER_ERRORS | RX_FIFO_ERRORS)) {
             s->over_err++;
-            set_uint32(s, s->scb + 22, s->over_err);
+            i82596_count_error(s, SCB_OVERRUN_ERRS);
         }
 
         if (error_type & RFD_STATUS_TRUNC) {
             s->short_fr_error++;
-            set_uint32(s, s->scb + 26, s->short_fr_error);
+            i82596_count_error(s, SCB_SHORT_ERRS);
         }
     }
 }
@@ -300,7 +344,6 @@ static void i82596_s_reset(I82596State *s)
     s->cu_status = CU_IDLE;
     s->rx_status = RX_IDLE;
     s->cmd_p = I596_NULL;
-    s->next_rbd = I596_NULL;
     s->lnkst = 0x8000;
     s->ca = s->ca_active = 0;
     s->send_irq = 0;
@@ -322,6 +365,13 @@ static void i82596_s_reset(I82596State *s)
     s->last_tx_len = 0;
 
     s->last_good_rfa = 0;
+    s->rbd_p = I596_NULL;
+    s->rx_take_el = false;
+    s->rfd_p = I596_NULL;
+    s->rx_hold_start = 0;
+    if (s->rx_retry_timer) {
+        timer_del(s->rx_retry_timer);
+    }
     s->queue_head = 0;
     s->queue_tail = 0;
     s->queue_count = 0;
@@ -441,8 +491,8 @@ static void i82596_tx_tfd_read(I82596State *s, hwaddr addr,
 {
     desc->status_bits = get_uint16(s, addr + 0);
     desc->command = get_uint16(s, addr + 2);
-    desc->link_addr = get_uint32(s, addr + 4);
-    desc->tbd_addr = get_uint32(s, addr + 8);
+    desc->link_addr = get_addr(s, addr + 4);
+    desc->tbd_addr = get_addr(s, addr + 8);
     desc->tcb_count = get_uint16(s, addr + 12);
     address_space_read(s->dma_as, addr + 14,
                       MEMTXATTRS_UNSPECIFIED, desc->dest_addr, 6);
@@ -454,8 +504,8 @@ static void i82596_tx_tfd_write(I82596State *s, hwaddr addr,
 {
     set_uint16(s, addr + 0, desc->status_bits);
     set_uint16(s, addr + 2, desc->command);
-    set_uint32(s, addr + 4, desc->link_addr);
-    set_uint32(s, addr + 8, desc->tbd_addr);
+    set_addr(s, addr + 4, desc->link_addr);
+    set_addr(s, addr + 8, desc->tbd_addr);
     set_uint16(s, addr + 12, desc->tcb_count);
     address_space_write(s->dma_as, addr + 14,
                        MEMTXATTRS_UNSPECIFIED, desc->dest_addr, 6);
@@ -466,8 +516,8 @@ static void i82596_tbd_read(I82596State *s, hwaddr addr,
                             struct i82596_tx_buffer_desc *tbd)
 {
     tbd->size = get_uint16(s, addr + 0);
-    tbd->link = get_uint32(s, addr + 4);
-    tbd->buffer = get_uint32(s, addr + 8);
+    tbd->link = get_addr(s, addr + 4);
+    tbd->buffer = get_addr(s, addr + 8);
 }
 
 static void i82596_rx_rfd_read(I82596State *s, hwaddr addr,
@@ -475,8 +525,8 @@ static void i82596_rx_rfd_read(I82596State *s, hwaddr addr,
 {
     desc->status_bits = get_uint16(s, addr + 0x0);
     desc->command = get_uint16(s, addr + 0x2);
-    desc->link = get_uint32(s, addr + 0x4);
-    desc->rbd_addr = get_uint32(s, addr + 0x8);
+    desc->link = get_addr(s, addr + 0x4);
+    desc->rbd_addr = get_addr(s, addr + 0x8);
     desc->actual_count = get_uint16(s, addr + 0xC);
     desc->size = get_uint16(s, addr + 0xE);
 
@@ -496,8 +546,8 @@ static void i82596_rx_desc_write(I82596State *s, hwaddr addr,
 
     if (write_full) {
         set_uint16(s, addr + 0x2, desc->command);
-        set_uint32(s, addr + 0x4, desc->link);
-        set_uint32(s, addr + 0x8, desc->rbd_addr);
+        set_addr(s, addr + 0x4, desc->link);
+        set_addr(s, addr + 0x8, desc->rbd_addr);
         set_uint16(s, addr + 0xE, desc->size);
 
         address_space_write(s->dma_as, addr + 0x10,
@@ -512,8 +562,8 @@ static void i82596_rbd_read(I82596State *s, hwaddr addr,
                             struct i82596_rx_buffer_desc *rbd)
 {
     rbd->actual_count = get_uint16(s, addr + 0x0);
-    rbd->next_rbd_addr = get_uint32(s, addr + 0x4);
-    rbd->buffer_addr = get_uint32(s, addr + 0x8);
+    rbd->next_rbd_addr = get_addr(s, addr + 0x4);
+    rbd->buffer_addr = get_addr(s, addr + 0x8);
     rbd->size = get_uint16(s, addr + 0xC);
 }
 
@@ -521,8 +571,8 @@ static void i82596_rbd_write(I82596State *s, hwaddr addr,
                              struct i82596_rx_buffer_desc *rbd)
 {
     set_uint16(s, addr + 0x0, rbd->actual_count);
-    set_uint32(s, addr + 0x4, rbd->next_rbd_addr);
-    set_uint32(s, addr + 0x8, rbd->buffer_addr);
+    set_addr(s, addr + 0x4, rbd->next_rbd_addr);
+    set_addr(s, addr + 0x8, rbd->buffer_addr);
     set_uint16(s, addr + 0xC, rbd->size);
 }
 
@@ -554,20 +604,15 @@ static int i82596_tx_copy_buffers(I82596State *s, hwaddr tfd_addr,
         total_len = frame_len;
 
     } else {
-        /*
-         * In flexible mode the first TCB byte count bytes of the frame sit in
-         * the TCB itself, after its 16 byte header, and the buffers of the TBD
-         * chain follow them. HP-UX 9 keeps the Ethernet header there.
-         */
-        uint16_t inline_len = desc->tcb_count & SIZE_MASK;
+        uint16_t tcb_len = desc->tcb_count & SIZE_MASK;
 
-        if (inline_len > sizeof(s->tx_buffer)) {
+        if (tcb_len > sizeof(s->tx_buffer)) {
             return -1;
         }
-        if (inline_len) {
+        if (tcb_len) {
             address_space_read(s->dma_as, tfd_addr + 16,
-                              MEMTXATTRS_UNSPECIFIED, s->tx_buffer, inline_len);
-            total_len = inline_len;
+                              MEMTXATTRS_UNSPECIFIED, s->tx_buffer, tcb_len);
+            total_len = tcb_len;
         }
 
         tbd_addr = desc->tbd_addr;
@@ -604,11 +649,6 @@ static int i82596_tx_copy_buffers(I82596State *s, hwaddr tfd_addr,
     return total_len;
 }
 
-/*
- * The frame goes to the net layer without the FCS, as from every other NIC:
- * the CRC the chip inserts belongs to the wire, and two more bytes make a
- * full-size frame too long for vmnet, which then drops it.
- */
 static int i82596_tx_process_frame(I82596State *s)
 {
     uint32_t total_len = s->tx_frame_len;
@@ -618,10 +658,6 @@ static int i82596_tx_process_frame(I82596State *s)
     }
 
     if (I596_NO_SRC_ADD_IN == 0 && total_len >= ETH_ALEN) {
-        /*
-         * The chip inserts its individual address after the destination
-         * address: the frame the driver supplies has no source address.
-         */
         if (total_len + ETH_ALEN > sizeof(s->tx_buffer)) {
             return 0;
         }
@@ -718,6 +754,7 @@ static void i82596_transmit(I82596State *s, uint32_t addr)
         success = false;
         goto tx_complete;
     }
+    /* QEMU net clients exchange frames without the FCS */
     frame_len = i82596_tx_process_frame(s);
     if (frame_len <= 0) {
         tx_status |= TX_ABORTED_ERRORS;
@@ -745,6 +782,95 @@ tx_complete:
     }
 }
 
+/*
+ * The RBD the RU fills next, or I596_NULL if none is free.  An RBD with EL
+ * set is the driver's last free buffer: leave it until the driver hands
+ * another one back, which moves EL on.  The chip would fill it and stop
+ * with no resources, which at QEMU speed keeps drivers in their overrun
+ * recovery (NetBSD iee marks every RBD EL there).
+ */
+static uint32_t i82596_next_rbd(I82596State *s)
+{
+    uint32_t rbd = s->rbd_p;
+
+    if (rbd == I596_NULL || rbd == 0) {
+        return I596_NULL;
+    }
+    if (!s->rx_take_el && (get_uint16(s, rbd + 0xC) & CMD_EOL)) {
+        return I596_NULL;
+    }
+    return rbd;
+}
+
+/* The next RFD (and, unless the RFD holds a whole frame, an RBD) is free. */
+static bool i82596_rx_ring_free(I82596State *s)
+{
+    uint32_t rbd;
+
+    if (s->rfd_p == I596_NULL || s->rfd_p == 0) {
+        return false;
+    }
+    /*
+     * The driver has not handed it back yet.  B alone is the mark of
+     * i82596_hold_rfd(): the RU holds this RFD for the next frame.
+     */
+    if (get_uint16(s, s->rfd_p) & STAT_C) {
+        return false;
+    }
+    if (!(get_uint16(s, s->rfd_p + 2) & CMD_FLEX) ||
+        (get_uint16(s, s->rfd_p + 0xE) & SIZE_MASK) >= PKT_BUF_SZ) {
+        return true;
+    }
+    rbd = i82596_next_rbd(s);
+    return rbd != I596_NULL && rbd != 0;
+}
+
+static bool i82596_rx_buffers_free(I82596State *s)
+{
+    if (i82596_rx_ring_free(s)) {
+        s->rx_hold_start = 0;
+        return true;
+    }
+    return false;
+}
+
+static void i82596_update_rx_state(I82596State *s, int new_state);
+
+/* Hold incoming frames while the ring is full; retry every 500 us. */
+static void i82596_rx_hold(I82596State *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!s->rx_hold_start) {
+        s->rx_hold_start = now;
+    }
+    timer_mod(s->rx_retry_timer, now + 500 * SCALE_US);
+}
+
+static void i82596_rx_retry(void *opaque)
+{
+    I82596State *s = opaque;
+
+    /*
+     * The driver has not handed a buffer back within 20 ms: behave like the
+     * chip.  Fill the last (EL) RBD if that is all that is left, otherwise
+     * report RU out of resources so the driver can rebuild its ring.
+     */
+    if (s->rx_hold_start && s->rx_status == RX_READY &&
+        !i82596_rx_buffers_free(s) &&
+        qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->rx_hold_start >
+            20 * SCALE_MS) {
+        s->rx_hold_start = 0;
+        s->rx_take_el = true;
+        if (!i82596_rx_buffers_free(s)) {
+            s->rx_take_el = false;
+            i82596_update_rx_state(s, RX_NO_RESOURCES);
+            i82596_update_scb_irq(s, true);
+        }
+    }
+    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+}
+
 bool i82596_can_receive(NetClientState *nc)
 {
     I82596State *s = qemu_get_nic_opaque(nc);
@@ -756,6 +882,15 @@ bool i82596_can_receive(NetClientState *nc)
     if (s->rx_status == RX_SUSPENDED || s->rx_status == RX_IDLE ||
         s->rx_status == RX_NO_RESOURCES) {
         return true;
+    }
+
+    /*
+     * A real 82596 cannot be overrun this fast at 10 Mbit/s; hold frames in
+     * the net queue while the driver catches up instead of dropping them.
+     */
+    if (s->rx_status == RX_READY && !i82596_rx_buffers_free(s)) {
+        i82596_rx_hold(s);
+        return false;
     }
 
     if (!s->throttle_state && !I596_FULL_DUPLEX) {
@@ -1025,9 +1160,10 @@ static ssize_t i82596_receive_packet(I82596State *s, const uint8_t *buf,
     size_t frame_size = size;
     size_t payload_size = 0;
     size_t bytes_copied = 0;
-    size_t rfd_count = 0;
     const uint8_t *packet_data = buf;
     bool out_of_resources = false;
+    bool rbds_exhausted = false;
+    size_t rfd_data_len = 0;
     size_t crc_size = i82596_get_crc_size(s);
 
     trace_i82596_receive_packet(buf, size);
@@ -1043,7 +1179,7 @@ static ssize_t i82596_receive_packet(I82596State *s, const uint8_t *buf,
     }
 
 
-    rfd_addr = get_uint32(s, s->scb + 8);
+    rfd_addr = s->rfd_p;
 
     if (rfd_addr == 0 || rfd_addr == I596_NULL) {
         i82596_update_rx_state(s, RX_NO_RESOURCES);
@@ -1099,7 +1235,6 @@ static ssize_t i82596_receive_packet(I82596State *s, const uint8_t *buf,
             if (payload_size > 0) {
                 bytes_copied = i82596_rx_copy_to_rfd(s, rfd_addr, packet_data,
                                                       payload_size, rfd_size);
-                rfd_count = bytes_copied;
             }
 
             i82596_rx_store_frame_header(s, &rfd, packet_data, frame_size);
@@ -1118,21 +1253,18 @@ static ssize_t i82596_receive_packet(I82596State *s, const uint8_t *buf,
                                     packet_data + bytes_copied,
                                     rfd_frame_size);
                 bytes_copied += rfd_frame_size;
-                rfd_count += rfd_frame_size;
+                rfd_data_len += rfd_frame_size;
             }
 
             if (bytes_copied < payload_size) {
                 size_t remaining = payload_size - bytes_copied;
-                rbd_addr = i82596_translate_address(s, rfd.rbd_addr, false);
-                /* the CPU may clear the pointer once the RU has fetched it */
-                if (rbd_addr == I596_NULL || rbd_addr == 0) {
-                    rbd_addr = s->next_rbd;
-                }
+                rbd_addr = i82596_next_rbd(s);
 
                 if (rbd_addr == I596_NULL || rbd_addr == 0) {
                     rx_status |= RFD_STATUS_TRUNC | RFD_STATUS_NOBUFS;
                     i82596_record_error(s, RFD_STATUS_NOBUFS, false);
                     packet_completed = true;
+                    rbds_exhausted = true;
                     break;
                 } else {
                     hwaddr remaining_rbd = I596_NULL;
@@ -1143,24 +1275,19 @@ static ssize_t i82596_receive_packet(I82596State *s, const uint8_t *buf,
                                             &out_of_resources,
                                             &remaining_rbd);
                     bytes_copied += rbd_bytes;
-                    s->next_rbd = remaining_rbd;
 
-                    uint32_t next_rfd = i82596_translate_address(s, rfd.link,
-                                                                  false);
-                    if (next_rfd != I596_NULL && next_rfd != 0) {
-                        if (remaining_rbd != I596_NULL && remaining_rbd != 0) {
-                            trace_i82596_rx_rfd_update(next_rfd, remaining_rbd);
-                            set_uint32(s, next_rfd + 8, remaining_rbd);
-                        } else {
-                            set_uint32(s, next_rfd + 8, I596_NULL);
-                        }
-                    }
+                    /* the RFD points at the first RBD holding its data */
+                    trace_i82596_rx_rfd_update(rfd_addr, rbd_addr);
+                    set_addr(s, rfd_addr + 8, rbd_addr);
+                    s->rbd_p = remaining_rbd;
+                    s->rx_take_el = false;
 
                     if (out_of_resources) {
                         trace_i82596_rx_out_of_rbds();
                         i82596_record_error(s, RFD_STATUS_NOBUFS, false);
                         rx_status |= RFD_STATUS_TRUNC | RFD_STATUS_NOBUFS;
                         packet_completed = true;
+                        rbds_exhausted = true;
                         break;
                     }
 
@@ -1208,9 +1335,17 @@ rx_complete:
     }
 
     rfd.status_bits = rx_status & ~STAT_B;
-    rfd.actual_count = (rfd_count & 0x3FFF) | 0x4000;
-    if (packet_completed && rfd_count == bytes_copied) {
-        rfd.actual_count |= I596_EOF;
+    if (simplified_mode) {
+        rfd.actual_count = (bytes_copied & 0x3FFF) | 0x4000;
+        if (packet_completed) {
+            rfd.actual_count |= I596_EOF;
+        }
+    } else {
+        /* the RBDs carry their own counts and the EOF of a split frame */
+        rfd.actual_count = (rfd_data_len & 0x3FFF) | 0x4000;
+        if (packet_completed && rfd_data_len == bytes_copied) {
+            rfd.actual_count |= I596_EOF;
+        }
     }
 
     /*
@@ -1220,38 +1355,27 @@ rx_complete:
      */
     i82596_rx_desc_write(s, rfd_addr, &rfd, simplified_mode);
 
-    /*
-     * After the RFD marked EL or S the RU stops, and says so with FR for
-     * the frame, RNR and an interrupt. Without the interrupt the driver
-     * never learnt of either, and receiving stopped for good.
-     */
-    if (rfd.command & (CMD_SUSP | CMD_EOL)) {
-        if (packet_completed) {
-            s->scb_status |= SCB_STATUS_FR;
-        }
-        i82596_update_rx_state(s, RX_SUSPENDED);
-        i82596_update_scb_irq(s, true);
-        return size;
-    }
-
-    if (packet_completed && s->rx_status == RX_READY) {
-        uint32_t next_rfd_addr = i82596_translate_address(s, rfd.link, false);
-        if (next_rfd_addr != 0 && next_rfd_addr != I596_NULL) {
-            set_uint32(s, s->scb + 8, next_rfd_addr);
-            i82596_hold_rfd(s, next_rfd_addr);
-        }
-
+    if (packet_completed) {
+        s->rfd_p = i82596_translate_address(s, rfd.link, false);
         s->scb_status |= SCB_STATUS_FR;
-        i82596_update_scb_irq(s, true);
+        if (!(rfd.command & (CMD_SUSP | CMD_EOL)) &&
+            s->rx_status == RX_READY &&
+            s->rfd_p != 0 && s->rfd_p != I596_NULL) {
+            i82596_hold_rfd(s, s->rfd_p);
+        }
     }
-
-    /*
-     * Out of receive buffers: the RU leaves the ready state and says so
-     * with RNR, and the driver starts it again with fresh RBDs. Staying
-     * ready lost every frame longer than the RFD's own data area for good.
-     */
-    if (rx_status & RFD_STATUS_NOBUFS) {
+    if (rfd.command & (CMD_SUSP | CMD_EOL)) {
+        i82596_update_rx_state(s, RX_SUSPENDED);
+    } else if (rbds_exhausted) {
         i82596_update_rx_state(s, RX_NO_RESOURCES);
+    }
+    /*
+     * An RU that stops after an RFD with EL or S says so with RNR and an
+     * interrupt, also for a frame it did not complete: without it the
+     * driver never learnt that the RU had stopped.
+     */
+    if (packet_completed || rbds_exhausted ||
+        (rfd.command & (CMD_SUSP | CMD_EOL))) {
         i82596_update_scb_irq(s, true);
     }
     trace_i82596_rx_complete(s->crc_err, s->align_err, s->resource_err);
@@ -1273,8 +1397,6 @@ ssize_t i82596_receive(NetClientState *nc, const uint8_t *buf, size_t size)
     if (s->rx_status != RX_READY) {
         if (s->queue_count >= PACKET_QUEUE_SIZE) {
             trace_i82596_receive_queue_full();
-            s->over_err++;
-            set_uint32(s, s->scb + 22, s->over_err);
             i82596_record_error(s, RX_OVER_ERRORS, false);
             return size;
         }
@@ -1286,6 +1408,11 @@ queue_packet:
             s->queue_count++;
         }
         return size;
+    }
+
+    if (!i82596_rx_buffers_free(s)) {
+        i82596_rx_hold(s);
+        return 0;
     }
 
     return i82596_receive_packet(s, buf, size, false);
@@ -1421,23 +1548,19 @@ static void i82596_update_statistics(I82596State *s, bool is_tx,
             s->tx_collisions += collision_count;
             s->collision_events++;
             s->total_collisions += collision_count;
-            set_uint32(s, s->scb + 32, s->tx_collisions);
         }
         if (error_flags) {
             i82596_record_error(s, error_flags, true);
         }
         if (!(error_flags & (TX_ABORTED_ERRORS | TX_CARRIER_ERRORS))) {
             s->tx_good_frames++;
-            set_uint32(s, s->scb + 36, s->tx_good_frames);
         }
     } else {
         s->total_frames++;
-        set_uint32(s, s->scb + 40, s->total_frames);
         if (error_flags) {
             i82596_record_error(s, error_flags, false);
         } else {
             s->total_good_frames++;
-            set_uint32(s, s->scb + 44, s->total_good_frames);
         }
     }
 }
@@ -1595,7 +1718,7 @@ static void i82596_command_dump(I82596State *s, uint32_t cmd_addr)
     uint16_t cmd = get_uint16(s, cmd_addr + 2);
     uint16_t status;
 
-    dump_addr = get_uint32(s, cmd_addr + 8);
+    dump_addr = get_addr(s, cmd_addr + 8);
 
     i82596_init_dump_area(s, dump_buffer);
     address_space_write(s->dma_as, dump_addr,
@@ -1688,17 +1811,6 @@ static void update_scb_status(I82596State *s)
     s->scb_status = (s->scb_status & 0xf000)
         | (s->cu_status << 8) | (s->rx_status << 4);
     set_uint16(s, s->scb, s->scb_status);
-
-    set_uint32(s, s->scb + 28, s->tx_aborted_errors);
-    set_uint32(s, s->scb + 32, s->tx_collisions);
-    set_uint32(s, s->scb + 36, s->tx_good_frames);
-
-    set_uint32(s, s->scb + 16, s->crc_err);
-    set_uint32(s, s->scb + 18, s->align_err);
-    set_uint32(s, s->scb + 20, s->resource_err);
-    set_uint32(s, s->scb + 22, s->over_err);
-    set_uint32(s, s->scb + 24, s->rcvdt_err);
-    set_uint32(s, s->scb + 26, s->short_fr_error);
 }
 
 static void command_loop(I82596State *s)
@@ -1707,11 +1819,12 @@ static void command_loop(I82596State *s)
            s->cmd_p != 0) {
         uint16_t status = get_uint16(s, s->cmd_p);
         if (status & (STAT_C | STAT_B)) {
-            uint32_t next = get_uint32(s, s->cmd_p + 4);
+            uint32_t next = get_addr(s, s->cmd_p + 4);
             if (next == 0 || next == s->cmd_p) {
                 s->cmd_p = I596_NULL;
                 s->cu_status = CU_IDLE;
                 s->scb_status |= SCB_STATUS_CNA;
+                s->send_irq = 1;
                 break;
             }
             s->cmd_p = i82596_translate_address(s, next, false);
@@ -1719,7 +1832,7 @@ static void command_loop(I82596State *s)
         }
         set_uint16(s, s->cmd_p, STAT_B);
         uint16_t cmd = get_uint16(s, s->cmd_p + 2);
-        uint32_t next_addr = get_uint32(s, s->cmd_p + 4);
+        uint32_t next_addr = get_addr(s, s->cmd_p + 4);
         next_addr = (next_addr == 0) ? I596_NULL :
                     i82596_translate_address(s, next_addr, false);
         switch (cmd & CMD_MASK) {
@@ -1763,11 +1876,6 @@ skip_status_update:
 
         bool stop = false;
 
-        /*
-         * A CU that leaves the active state sets CNA and asserts INT, even
-         * when the command that ended the list had no I bit: HP-UX 9 sends
-         * its frames as a single EL command and waits for this interrupt.
-         */
         if (cmd & CMD_SUSP) {
             s->cu_status = CU_SUSPENDED;
             s->scb_status |= SCB_STATUS_CNA;
@@ -1830,7 +1938,7 @@ static void examine_scb(I82596State *s)
         break;
 
     case SCB_CUC_START: {
-        uint32_t cmd_ptr = get_uint32(s, s->scb + 4);
+        uint32_t cmd_ptr = get_addr(s, s->scb + 4);
         s->cmd_p = i82596_translate_address(s, cmd_ptr, false);
         s->cu_status = CU_ACTIVE;
         break;
@@ -1869,7 +1977,7 @@ static void examine_scb(I82596State *s)
         break;
 
     case SCB_RUC_START: {
-        uint32_t rfd_log = get_uint32(s, s->scb + 8);
+        uint32_t rfd_log = get_addr(s, s->scb + 8);
         hwaddr rfd = i82596_translate_address(s, rfd_log, false);
 
         if (rfd == 0 || rfd == I596_NULL) {
@@ -1894,7 +2002,6 @@ static void examine_scb(I82596State *s)
                 hwaddr rbd = i82596_translate_address(s, test_rfd.rbd_addr,
                                                       false);
                 if (rbd != I596_NULL && rbd != 0) {
-                    s->next_rbd = rbd;
                     first_usable_rfd = test_rfd_addr;
                     first_usable_rfd_log = test_rfd_log;
                     found = true;
@@ -1909,12 +2016,11 @@ static void examine_scb(I82596State *s)
         if (found) {
             s->current_rx_desc = first_usable_rfd;
             s->last_good_rfa = first_usable_rfd_log;
+            s->rbd_p = i82596_translate_address(s, test_rfd.rbd_addr, false);
+            s->rx_take_el = false;
+            s->rfd_p = first_usable_rfd;
             i82596_update_rx_state(s, RX_READY);
             i82596_hold_rfd(s, first_usable_rfd);
-
-            if (first_usable_rfd != rfd) {
-                set_uint32(s, s->scb + 8, first_usable_rfd_log);
-            }
 
             if (s->queue_count > 0) {
                 trace_i82596_flush_queue(s->queue_count);
@@ -1957,7 +2063,7 @@ static void examine_scb(I82596State *s)
     }
     if (s->cu_status == CU_ACTIVE) {
         if (s->cmd_p == I596_NULL) {
-            s->cmd_p = get_uint32(s, s->scb + 4);
+            s->cmd_p = get_addr(s, s->scb + 4);
         }
         update_scb_status(s);
         command_loop(s);
@@ -2100,18 +2206,37 @@ void i82596_poll(NetClientState *nc, bool enable)
 }
 
 /*
+ * Version 1 had no RFD pointer: the RU kept it in the RFA field of the SCB,
+ * where the snapshot still has it.
+ */
+static int i82596_init_state_post_load(void *opaque, int version_id)
+{
+    I82596State *s = opaque;
+
+    if (version_id < 2 && s->scb) {
+        s->rfd_p = i82596_translate_address(s, get_addr(s, s->scb + 8),
+                                            false);
+    }
+    return 0;
+}
+
+/*
  * State that the first version of this description left out.  Without SCP
  * the next channel attention after a load sees the reset default, runs the
  * chip initialisation on garbage and loses the SCB address.  A subsection
- * keeps older snapshots loadable.
+ * keeps older snapshots loadable.  Version 1 saved the RBD pointer as a
+ * 64-bit next_rbd; rbd_p is its low half, after four bytes that were zero.
  */
 static const VMStateDescription vmstate_i82596_init_state = {
     .name = "i82596/init_state",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
+    .post_load = i82596_init_state_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64(scp, I82596State),
-        VMSTATE_UINT64(next_rbd, I82596State),
+        VMSTATE_UNUSED(4),
+        VMSTATE_UINT32(rbd_p, I82596State),
+        VMSTATE_UINT32_V(rfd_p, I82596State, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -2126,12 +2251,24 @@ static int i82596_post_load(void *opaque, int version_id)
     s->queue_count = 0;
     s->flushing_queue = false;
 
+    /*
+     * Nor is a frame hold.  A start time left from before the load can lie
+     * ahead of the restored clock and keep the 20 ms timeout from firing.
+     */
+    s->rx_hold_start = 0;
+    s->rx_take_el = false;
+
     if (s->nic) {
         qemu_flush_queued_packets(qemu_get_queue(s->nic));
     }
     return 0;
 }
 
+/*
+ * This stays at version 1: lasi_82596 embeds it with VMSTATE_STRUCT, which
+ * loads it with its current version, so a field added here would break the
+ * snapshots already saved.  New state goes into the subsection.
+ */
 const VMStateDescription vmstate_i82596 = {
     .name = "i82596",
     .version_id = 1,
@@ -2205,6 +2342,13 @@ static int i82596_flush_packet_queue(I82596State *s)
         int tail = s->queue_tail;
         size_t len = s->packet_queue_len[tail];
 
+        if (s->rx_status == RX_READY && !i82596_rx_buffers_free(s)) {
+            i82596_rx_hold(s);
+            timer_mod(s->flush_queue_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 500 * SCALE_US);
+            break;
+        }
+
         ssize_t ret = i82596_receive_packet(s, s->packet_queue[tail], len,
                                              true);
 
@@ -2254,6 +2398,8 @@ void i82596_common_init(DeviceState *dev, I82596State *s, NetClientInfo *info)
     s->nic = qemu_new_nic(info, &s->conf, object_get_typename(OBJECT(dev)),
                 dev->id, &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
+
+    s->rx_retry_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, i82596_rx_retry, s);
 
     if (USE_TIMER) {
         if (!s->flush_queue_timer) {

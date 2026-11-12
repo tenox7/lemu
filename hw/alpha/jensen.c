@@ -14,6 +14,7 @@
 #include "qemu/log.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/visitor.h"
 #include "hw/core/boards.h"
 #include "hw/block/flash.h"
@@ -1121,7 +1122,7 @@ static void jensen_class_init(ObjectClass *oc, const void *data)
                                    jensen_set_s3_928);
     object_class_property_set_description(oc, "s3-928",
         "Experimental ISA S3 86C928 graphics (default: off)");
-    object_class_property_add(oc, "s3-vram-mb", "uint32",
+    object_class_property_add(oc, "s3-vram-mb", "uint32", &uint32_type_info,
                               jensen_get_s3_vram_mb, jensen_set_s3_vram_mb,
                               NULL, NULL);
     object_class_property_set_description(oc, "s3-vram-mb",
