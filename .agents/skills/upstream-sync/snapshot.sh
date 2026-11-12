@@ -67,7 +67,9 @@ import json
 with open('meson-logs/testlog-slow.json') as f:
     for line in f:
         t = json.loads(line)
-        print(t['name'].split(' / ')[-1], t['result'])
+        # "SUITES / NAME" or "SUITES - NAME", depending on the meson version
+        name = t['name'].split(' / ')[-1].split(' - ')[-1]
+        print(name.removeprefix('qemu:'), t['result'])
 EOF
     LC_ALL=C sort "tests-$label.unsorted" >"tests-$label.txt"
     rm -f "tests-$label.unsorted"
