@@ -1,6 +1,6 @@
 # One build for all kits
 
-These scripts build QEMU once for all the kits: the seven binaries the
+These scripts build QEMU once for all the kits: the eight binaries the
 kits use, for macOS, Linux and Windows. Each machine's own `release/`
 folder then packs its kits from that one build. Without them, each of
 the five release folders builds its own QEMU, so a full set of kits
@@ -16,6 +16,7 @@ compiles the same code 15 times, with slightly different features.
 | qemu-system-mips64 | sinixn545 | `../rm200/release/pack.sh` |
 | qemu-system-hppa | hpux1020b160l, hpux905-715, hpux907-715, hpux11v1b160l | `../hppa/release/mkrelease.sh` |
 | qemu-system-i386 | nt351x86 | `../pc/release/pack.sh` |
+| qemu-system-sparc | sunos414 (the kit is `sunos414-lemu.tar.gz`) | `../sun4m/release/mkrelease.sh` |
 
 Run them on an Apple Silicon Mac with Homebrew and Docker. The Linux and
 Windows builds run in Docker.
@@ -35,7 +36,8 @@ commit.
 - `OUT/rc` must show exit code 0 for all four. The logs are in
   `OUT/*.log`.
 - Each binary has every feature that any of the five machine builds had.
-  qemu-system-hppa and qemu-system-i386 get the same set.
+  qemu-system-hppa, qemu-system-i386 and qemu-system-sparc get the same
+  set.
 - `build-mac.sh` prints the oldest macOS the binaries run on
   (`needs macOS ...`). The kit READMEs must say the same.
 
@@ -56,8 +58,8 @@ what each binary has in `OUT/macos-*.features` and
 
     sh stage.sh OUT STAGE
 
-`stage.sh` makes `STAGE` new. `STAGE/i386`, `STAGE/ppc`, `STAGE/ppc64`, `STAGE/alpha`
-and `STAGE/hppa` each hold only their own binary. `STAGE/mips` has the
+`stage.sh` makes `STAGE` new. `STAGE/i386`, `STAGE/ppc`, `STAGE/ppc64`, `STAGE/alpha`,
+`STAGE/hppa` and `STAGE/sparc` each hold only their own binary. `STAGE/mips` has the
 folder names that `rm200/release/pack.sh` wants. Give the pack scripts
 these folders in place of their own build, for example:
 
@@ -71,17 +73,20 @@ these folders in place of their own build, for example:
     sh ../hppa/release/mkrelease.sh hpux905 VMDIR STAGE/hppa hpux905-715-qemu.tar.lz
     sh ../hppa/release/mkrelease.sh hpux907 VMDIR STAGE/hppa hpux907-715-qemu.tar.lz
     sh ../hppa/release/mkrelease.sh hpux11v1 VMDIR STAGE/hppa hpux11v1b160l-qemu.tar.lz
+    sh ../sun4m/release/mkrelease.sh sunos414 VMDIR STAGE/sparc sunos414-lemu.tar.gz
 
 - `VMDIR`, `SRCDIR` and `KITDIR` hold the guest files: disk, NVRAM and
   firmware. See each machine's notes.
 - Pack one kit at a time: each pack runs `plzip -9`, which uses all
-  cores.
+  cores. The SunOS pack script takes `.tar.gz` or `.tar.lz` and names the
+  kit's folder after the file.
 
 ## Test
 
 - Boot each kit on the Mac. Move the mouse, click something, check that
   the monitor answers, and look at every screen, not only the main one.
 - Linux: `../rm200/release/ltest.sh`, `../jensen/release/ltest.sh` and,
-  for the PowerPC kits, `ltest-ppc.sh amd64|arm64 KITCOPY BINARY`. Use
+  for the PowerPC, HP-UX and SunOS kits,
+  `ltest-ppc.sh amd64|arm64 KITCOPY BINARY`. Use
   copies of the unpacked kits: a boot writes to the disk.
 - The Windows build is not run.
