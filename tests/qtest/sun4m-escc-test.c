@@ -8,7 +8,8 @@
  * must show both, and the interrupt must stay up until both are read and
  * go down then. Each key must give one code when it goes down and one when
  * it comes up, also Caps Lock and a key that the host repeats, and the
- * mouse must send whole packets of five bytes.
+ * mouse must send whole packets of five bytes. A channel reset must take
+ * the interrupt down.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -28,6 +29,7 @@
 #define KBD_MS_IRQ      (1 << 14)
 
 #define WR1_RXINTALL    0x10
+#define WR9_RESET_A     0x80
 
 #define RR3_RXINTA      0x20
 #define RR3_RXINTB      0x04
@@ -235,6 +237,23 @@ static void test_mouse_packets(void)
     qtest_quit(qts);
 }
 
+static void test_channel_reset(void)
+{
+    QTestState *qts = start();
+
+    key(qts, "x", true);
+    g_assert_true(irq(qts));
+    g_assert_cmphex(rreg(qts, KBD_CTRL, 3), ==, RR3_RXINTA);
+
+    /* The guest resets channel A: the key code and its interrupt are gone */
+    wreg(qts, KBD_CTRL, 9, WR9_RESET_A);
+    g_assert_false(irq(qts));
+    g_assert_cmphex(rreg(qts, KBD_CTRL, 3), ==, 0);
+    g_assert_cmphex(rreg(qts, MS_CTRL, 2), ==, RR2_NOINT);
+
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -242,6 +261,7 @@ int main(int argc, char **argv)
     qtest_add_func("/sun4m/escc/kbd-and-mouse", test_kbd_and_mouse);
     qtest_add_func("/sun4m/escc/keys", test_keys);
     qtest_add_func("/sun4m/escc/mouse-packets", test_mouse_packets);
+    qtest_add_func("/sun4m/escc/channel-reset", test_channel_reset);
 
     return g_test_run();
 }

@@ -421,6 +421,9 @@ static void escc_soft_reset_chn(ESCCChannelState *s)
     s->rregs[R_SPEC] |= SPEC_BITS8;
     s->rregs[R_INTR] = 0;
     s->rregs[R_MISC] &= MISC_2CLKMISS;
+
+    /* What was pending is gone with the reset */
+    escc_update_irq(s);
 }
 
 static void escc_hard_reset_chn(ESCCChannelState *s)
