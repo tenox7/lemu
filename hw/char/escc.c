@@ -195,6 +195,7 @@
 
 static uint8_t sunkbd_layout_dip_switch(const char *sunkbd_layout);
 static void handle_kbd_command(ESCCChannelState *s, int val);
+static void sunmouse_send(ESCCChannelState *s);
 static int serial_can_receive(void *opaque);
 static void serial_receive_byte(ESCCChannelState *s, int ch);
 
@@ -250,6 +251,9 @@ static uint32_t get_queue(void *opaque)
     trace_escc_get_queue(CHN_C(s), val);
     if (q->count > 0) {
         serial_receive_byte(s, 0);
+    } else if (s->type == escc_mouse) {
+        /* The guest has caught up: send the motion that was held back */
+        sunmouse_send(s);
     }
     return val;
 }
@@ -1018,15 +1022,32 @@ static void sunmouse_handle_event(DeviceState *dev, QemuConsole *src,
     }
 }
 
-static void sunmouse_sync(DeviceState *dev)
+/* MSC protocol: a start byte with the buttons, then two pairs of motion */
+#define SUNMOUSE_PACKET 5
+
+/*
+ * Send the motion and the buttons as one packet. While the guest has two
+ * packets or more to read, motion alone waits and adds up, so a burst of
+ * host events can't fill the queue and leave the pointer behind the mouse.
+ * get_queue() sends what waited, and what did not fit in one packet, once
+ * the guest has read everything.
+ */
+static void sunmouse_send(ESCCChannelState *s)
 {
-    ESCCChannelState *s = (ESCCChannelState *)dev;
     int ch;
 
     if (s->sunmouse_dx == 0 && s->sunmouse_dy == 0 &&
         (s->sunmouse_buttons & 0x80) == 0) {
-            /* Nothing to do after button event filter */
-            return;
+        /* Nothing to do after button event filter */
+        return;
+    }
+    if (s->queue.count > ESCC_SERIO_QUEUE_SIZE - SUNMOUSE_PACKET) {
+        /* Half a packet would put the guest out of step with the stream */
+        return;
+    }
+    if ((s->sunmouse_buttons & 0x80) == 0 &&
+        s->queue.count >= 2 * SUNMOUSE_PACKET) {
+        return;
     }
 
     /* Clear our button event flag */
@@ -1037,27 +1058,25 @@ static void sunmouse_sync(DeviceState *dev)
     ch ^= s->sunmouse_buttons;
     put_queue(s, ch);
 
-    ch = s->sunmouse_dx;
-    if (ch > 127) {
-        ch = 127;
-    } else if (ch < -127) {
-        ch = -127;
-    }
+    ch = MAX(-127, MIN(127, s->sunmouse_dx));
     put_queue(s, ch & 0xff);
     s->sunmouse_dx -= ch;
 
-    ch = s->sunmouse_dy;
-    if (ch > 127) {
-        ch = 127;
-    } else if (ch < -127) {
-        ch = -127;
-    }
+    ch = MAX(-127, MIN(127, s->sunmouse_dy));
     put_queue(s, ch & 0xff);
     s->sunmouse_dy -= ch;
 
-    /* MSC protocol specifies two extra motion bytes */
+    /*
+     * The second pair stays empty: SunOS adds both pairs of a packet in
+     * one signed byte and stops at 127, so it would lose what is more.
+     */
     put_queue(s, 0);
     put_queue(s, 0);
+}
+
+static void sunmouse_sync(DeviceState *dev)
+{
+    sunmouse_send((ESCCChannelState *)dev);
 }
 
 static const QemuInputHandler sunmouse_handler = {
