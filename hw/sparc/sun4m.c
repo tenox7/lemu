@@ -87,6 +87,10 @@
 #define MAX_PILS 16
 #define MAX_VSIMMS 4
 
+/* A real cg3 has 1 MB of video RAM; its SBus slot has room for 8 MB */
+#define CG3_VRAM_SIZE        (1 * MiB)
+#define CG3_MAX_VRAM_SIZE    (8 * MiB)
+
 #define ESCC_CLOCK 4915200
 
 struct sun4m_hwdef {
@@ -918,15 +922,26 @@ static void sun4m_hw_init(MachineState *machine)
                 exit(1);
             }
 
-            if (!(graphic_width == 1024 && graphic_height == 768) &&
-                !(graphic_width == 1152 && graphic_height == 900)) {
-                error_report("Unsupported resolution: %d x %d", graphic_width,
-                             graphic_height);
+            /*
+             * A real cg3 has 1 MB of video RAM, for 1152 x 900. The frame
+             * buffer starts in the middle of the 16 MB of its slot, so
+             * there is room for 8 MB. The guest takes the size from the
+             * properties that the card's FCode gives it, and so SunOS 4
+             * runs screens of other sizes too.
+             */
+            if (graphic_width < 640 || graphic_height < 480 ||
+                graphic_width % 8 ||
+                graphic_width * graphic_height > CG3_MAX_VRAM_SIZE) {
+                error_report("Unsupported resolution: %d x %d (640 x 480 or "
+                             "more, 8 MB of pixels at most, and a width that "
+                             "8 divides)", graphic_width, graphic_height);
                 exit(1);
             }
 
             /* sbus irq 5 */
-            cg3_init(hwdef->tcx_base, slavio_irq[11], 0x00100000,
+            cg3_init(hwdef->tcx_base, slavio_irq[11],
+                     MAX(CG3_VRAM_SIZE,
+                         ROUND_UP(graphic_width * graphic_height, MiB)),
                      graphic_width, graphic_height, graphic_depth);
             vga_interface_created = true;
         } else {

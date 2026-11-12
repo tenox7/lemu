@@ -161,7 +161,8 @@ static void cg3_invalidate_display(void *opaque)
 {
     CG3State *s = opaque;
 
-    memory_region_set_dirty(&s->vram_mem, 0, CG3_VRAM_SIZE);
+    memory_region_set_dirty(&s->vram_mem, 0,
+                            memory_region_size(&s->vram_mem));
 }
 
 static uint64_t cg3_reg_read(void *opaque, hwaddr addr, unsigned size)
@@ -285,6 +286,12 @@ static void cg3_realizefn(DeviceState *dev, Error **errp)
     CG3State *s = CG3(dev);
     int ret;
     char *fcode_filename;
+
+    if ((uint64_t)s->width * s->height > s->vram_size) {
+        error_setg(errp, "cg3: %u x %u does not fit in %u bytes of video RAM",
+                   s->width, s->height, s->vram_size);
+        return;
+    }
 
     memory_region_init_rom(&s->rom, obj, "cg3.prom", FCODE_MAX_ROM_SIZE,
                            &error_fatal);
