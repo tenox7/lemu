@@ -58,12 +58,13 @@ EOF
     # shellcheck disable=SC2086
     echo "qtests: running $(echo $tests | wc -w | tr -d ' ') tests, this takes a while"
     # a stale log from the last run must not count as this run
-    rm -f meson-logs/testlog.json
+    rm -f meson-logs/testlog-slow.json
+    # QEMU puts these in its "slow" suite, which the default setup skips
     # shellcheck disable=SC2086
-    ./run meson test --print-errorlogs $tests >"tests-$label.log" 2>&1
+    ./run meson test --setup slow --print-errorlogs $tests >"tests-$label.log" 2>&1
     "$py" - <<'EOF' >"tests-$label.unsorted" || die "no test results: see tests-$label.log"
 import json
-with open('meson-logs/testlog.json') as f:
+with open('meson-logs/testlog-slow.json') as f:
     for line in f:
         t = json.loads(line)
         print(t['name'].split(' / ')[-1], t['result'])
