@@ -777,6 +777,19 @@ static const TypeInfo ram_info = {
     .class_init    = ram_class_init,
 };
 
+/* Halt the CPU in the SunOS 4.1.4 idle loop, see target/sparc/sunos_idle.c */
+static bool sun4m_sunos_idle = true;
+
+static bool sun4m_get_sunos_idle(Object *obj, Error **errp)
+{
+    return sun4m_sunos_idle;
+}
+
+static void sun4m_set_sunos_idle(Object *obj, bool value, Error **errp)
+{
+    sun4m_sunos_idle = value;
+}
+
 static DeviceState *cpu_devinit(const char *cpu_type, unsigned int id,
                                 uint64_t prom_addr)
 {
@@ -832,6 +845,8 @@ static void sun4m_hw_init(MachineState *machine)
     /* init CPUs */
     for(i = 0; i < smp_cpus; i++) {
         cpus[i] = cpu_devinit(machine->cpu_type, i, hwdef->slavio_base);
+        /* With more CPUs, one gives another work without an interrupt */
+        SPARC_CPU(cpus[i])->env.sunos_idle = sun4m_sunos_idle && smp_cpus == 1;
     }
 
     /* Create and map RAM frontend */
@@ -1109,6 +1124,12 @@ static void sun4m_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_boot_order = "c";
     mc->default_display = "tcx";
     mc->default_ram_id = "sun4m.ram";
+
+    object_class_property_add_bool(oc, "sunos-idle", sun4m_get_sunos_idle,
+                                   sun4m_set_sunos_idle);
+    object_class_property_set_description(oc, "sunos-idle",
+        "Halt the CPU while SunOS 4.1.4 is idle, instead of spinning "
+        "(default: on)");
 }
 
 static void ss5_class_init(ObjectClass *oc, const void *data)
