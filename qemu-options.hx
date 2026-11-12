@@ -2596,9 +2596,9 @@ SRST
 
     ``cg3``
         (sun4m only) Sun cgthree framebuffer. This is a simple 8-bit
-        framebuffer for sun4m machines available in both 1024x768
-        (OpenBIOS) and 1152x900 (OBP) resolutions aimed at people
-        wishing to run older Solaris versions.
+        framebuffer for sun4m machines, aimed at people wishing to run
+        SunOS 4 and older Solaris versions. Its resolution is 1024x768
+        unless ``-g`` gives another one.
 
     ``virtio``
         Virtio VGA card.
@@ -2625,8 +2625,9 @@ SRST
 
     For SPARC with the TCX graphics device, the default is 1024x768x8
     with the option of 1024x768x24. For cgthree, the default is
-    1024x768x8 with the option of 1152x900x8 for people who wish to use
-    OBP.
+    1024x768x8, and any other size from 640x480 up to 8 MB of pixels
+    works with a width that 8 divides, such as 1152x900x8 or
+    1920x1080x8.
 ERST
 
 #ifdef CONFIG_VNC
