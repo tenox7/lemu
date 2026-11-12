@@ -218,7 +218,8 @@ qtests_sh4 = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-te
    config_all_devices.has_key('CONFIG_R2D') ? ['pflash-cfi02-test'] : [])
 qtests_sh4eb = (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : [])
 
-qtests_sparc = ['prom-env-test', 'm48t59-test', 'boot-serial-test'] + \
+qtests_sparc = ['prom-env-test', 'm48t59-test', 'boot-serial-test',
+                'sun4m-escc-test'] + \
   qtests_filter
 
 qtests_sparc64 = \
