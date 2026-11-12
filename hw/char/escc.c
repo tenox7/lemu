@@ -254,28 +254,122 @@ static uint32_t get_queue(void *opaque)
     return val;
 }
 
-static int escc_update_irq_chn(ESCCChannelState *s)
+/* rx ints enabled, pending */
+static bool escc_rx_ip(ESCCChannelState *s)
 {
-    if ((((s->wregs[W_INTR] & INTR_TXINT) && (s->txint == 1)) ||
-        /* tx ints enabled, pending */
-        ((((s->wregs[W_INTR] & INTR_RXMODEMSK) == INTR_RXINT1ST) ||
-        ((s->wregs[W_INTR] & INTR_RXMODEMSK) == INTR_RXINTALL)) &&
-            s->rxint == 1) ||
-        /* rx ints enabled, pending */
-        ((s->wregs[W_EXTINT] & EXTINT_BRKINT) &&
-            (s->rregs[R_STATUS] & STATUS_BRK)))) {
-        /* break int e&p */
-        return 1;
-    }
-    return 0;
+    uint8_t mode = s->wregs[W_INTR] & INTR_RXMODEMSK;
+
+    return s->rxint == 1 &&
+           (mode == INTR_RXINT1ST || mode == INTR_RXINTALL);
 }
 
+/* tx ints enabled, pending */
+static bool escc_tx_ip(ESCCChannelState *s)
+{
+    return s->txint == 1 && (s->wregs[W_INTR] & INTR_TXINT);
+}
+
+static int escc_update_irq_chn(ESCCChannelState *s)
+{
+    return escc_tx_ip(s) || escc_rx_ip(s) ||
+           /* break int e&p */
+           ((s->wregs[W_EXTINT] & EXTINT_BRKINT) &&
+            (s->rregs[R_STATUS] & STATUS_BRK));
+}
+
+enum {
+    ESCC_IP_NONE,
+    ESCC_IP_TX,
+    ESCC_IP_RX,
+};
+
+/*
+ * The interrupt that a channel wants serviced first. Receive goes before
+ * transmit. But once the guest has reset the IUS of a receive interrupt
+ * and left the character unread, transmit goes first.
+ */
+static int escc_chn_ip(ESCCChannelState *s)
+{
+    if (escc_rx_ip(s) && s->rxint_under_svc) {
+        return ESCC_IP_RX;
+    }
+    if (escc_tx_ip(s)) {
+        return ESCC_IP_TX;
+    }
+    return escc_rx_ip(s) ? ESCC_IP_RX : ESCC_IP_NONE;
+}
+
+/*
+ * RR3 of channel A and RR2 of channel B describe both channels. RR3 has
+ * the pending interrupts. RR2 names the one to service first: channel A
+ * goes before channel B.
+ *
+ * Each channel must not write its own interrupt to RR2. When a keyboard
+ * byte and a mouse byte waited together, the channel that was serviced
+ * first then left "no interrupt" in RR2 with the interrupt line still
+ * raised. SunOS takes that for a special receive condition on channel B
+ * and reads a byte to throw it away: a lost mouse byte made the pointer
+ * jump, and with no mouse byte left SunOS hung until the next key.
+ */
+static void escc_update_intr_regs(ESCCChannelState *s)
+{
+    ESCCChannelState *a = s->chn == escc_chn_a ? s : s->otherchn;
+    ESCCChannelState *b = a->otherchn;
+    bool hi = (a->wregs[W_MINTR] | b->wregs[W_MINTR]) & MINTR_STATUSHI;
+    uint8_t intr = 0, ivec;
+
+    if (escc_rx_ip(a)) {
+        intr |= INTR_RXINTA;
+    }
+    if (escc_tx_ip(a)) {
+        intr |= INTR_TXINTA;
+    }
+    if (escc_rx_ip(b)) {
+        intr |= INTR_RXINTB;
+    }
+    if (escc_tx_ip(b)) {
+        intr |= INTR_TXINTB;
+    }
+    a->rregs[R_INTR] = intr;
+
+    switch (escc_chn_ip(a)) {
+    case ESCC_IP_RX:
+        ivec = hi ? IVEC_HIRXINTA : IVEC_LORXINTA;
+        break;
+    case ESCC_IP_TX:
+        ivec = hi ? IVEC_HITXINTA : IVEC_LOTXINTA;
+        break;
+    default:
+        switch (escc_chn_ip(b)) {
+        case ESCC_IP_RX:
+            ivec = hi ? IVEC_HIRXINTB : IVEC_LORXINTB;
+            break;
+        case ESCC_IP_TX:
+            ivec = IVEC_TXINTB;
+            break;
+        default:
+            ivec = hi ? IVEC_HINOINT : IVEC_LONOINT;
+            break;
+        }
+        break;
+    }
+    b->rregs[R_IVEC] = ivec;
+}
+
+/*
+ * Each channel has an interrupt line of its own, and the boards with one
+ * line for the chip OR the two. So a channel's line shows only what that
+ * channel has pending. It used to show what both had: when the other
+ * channel was serviced last, this line stayed raised with nothing left to
+ * service, and the guest took interrupts for ever.
+ */
 static void escc_update_irq(ESCCChannelState *s)
 {
     int irq;
 
+    escc_update_intr_regs(s);
+
     irq = escc_update_irq_chn(s);
-    irq |= escc_update_irq_chn(s->otherchn);
 
     trace_escc_update_irq(irq);
     qemu_set_irq(s->irq, irq);
@@ -377,26 +471,7 @@ static void escc_reset(DeviceState *d)
 static inline void set_rxint(ESCCChannelState *s)
 {
     s->rxint = 1;
-    /*
-     * XXX: missing daisy chaining: escc_chn_b rx should have a lower priority
-     * than chn_a rx/tx/special_condition service
-     */
     s->rxint_under_svc = 1;
-    if (s->chn == escc_chn_a) {
-        s->rregs[R_INTR] |= INTR_RXINTA;
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->otherchn->rregs[R_IVEC] = IVEC_HIRXINTA;
-        } else {
-            s->otherchn->rregs[R_IVEC] = IVEC_LORXINTA;
-        }
-    } else {
-        s->otherchn->rregs[R_INTR] |= INTR_RXINTB;
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->rregs[R_IVEC] = IVEC_HIRXINTB;
-        } else {
-            s->rregs[R_IVEC] = IVEC_LORXINTB;
-        }
-    }
     escc_update_irq(s);
 }
 
@@ -405,21 +480,6 @@ static inline void set_txint(ESCCChannelState *s)
     s->txint = 1;
     if (!s->rxint_under_svc) {
         s->txint_under_svc = 1;
-        if (s->chn == escc_chn_a) {
-            if (s->wregs[W_INTR] & INTR_TXINT) {
-                s->rregs[R_INTR] |= INTR_TXINTA;
-            }
-            if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-                s->otherchn->rregs[R_IVEC] = IVEC_HITXINTA;
-            } else {
-                s->otherchn->rregs[R_IVEC] = IVEC_LOTXINTA;
-            }
-        } else {
-            s->rregs[R_IVEC] = IVEC_TXINTB;
-            if (s->wregs[W_INTR] & INTR_TXINT) {
-                s->otherchn->rregs[R_INTR] |= INTR_TXINTB;
-            }
-        }
         escc_update_irq(s);
     }
 }
@@ -428,21 +488,6 @@ static inline void clr_rxint(ESCCChannelState *s)
 {
     s->rxint = 0;
     s->rxint_under_svc = 0;
-    if (s->chn == escc_chn_a) {
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->otherchn->rregs[R_IVEC] = IVEC_HINOINT;
-        } else {
-            s->otherchn->rregs[R_IVEC] = IVEC_LONOINT;
-        }
-        s->rregs[R_INTR] &= ~INTR_RXINTA;
-    } else {
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->rregs[R_IVEC] = IVEC_HINOINT;
-        } else {
-            s->rregs[R_IVEC] = IVEC_LONOINT;
-        }
-        s->otherchn->rregs[R_INTR] &= ~INTR_RXINTB;
-    }
     if (s->txint) {
         set_txint(s);
     }
@@ -453,22 +498,6 @@ static inline void clr_txint(ESCCChannelState *s)
 {
     s->txint = 0;
     s->txint_under_svc = 0;
-    if (s->chn == escc_chn_a) {
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->otherchn->rregs[R_IVEC] = IVEC_HINOINT;
-        } else {
-            s->otherchn->rregs[R_IVEC] = IVEC_LONOINT;
-        }
-        s->rregs[R_INTR] &= ~INTR_TXINTA;
-    } else {
-        s->otherchn->rregs[R_INTR] &= ~INTR_TXINTB;
-        if (s->wregs[W_MINTR] & MINTR_STATUSHI) {
-            s->rregs[R_IVEC] = IVEC_HINOINT;
-        } else {
-            s->rregs[R_IVEC] = IVEC_LONOINT;
-        }
-        s->otherchn->rregs[R_INTR] &= ~INTR_TXINTB;
-    }
     if (s->rxint) {
         set_rxint(s);
     }
@@ -690,6 +719,10 @@ static uint64_t escc_mem_read(void *opaque, hwaddr addr,
     s = &serial->chn[channel];
     switch (saddr) {
     case SERIAL_CTRL:
+        if (s->reg == R_IVEC || s->reg == R_INTR) {
+            /* The guest may have changed which interrupts are enabled */
+            escc_update_intr_regs(s);
+        }
         trace_escc_mem_readb_ctrl(CHN_C(s), s->reg, s->rregs[s->reg]);
         ret = s->rregs[s->reg];
         s->reg = 0;
