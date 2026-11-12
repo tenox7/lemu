@@ -506,6 +506,10 @@ struct CPUArchState {
     uint64_t mmubpaction;
     uint64_t mmubpregs[4];
     uint64_t prom_addr;
+    /* Halt in the idle loop of SunOS 4.1.4, see sunos_idle.c */
+    bool sunos_idle;
+    int64_t sunos_idle_since;   /* when the loop first found no work */
+    int64_t sunos_idle_last;    /* when the loop last found no work */
 #endif
     float_status fp_status;
 #if defined(TARGET_SPARC64)

@@ -32,6 +32,7 @@
 #include "fpu/softfloat.h"
 #include "asi.h"
 #include "target/sparc/translate.h"
+#include "trace.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -196,6 +197,7 @@ typedef struct DisasContext {
     bool hypervisor;
 #else
     bool fsr_qne;
+    bool sunos_idle;
 #endif
 #endif
 
@@ -5779,6 +5781,8 @@ static void sparc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     dc->hypervisor = (dc->base.tb->flags & TB_FLAG_HYPER) != 0;
 # else
     dc->fsr_qne = (dc->base.tb->flags & TB_FLAG_FSR_QNE) != 0;
+    dc->sunos_idle = cpu_env(cs)->sunos_idle && dc->supervisor &&
+                     !(tb_cflags(dc->base.tb) & CF_SINGLE_STEP);
 # endif
 #endif
 #ifdef TARGET_SPARC64
@@ -5819,6 +5823,91 @@ static void sparc_tr_insn_start(DisasContextBase *dcbase, CPUState *cs)
     tcg_gen_insn_start(dc->pc, npc, 0);
 }
 
+#if !defined(CONFIG_USER_ONLY) && !defined(TARGET_SPARC64)
+/*
+ * SunOS 4.1.4 spins in idlework() when it has nothing to run; see
+ * sunos_idle.c. These are the last words of that loop, each with its mask:
+ * the addresses of the kernel's variables and functions are left out, so
+ * that a kernel linked at other addresses matches too.
+ */
+static const uint32_t sunos_idle_loop[][2] = {
+    { 0x24800004, 0xffffffff },     /*         ble,a check     spin <= 0 */
+    { 0x2d000000, 0xffc00000 },     /*          sethi %hi(Nrunnable), %l6 */
+    { 0x10bfffe7, 0xffffffff },     /*         b     top */
+    { 0xba276001, 0xffffffff },     /*          dec  %i5       spin-- */
+    { 0xec05a000, 0xffffe000 },     /* check:  ld    [%l6 + lo], %l6 */
+    { 0x80900016, 0xffffffff },     /*         tst   %l6 */
+    { 0x12800006, 0xffffffff },     /*         bne   knock */
+    { 0x2f000000, 0xffc00000 },     /*          sethi %hi(whichqs), %l7 */
+    { 0xee05e000, 0xffffe000 },     /*         ld    [%l7 + lo], %l7 */
+    { 0x80900017, 0xffffffff },     /*         tst   %l7 */
+    { 0x2280000a, 0xffffffff },     /*         be,a  streams */
+    { 0x31000000, 0xffc00000 },     /*          sethi %hi(qrunflag), %i0 */
+    { 0x40000000, 0xc0000000 },     /* knock:  call  klock_knock */
+    { 0x01000000, 0xffffffff },     /*          nop */
+    { 0x80900008, 0xffffffff },     /*         tst   %o0 */
+    { 0x22800005, 0xffffffff },     /*         be,a  streams */
+    { 0x31000000, 0xffc00000 },     /*          sethi %hi(qrunflag), %i0 */
+    { 0x40000000, 0xc0000000 },     /*         call  idle */
+    { 0xba1023e8, 0xffffffff },     /*          mov  1000, %i5 spin = 1000 */
+    { 0x31000000, 0xffc00000 },     /*         sethi %hi(qrunflag), %i0 */
+    { 0xf04e2000, 0xffffe000 },     /* streams: ldsb [%i0 + lo], %i0 */
+    { 0x80900018, 0xffffffff },     /*         tst   %i0 */
+    { 0x02bfffd3, 0xffffffff },     /*         be    top       the helper */
+    { 0x01000000, 0xffffffff },     /*          nop */
+};
+#define SUNOS_IDLE_BRANCH       22
+
+/* The address that the sethi at w[hi] and the load at w[lo] make */
+static target_ulong sunos_idle_addr(const uint32_t *w, int hi, int lo)
+{
+    return (extract32(w[hi], 0, 22) << 10) + sextract32(w[lo], 0, 13);
+}
+
+/*
+ * At the branch from the end of the SunOS idle loop back to its top, let
+ * helper_sunos_idle() halt the CPU
+ */
+static void gen_sunos_idle(DisasContext *dc, CPUSPARCState *env)
+{
+    enum { LEN = ARRAY_SIZE(sunos_idle_loop) };
+    target_ulong start = dc->pc - 4 * SUNOS_IDLE_BRANCH;
+    target_ulong top, nrunnable, whichqs, qrunflag;
+    uint32_t w[LEN];
+    int i;
+
+    /* The branch is not in a delay slot */
+    if (dc->npc != dc->pc + 4) {
+        return;
+    }
+    /* Off RAM, translator_ldl_end() would record these words as code */
+    if (tb_page_addr0(dc->base.tb) == -1 ||
+        !translator_is_same_page(&dc->base, start) ||
+        !translator_is_same_page(&dc->base, start + 4 * (LEN - 1))) {
+        return;
+    }
+    for (i = 0; i < LEN; i++) {
+        w[i] = translator_ldl_end(env, &dc->base, start + 4 * i, MO_BE);
+        if ((w[i] & sunos_idle_loop[i][1]) != sunos_idle_loop[i][0]) {
+            return;
+        }
+    }
+
+    top = dc->pc + 4 * sextract32(w[SUNOS_IDLE_BRANCH], 0, 22);
+    nrunnable = sunos_idle_addr(w, 1, 4);
+    whichqs = sunos_idle_addr(w, 7, 8);
+    qrunflag = sunos_idle_addr(w, 19, 20);
+    trace_sparc_sunos_idle_match(dc->pc, top, nrunnable, whichqs, qrunflag);
+
+    /* The helper reads the clock: end the TB with the branch */
+    translator_io_start(&dc->base);
+    gen_helper_sunos_idle(tcg_env, tcg_constant_tl(top),
+                          tcg_constant_tl(nrunnable),
+                          tcg_constant_tl(whichqs),
+                          tcg_constant_tl(qrunflag));
+}
+#endif
+
 static void sparc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
@@ -5826,6 +5915,12 @@ static void sparc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
 
     insn = translator_ldl_end(cpu_env(cs), &dc->base, dc->pc, MO_BE);
     dc->base.pc_next += 4;
+
+#if !defined(CONFIG_USER_ONLY) && !defined(TARGET_SPARC64)
+    if (insn == sunos_idle_loop[SUNOS_IDLE_BRANCH][0] && dc->sunos_idle) {
+        gen_sunos_idle(dc, cpu_env(cs));
+    }
+#endif
 
     if (!decode(dc, insn)) {
         gen_exception(dc, TT_ILL_INSN);

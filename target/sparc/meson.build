@@ -20,6 +20,7 @@ sparc_system_ss.add(files(
   'mmu_helper.c',
   'monitor.c',
 ))
+sparc_system_ss.add(when: 'TARGET_SPARC', if_true: files('sunos_idle.c'))
 
 target_arch += {'sparc': sparc_ss}
 target_system_arch += {'sparc': sparc_system_ss}

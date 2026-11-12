@@ -14,6 +14,12 @@ mmu_helper_mmu_fault(uint64_t address, uint64_t paddr, int mmu_idx, uint32_t tl,
 sun4m_cpu_interrupt(unsigned int level) "Set CPU IRQ %d"
 sun4m_cpu_reset_interrupt(unsigned int level) "Reset CPU IRQ %d"
 
+# sunos_idle.c
+sparc_sunos_idle(uint32_t pc) "idle loop halt, go on at 0x%08x"
+
+# translate.c
+sparc_sunos_idle_match(uint32_t pc, uint32_t top, uint32_t nrunnable, uint32_t whichqs, uint32_t qrunflag) "SunOS idle loop: branch at 0x%08x to 0x%08x, Nrunnable 0x%08x whichqs 0x%08x qrunflag 0x%08x"
+
 # int64_helper.c
 int_helper_set_softint(uint32_t softint) "new 0x%08x"
 int_helper_clear_softint(uint32_t softint) "new 0x%08x"
