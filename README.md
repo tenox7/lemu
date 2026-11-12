@@ -30,7 +30,7 @@ It emulates **old computers**, and it is made to be used **with AI agents**.
 ## Machines
 
 Each guest links to its `run.sh`, which shows the QEMU options it needs.
-The PC has no kit, so its `run.sh` is an example.
+The PC and the Sun have no kit, so their `run.sh` is an example.
 
 | Machine | Guests |
 |---|---|
@@ -43,10 +43,11 @@ The PC has no kit, so its `run.sh` is an example.
 | IBM pSeries (POWER7, POWER8) | [AIX 5.3](machines/pseries/aix53/run.sh), [AIX 6.1](machines/pseries/aix61/run.sh), [AIX 7.2](machines/pseries/aix72/run.sh) |
 | HP B160L (PA-RISC 1.1, PA-7300LC) | [HP-UX 10.20](machines/hppa/hpux1020/run.sh) (4 CPUs) |
 | HP 9000/715 (PA-RISC 1.1, PA-7100LC) | [HP-UX 9.05](machines/hppa/hpux905/run.sh) |
+| Sun SPARCstation 5 (sun4m, microSPARC II) | [SunOS 4.1.4](machines/sun4m/sunos414/run.sh) |
 
 ## Build
 
-    ./configure --target-list=mips64el-softmmu,mips64-softmmu,alpha-softmmu,i386-softmmu,ppc-softmmu,ppc64-softmmu,hppa-softmmu
+    ./configure --target-list=mips64el-softmmu,mips64-softmmu,alpha-softmmu,i386-softmmu,ppc-softmmu,ppc64-softmmu,hppa-softmmu,sparc-softmmu
     make
 
 - You need the same tools as for QEMU, and Python 3.12 or newer.
