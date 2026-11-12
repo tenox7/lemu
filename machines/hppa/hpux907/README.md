@@ -8,7 +8,7 @@ An idle guest at the VUE desktop uses about 5% of a host core.
 
 ## Run
 
-[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux907-715-qemu` (see
+[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux907-715-lemu` (see
 [README.txt](README.txt)); [../release/mkrelease.sh](../release/mkrelease.sh) packs it:
 `mkrelease.sh hpux907 VMDIR STAGE/hppa OUT.tar.lz`, with the disk in `VMDIR/hpux907.qcow2`
 (HP-UX 9.07 on SCSI ID 6). The pack leaves the disk's snapshots out. The kit forwards telnet

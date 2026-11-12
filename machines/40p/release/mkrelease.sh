@@ -5,13 +5,13 @@ set -e
 here=$(cd "$(dirname "$0")" && pwd)
 os=$1 vm=$2 bin=$3 out=$4
 case $os in
-nt) name=nt40powerpc-qemu disk=nt40 nvram=nvram.bin ;;
-nt351) name=nt351powerpc-qemu disk=nt351 nvram=nvram.bin ;;
-os2) name=os2powerpc-qemu disk=os2 nvram=nvram-os2.bin ;;
-solaris) name=sol251powerpc-qemu disk=sol251 nvram=nvram-sol.bin ;;
-aix41) name=aix415rs6k-qemu disk=aix415 nvram=nvram.bin ;;
-aix43) name=aix433rs6k-qemu disk=aix433 nvram=nvram43.bin ;;
-aix51) name=aix51rs6k-qemu disk=aix51 nvram=nvram.bin ;;
+nt) name=nt40powerpc-lemu disk=nt40 nvram=nvram.bin ;;
+nt351) name=nt351powerpc-lemu disk=nt351 nvram=nvram.bin ;;
+os2) name=os2powerpc-lemu disk=os2 nvram=nvram-os2.bin ;;
+solaris) name=sol251powerpc-lemu disk=sol251 nvram=nvram-sol.bin ;;
+aix41) name=aix415rs6k-lemu disk=aix415 nvram=nvram.bin ;;
+aix43) name=aix433rs6k-lemu disk=aix433 nvram=nvram43.bin ;;
+aix51) name=aix51rs6k-lemu disk=aix51 nvram=nvram.bin ;;
 *) echo "unknown OS: $os" >&2; exit 1 ;;
 esac
 img=$vm/disk/$disk.qcow2 fw=$vm/fw

@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-or-later
 # HP-UX 9.07 on an HP 9000/715 (PA-7100LC): one CPU, 128 MB RAM, Artist graphics,
-# SCSI disk, LASI LAN. This starts the kit hpux907-715-nnm-qemu (README.txt).
+# SCSI disk, LASI LAN. This starts the kit hpux907-715-nnm-lemu (README.txt).
 cd "$(dirname "$0")" || exit 1
 case "$(uname -s)-$(uname -m)" in
 Darwin-arm64) q=bin/macos-arm64/qemu-system-hppa ;;

@@ -20,7 +20,7 @@ for p in $plats; do
     [ -d "$bin/$p" ] || { echo "$0: no $bin/$p" >&2; exit 1; }
 done
 out=$(cd "$(dirname "$4")" && pwd)/$(basename "$4")
-k=${g}axp-qemu
+k=${g}axp-lemu
 t=$(mktemp -d)
 trap 'rm -rf "$t"' EXIT
 r=$t/$k

@@ -6,7 +6,7 @@ folder then packs its kits from that one build. Without them, each of
 the five release folders builds its own QEMU, so a full set of kits
 compiles the same code 15 times, with slightly different features.
 
-| Binary | Kits (`<name>-qemu.tar.lz`) | Pack script |
+| Binary | Kits (`<name>-lemu.tar.lz`) | Pack script |
 |---|---|---|
 | qemu-system-ppc | aix415rs6k, aix433rs6k, aix51rs6k, nt351powerpc, nt40powerpc, os2powerpc, sol251powerpc | `../40p/release/mkrelease.sh` |
 | qemu-system-ppc | aix325rs6000 | `../7006/release/mkrelease.sh` |
@@ -63,16 +63,16 @@ what each binary has in `OUT/macos-*.features` and
 folder names that `rm200/release/pack.sh` wants. Give the pack scripts
 these folders in place of their own build, for example:
 
-    sh ../40p/release/mkrelease.sh nt VMDIR STAGE/ppc nt40powerpc-qemu.tar.lz
-    sh ../7006/release/mkrelease.sh VMDIR STAGE/ppc aix325rs6000-qemu.tar.lz
-    sh ../pseries/release/mkrelease.sh aix53 VMDIR STAGE/ppc64 aix53pseries-qemu.tar.lz
-    sh ../jensen/release/pack.sh nt40 SRCDIR STAGE/alpha nt40axp-qemu.tar.lz
-    sh ../pc/release/pack.sh nt351 VMDIR STAGE/i386 nt351x86-qemu.tar.lz
-    sh ../rm200/release/pack.sh KITDIR qemu-system-mips64el STAGE/mips nt4-rm200-qemu.tar.lz
-    sh ../hppa/release/mkrelease.sh hpux1020 VMDIR STAGE/hppa hpux1020b160l-qemu.tar.lz
-    sh ../hppa/release/mkrelease.sh hpux905 VMDIR STAGE/hppa hpux905-715-qemu.tar.lz
-    sh ../hppa/release/mkrelease.sh hpux907 VMDIR STAGE/hppa hpux907-715-qemu.tar.lz
-    sh ../hppa/release/mkrelease.sh hpux11v1 VMDIR STAGE/hppa hpux11v1b160l-qemu.tar.lz
+    sh ../40p/release/mkrelease.sh nt VMDIR STAGE/ppc nt40powerpc-lemu.tar.lz
+    sh ../7006/release/mkrelease.sh VMDIR STAGE/ppc aix325rs6000-lemu.tar.lz
+    sh ../pseries/release/mkrelease.sh aix53 VMDIR STAGE/ppc64 aix53pseries-lemu.tar.lz
+    sh ../jensen/release/pack.sh nt40 SRCDIR STAGE/alpha nt40axp-lemu.tar.lz
+    sh ../pc/release/pack.sh nt351 VMDIR STAGE/i386 nt351x86-lemu.tar.lz
+    sh ../rm200/release/pack.sh KITDIR qemu-system-mips64el STAGE/mips nt4-rm200-lemu.tar.lz
+    sh ../hppa/release/mkrelease.sh hpux1020 VMDIR STAGE/hppa hpux1020b160l-lemu.tar.lz
+    sh ../hppa/release/mkrelease.sh hpux905 VMDIR STAGE/hppa hpux905-715-lemu.tar.lz
+    sh ../hppa/release/mkrelease.sh hpux907 VMDIR STAGE/hppa hpux907-715-lemu.tar.lz
+    sh ../hppa/release/mkrelease.sh hpux11v1 VMDIR STAGE/hppa hpux11v1b160l-lemu.tar.lz
     sh ../sun4m/release/mkrelease.sh sunos414 VMDIR STAGE/sparc sunos414-lemu.tar.gz
 
 - `VMDIR`, `SRCDIR` and `KITDIR` hold the guest files: disk, NVRAM and

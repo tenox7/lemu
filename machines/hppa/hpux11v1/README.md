@@ -8,7 +8,7 @@ spinning. LEMU's firmware (SeaBIOS-hppa 27) is enough.
 
 ## Run
 
-[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux11v1b160l-qemu` (see
+[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux11v1b160l-lemu` (see
 [README.txt](README.txt)); [../release/mkrelease.sh](../release/mkrelease.sh) packs it.
 They use LEMU's firmware and the disk `hpux11v1.qcow2` on SCSI ID 6. The CDE login
 comes up about 70 s after the start; root's password is root.

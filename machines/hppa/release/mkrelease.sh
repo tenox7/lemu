@@ -16,12 +16,12 @@ set -e
 here=$(cd "$(dirname "$0")" && pwd)
 os=$1 vm=$2 bin=$3 out=$4
 case $os in
-hpux1020) name=hpux1020b160l-qemu img=$vm/hpux.img ;;
-hpux1020nnm) name=hpux1020b160l-nnm-qemu img=$vm/hpux.img ;;
-hpux905) name=hpux905-715-qemu img=$vm/hpux905.qcow2 ;;
-hpux907) name=hpux907-715-qemu img=$vm/hpux907.qcow2 ;;
-hpux907nnm) name=hpux907-715-nnm-qemu img=$vm/hpux907.qcow2 ;;
-hpux11v1) name=hpux11v1b160l-qemu img=$vm/hpux.img ;;
+hpux1020) name=hpux1020b160l-lemu img=$vm/hpux.img ;;
+hpux1020nnm) name=hpux1020b160l-nnm-lemu img=$vm/hpux.img ;;
+hpux905) name=hpux905-715-lemu img=$vm/hpux905.qcow2 ;;
+hpux907) name=hpux907-715-lemu img=$vm/hpux907.qcow2 ;;
+hpux907nnm) name=hpux907-715-nnm-lemu img=$vm/hpux907.qcow2 ;;
+hpux11v1) name=hpux11v1b160l-lemu img=$vm/hpux.img ;;
 *) echo "unknown OS: $os" >&2; exit 1 ;;
 esac
 t=$(mktemp -d)

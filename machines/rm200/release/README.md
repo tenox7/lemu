@@ -6,14 +6,14 @@ all eight kits:
 
 | Kit | Binary | Machine | Run scripts |
 |---|---|---|---|
-| nt31mips-qemu | qemu-system-mips64el | magnum (NT 3.1) | `machines/jazz/nt31` |
-| nt4-jazz-qemu | qemu-system-mips64el | magnum (NT 4.0) | `machines/jazz/nt40` |
-| nt351-jazz-qemu | qemu-system-mips64el | magnum (NT 3.51) | `machines/jazz/nt351` |
-| nt4-rm200-qemu | qemu-system-mips64el | sni-rm200 (NT 4.0) | `machines/rm200/nt40` |
-| nt351-rm200-qemu | qemu-system-mips64el | sni-rm200 (NT 3.51) | `machines/rm200/nt351` |
-| nt4-rm200-smp-qemu | qemu-system-mips64el | sni-rm300, 2 CPUs (NT 4.0) | `machines/rm200/nt40smp` |
-| nt4srv-rm300-smp4-qemu | qemu-system-mips64el | sni-rm300, 4 CPUs (NT 4.0 Server) | `machines/rm200/nt40srv` |
-| sinixn545-qemu | qemu-system-mips64 | sni-rm200 (SINIX-N 5.45) | `machines/rm200/sinix545` |
+| nt31mips-lemu | qemu-system-mips64el | magnum (NT 3.1) | `machines/jazz/nt31` |
+| nt4-jazz-lemu | qemu-system-mips64el | magnum (NT 4.0) | `machines/jazz/nt40` |
+| nt351-jazz-lemu | qemu-system-mips64el | magnum (NT 3.51) | `machines/jazz/nt351` |
+| nt4-rm200-lemu | qemu-system-mips64el | sni-rm200 (NT 4.0) | `machines/rm200/nt40` |
+| nt351-rm200-lemu | qemu-system-mips64el | sni-rm200 (NT 3.51) | `machines/rm200/nt351` |
+| nt4-rm200-smp-lemu | qemu-system-mips64el | sni-rm300, 2 CPUs (NT 4.0) | `machines/rm200/nt40smp` |
+| nt4srv-rm300-smp4-lemu | qemu-system-mips64el | sni-rm300, 4 CPUs (NT 4.0 Server) | `machines/rm200/nt40srv` |
+| sinixn545-lemu | qemu-system-mips64 | sni-rm200 (SINIX-N 5.45) | `machines/rm200/sinix545` |
 
 ## Build
 
@@ -49,8 +49,8 @@ missing git id. The check catches those:
 
 ## Pack and test
 
-    sh pack.sh KITDIR qemu-system-mips64el $OUT nt31mips-qemu.tar.lz
-    sh verify.sh WORKDIR nt31mips-qemu.tar.lz
+    sh pack.sh KITDIR qemu-system-mips64el $OUT nt31mips-lemu.tar.lz
+    sh verify.sh WORKDIR nt31mips-lemu.tar.lz
     sh ltest.sh ubuntu:24.04 KITCOPY
 
 - `KITDIR` is an unpacked kit (run.sh, run.cmd, README.txt, disk,

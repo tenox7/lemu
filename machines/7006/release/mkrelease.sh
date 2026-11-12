@@ -6,7 +6,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 vm=$1 bin=$2 out=$3
 t=$(mktemp -d)
 trap 'rm -rf "$t"' EXIT
-r=$t/aix325rs6000-qemu
+r=$t/aix325rs6000-lemu
 mkdir -p "$r/bin/share/qemu/keymaps" "$r/fw"
 
 qemu-img convert -O qcow2 "$vm/disk/hd0.qcow2" "$r/aix325.qcow2"
@@ -23,5 +23,5 @@ done
 chmod 644 "$r/aix325.qcow2" "$r/nvram.bin" "$r"/fw/*
 
 COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 \
-    --uname root --gname root -C "$t" -cf - aix325rs6000-qemu | plzip -9 > "$out"
+    --uname root --gname root -C "$t" -cf - aix325rs6000-lemu | plzip -9 > "$out"
 lzip -t "$out"

@@ -8,7 +8,7 @@ SeaBIOS-hppa 25 with `legacy-fw=on` work too.
 
 ## Run
 
-[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux1020b160l-qemu` (see
+[run.sh](run.sh) and [run.cmd](run.cmd) start the kit `hpux1020b160l-lemu` (see
 [README.txt](README.txt)); [../release/mkrelease.sh](../release/mkrelease.sh) packs it.
 They use LEMU's firmware (SeaBIOS-hppa 27; the first kit, packed on 2026-11-05, has 26)
 and the disk `hpux1020.qcow2` on SCSI ID 6.

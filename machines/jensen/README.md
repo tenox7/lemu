@@ -8,8 +8,8 @@ Jensen.
 
 | Folder | What |
 |---|---|
-| `nt31/` | run.sh, run.cmd and README.txt of the nt31axp-qemu kit |
-| `nt40/` | the same for the nt40axp-qemu kit |
+| `nt31/` | run.sh, run.cmd and README.txt of the nt31axp-lemu kit |
+| `nt40/` | the same for the nt40axp-lemu kit |
 | `release/` | build, check and pack the kits |
 
 ## Machine options

@@ -17,7 +17,7 @@ esac
 # is slowed down (hpux-x11-pace=on is the default); without it the X server crashes at
 # start on a fast host and the VUE login never appears.
 # HP-UX has the fixed address 192.168.1.235, so the user mode network is 192.168.1.0/24.
-# This starts the kit hpux1020b160l-nnm-qemu: HP-UX 10.20 with OpenView NNM 6.1 (README.txt).
+# This starts the kit hpux1020b160l-nnm-lemu: HP-UX 10.20 with OpenView NNM 6.1 (README.txt).
 # The terminal holds the QEMU monitor.
 exec "$q" \
 	-name "HP-UX 10.20 PA-RISC B160L NNM" \

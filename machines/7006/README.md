@@ -9,11 +9,11 @@ core instead of a whole one. `-M 7006,idle=off` lets the loop spin instead.
 
 ## Release
 
-`release/` builds the ready-to-run `aix325rs6000-qemu.tar.lz`:
+`release/` builds the ready-to-run `aix325rs6000-lemu.tar.lz`:
 `build-linux.sh amd64|arm64 OUT` and `build-windows.sh OUT` (Docker), and
 `build-macos.sh OUT` (Homebrew glib, pixman, libslirp, sdl2-compat, sdl3,
 dylibbundler) build self-contained QEMU binaries into OUT, then `mkrelease.sh
-VMDIR OUT aix325rs6000-qemu.tar.lz` packs them with the VM's disk
+VMDIR OUT aix325rs6000-lemu.tar.lz` packs them with the VM's disk
 (`disk/hd0.qcow2`), NVRAM (`disk/nvram.bin`), firmware (`fw/`) and the
 `run.sh`, `run.cmd` and `README.txt` in `aix325/`. SDL is the display on
 every platform, as only it shows the operator panel in a window of its own.
