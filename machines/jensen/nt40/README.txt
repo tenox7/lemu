@@ -8,6 +8,9 @@ The ARC boot menu still lists the NT 3.1 entry this disk was set up from; NT 4.0
 The screen is 1280x1024 with 65536 colours (S3 86C928, 4 MB).
 QEMU halts the CPU while NT is idle, so an idle VM uses about 2% of a host core.
 The clock runs 28 years behind (the firmware rejects current years). Network is QEMU user mode NAT (NE2000, 10.0.2.15).
+Compilers: Visual C++ 4.1 for Alpha (cl 10.10) in D:\MSDEV and the Win32 SDK of August 1996 in D:\MSTOOLS. cl and nmake work in any Command Prompt and over rsh.
+DDK: the Windows NT 4.0 DDK (build 1381) is in D:\DDK. To build a driver: Start, Programs, Windows NT DDK (Common), Free Build Environment, then cd to a folder with a sources file and type build -cef. The driver lands in D:\DDK\lib\alpha\free.
+DDK from rsh or a batch job: first type set TMP=D:\TEMP, set TEMP=D:\TEMP and call D:\DDK\bin\setenv.bat D:\DDK free.
 rsh: the ntrshd service (rsh and rcp server, github.com/tenox7/ntrshd) starts at boot and runs commands as Administrator. It is unauthenticated: it asks for no password, so anyone who can reach its port can run any command as Administrator. 127.0.0.1:45514 on this computer goes to it, e.g. rsh-mcp (github.com/tenox7/rsh-mcp) with host 127.0.0.1 and port 45514. 127.0.0.1:45389 goes to port 3389 (RDP) in NT, for an RDP server you install there. Both listen on 127.0.0.1 only, so other computers can't reach them.
 QEMU monitor: Ctrl-Alt-2 (back with Ctrl-Alt-1). CD-ROM and floppy are empty: change cd0 file.iso, change fd0 file.img.
 Send Ctrl-Alt-Del from the monitor with: sendkey ctrl-alt-delete

@@ -8,6 +8,8 @@ The screen is 1280x1024 with 65536 colours (S3 86C928, 4 MB, NT's own S3 driver)
 Compilers: Visual C++ 4.1 (cl 10.10) in C:\MSDEV and the Win32 SDK of August 1996 in C:\MSTOOLS. cl and nmake work in any new Command Prompt.
 APPVER=3.51 makes the SDK's win32.mak build programs for NT 3.51. The SDK tools need MSVCRT.DLL 4.20 and MFC42.DLL: NT 3.51 has neither, so both are in C:\MSTOOLS\BIN.
 Developer Studio asks for the VC++ CD when it starts (the help is on that CD): press Cancel.
+DDK: the Windows NT 3.51 DDK (build 1057) is in C:\DDK. To build a driver, open Program Manager, group Windows NT DDK, Free Build Environment, cd to a folder with a sources file and type build -cef. The driver lands in C:\DDK\lib\i386\free.
+DDK from rsh or a batch job: first type set TMP=C:\TEMP, set TEMP=C:\TEMP and call C:\DDK\bin\setenv.bat C:\DDK free.
 fw/bios-nt351.bin is SeaBIOS with the E820 memory map and the MP table turned off: NT 3.51 setup crashes with the stock one.
 QEMU halts the CPU while NT is idle, so an idle VM uses about 2% of a host core.
 The clock is the host's local time. Network is QEMU user mode NAT (NE2000, DHCP, 10.0.2.15).

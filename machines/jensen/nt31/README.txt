@@ -7,6 +7,10 @@ Press a key during the firmware's 5 s countdown for the ARC menus. Its "NVRAM in
 NT's boot screen stays blank until the desktop appears.
 QEMU halts the CPU while NT is idle, so an idle VM uses about 2% of a host core.
 The clock runs 28 years behind (the firmware rejects current years). Network is QEMU user mode NAT.
+Compiler: the Win32 SDK for NT 3.1 (1993) in D:\MSTOOLS. The NT 3.1 SDK compilers need -Od, not -Ox.
+DDK: the Windows NT 3.1 DDK (November 1993) is in D:\DDK. To build a driver, open Program Manager, group Windows NT DDK, Free Build Environment, cd to a folder with a sources file and type build -cef. The driver lands in D:\DDK\lib\alpha\free.
+DDK from rsh or a batch job: first type set PROCESSOR_ARCHITECTURE=ALPHA, set TMP=D:\TEMP, set TEMP=D:\TEMP and call D:\DDK\bin\setenv.bat D:\DDK free. NT 3.1 has no cd /d: type D: first, then cd.
+Build on the local disk, not on a network share: NT 3.1 damages files there.
 rsh: the ntrshd service (rsh and rcp server, github.com/tenox7/ntrshd) starts at boot and runs commands as Administrator. It is unauthenticated: it asks for no password, so anyone who can reach its port can run any command as Administrator. 127.0.0.1:33514 on this computer goes to it, e.g. rsh-mcp (github.com/tenox7/rsh-mcp) with host 127.0.0.1 and port 33514. 127.0.0.1:33389 goes to port 3389 (RDP) in NT, for an RDP server you install there. Both listen on 127.0.0.1 only, so other computers can't reach them.
 QEMU monitor: Ctrl-Alt-2 (back with Ctrl-Alt-1). CD-ROM and floppy are empty: change cd0 file.iso, change fd0 file.img.
 Send Ctrl-Alt-Del from the monitor with: sendkey ctrl-alt-delete
