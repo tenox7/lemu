@@ -33,6 +33,7 @@
 #include "hw/timer/i8254_internal.h"
 #include "system/blockdev.h"
 #include "system/reset.h"
+#include "system/qtest.h"
 #include "system/runstate.h"
 #include <glib/gstdio.h>
 #include "system/system.h"
@@ -782,9 +783,13 @@ static void jensen_init(MachineState *machine)
         path = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios);
         if (!path || !g_file_get_contents(path, &image, &image_len, NULL) ||
             image_len != JENSEN_FLASH_SIZE) {
-            error_report("Jensen requires a raw 1 MiB system ROM (-bios); "
-                         "extract it using scripts/jensen-extract.py");
-            exit(EXIT_FAILURE);
+            /* The ROM is not in the tree: qtest runs the machine without it */
+            if (!qtest_enabled()) {
+                error_report("Jensen requires a raw 1 MiB system ROM (-bios); "
+                             "extract it using scripts/jensen-extract.py");
+                exit(EXIT_FAILURE);
+            }
+            g_clear_pointer(&image, g_free);
         }
     }
 

@@ -296,7 +296,8 @@ static void es40_machine_init(MachineState *machine)
         size = -1;
     }
 
-    if (size < 0) {
+    /* The SROM is not in the tree: qtest runs the machine without it */
+    if (size < 0 && !qtest_enabled()) {
         error_report("could not load SROM image '%s'", firmware);
         exit(1);
     }
