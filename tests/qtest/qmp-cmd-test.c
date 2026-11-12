@@ -112,6 +112,7 @@ static bool query_is_ignored(const char *cmd)
     const char *ignored[] = {
         /* Not actually queries: */
         "add-fd",
+        "memory-search",          /* LEMU: needs @bytes, @text or @value */
         /* Success depends on target arch: */
         "query-cpu-definitions",  /* arm, i386, ppc, s390x */
         "query-gic-capabilities", /* arm */
