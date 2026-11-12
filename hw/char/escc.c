@@ -381,7 +381,9 @@ static void escc_reset_chn(ESCCChannelState *s)
     s->rx = s->tx = 0;
     s->rxint = s->txint = 0;
     s->rxint_under_svc = s->txint_under_svc = 0;
-    s->e0_mode = s->led_mode = s->caps_lock_mode = s->num_lock_mode = 0;
+    s->e0_mode = s->led_mode = 0;
+    bitmap_zero(s->sunkbd_down, ESCC_SUNKBD_KEYS);
+    memset(s->sunkbd_count, 0, sizeof(s->sunkbd_count));
     s->sunmouse_dx = s->sunmouse_dy = s->sunmouse_buttons = 0;
     clear_queue(s);
 }
@@ -838,40 +840,34 @@ static void sunkbd_handle_event(DeviceState *dev, QemuConsole *src,
     trace_escc_sunkbd_event_in(qcode, QKeyCode_str(qcode),
                                evt->key.down);
 
-    if (evt->key.key == KEY_CAPSLOCK) {
-        if (evt->key.down) {
-            s->caps_lock_mode ^= 1;
-            if (s->caps_lock_mode == 2) {
-                return; /* Drop second press */
-            }
-        } else {
-            s->caps_lock_mode ^= 2;
-            if (s->caps_lock_mode == 3) {
-                return; /* Drop first release */
-            }
-        }
-    }
-
-    if (evt->key.key == KEY_NUMLOCK) {
-        if (evt->key.down) {
-            s->num_lock_mode ^= 1;
-            if (s->num_lock_mode == 2) {
-                return; /* Drop second press */
-            }
-        } else {
-            s->num_lock_mode ^= 2;
-            if (s->num_lock_mode == 3) {
-                return; /* Drop first release */
-            }
-        }
-    }
-
-    if (evt->key.key >= qemu_input_map_linux_to_sun_len) {
+    if (evt->key.key >= qemu_input_map_linux_to_sun_len ||
+        evt->key.key >= ESCC_SUNKBD_KEYS) {
         return;
     }
 
     keycode = qemu_input_map_linux_to_sun[evt->key.key];
-    if (!evt->key.down) {
+    if (!keycode || keycode >= ARRAY_SIZE(s->sunkbd_count)) {
+        /* A Sun keyboard has no such key */
+        return;
+    }
+
+    /*
+     * A Sun keyboard sends one code when a key goes down and one when it
+     * comes up, also for Caps Lock and Num Lock: the guest turns them on
+     * and off itself, and repeats a held key itself. So the host's key
+     * repeat is not passed on. Two host keys may be one Sun key (the Sun
+     * keyboard has one Control key): it comes up with the last of them.
+     */
+    if (evt->key.down) {
+        if (test_and_set_bit(evt->key.key, s->sunkbd_down) ||
+            s->sunkbd_count[keycode]++) {
+            return;
+        }
+    } else {
+        if (!test_and_clear_bit(evt->key.key, s->sunkbd_down) ||
+            --s->sunkbd_count[keycode]) {
+            return;
+        }
         keycode |= 0x80;
     }
     trace_escc_sunkbd_event_out(keycode);

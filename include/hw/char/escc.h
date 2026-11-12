@@ -4,6 +4,7 @@
 #include "chardev/char-fe.h"
 #include "chardev/char-serial.h"
 #include "hw/core/sysbus.h"
+#include "qemu/bitmap.h"
 #include "ui/input.h"
 #include "qom/object.h"
 
@@ -29,6 +30,7 @@ typedef struct {
 } ESCCSERIOQueue;
 
 #define ESCC_SERIAL_REGS 16
+#define ESCC_SUNKBD_KEYS 0x300
 typedef struct ESCCChannelState {
     qemu_irq irq;
     uint32_t rxint, txint, rxint_under_svc, txint_under_svc;
@@ -37,7 +39,10 @@ typedef struct ESCCChannelState {
     uint8_t wregs[ESCC_SERIAL_REGS], rregs[ESCC_SERIAL_REGS];
     ESCCSERIOQueue queue;
     CharFrontend chr;
-    int e0_mode, led_mode, caps_lock_mode, num_lock_mode;
+    int e0_mode, led_mode;
+    /* host keys that are down, by Linux key code, and how many per Sun key */
+    DECLARE_BITMAP(sunkbd_down, ESCC_SUNKBD_KEYS);
+    uint8_t sunkbd_count[128];
     int disabled;
     int clock;
     uint32_t vmstate_dummy;
