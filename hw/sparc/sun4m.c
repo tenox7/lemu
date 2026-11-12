@@ -931,7 +931,7 @@ static void sun4m_hw_init(MachineState *machine)
              */
             if (graphic_width < 640 || graphic_height < 480 ||
                 graphic_width % 8 ||
-                graphic_width * graphic_height > CG3_MAX_VRAM_SIZE) {
+                (int64_t)graphic_width * graphic_height > CG3_MAX_VRAM_SIZE) {
                 error_report("Unsupported resolution: %d x %d (640 x 480 or "
                              "more, 8 MB of pixels at most, and a width that "
                              "8 divides)", graphic_width, graphic_height);
