@@ -38,5 +38,5 @@ Debian container, and writes `pc-bios/QEMU,cgthree.bin`. The unchanged
 
 ## Sizes that were tested
 
-SunOS 4.1.4 with OpenWindows 3: 1024x768, 1152x900, 1920x1080, 2560x1600,
-3200x1800. SunView: 1920x1080.
+SunOS 4.1.4 with OpenWindows 3: 1024x768, 1152x900, 1280x1024, 1920x1080,
+2560x1600, 3200x1800. SunView: 1920x1080.
