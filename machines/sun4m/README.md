@@ -16,9 +16,10 @@ size, and the keyboard and mouse behave like the real ones.
 
 - OpenBIOS keeps the top 16 MB of RAM for itself. `-m 32` leaves SunOS 16 MB
   (`mem = 16252K` at boot), `-m 256` leaves it 240 MB.
-- With 16 MB, starting OpenWindows can panic the kernel: an allocation in the
-  window system's input code fails and is not checked
-  (`BAD TRAP ... Data access exception` in `vuid_set_value`).
+- With 16 MB, starting OpenWindows can panic the kernel
+  (`BAD TRAP ... Data access exception` in `vuid_set_value`): at the first
+  event of a kind the window system asks for 76 bytes without waiting, and
+  it does not check that it got them. It is rare: once in 14 starts here.
 - The SPARCstation 5 takes 256 MB at most.
 
 ## Idle
@@ -48,6 +49,18 @@ the mouse on channel B. What LEMU fixed:
 - **Mouse packets.** A full queue cut a packet in half.
 
 `tests/qtest/sun4m-escc-test.c` checks all of these.
+
+What SunOS does by itself, which a script that moves the mouse must know:
+
+- **The first 48 mouse packets do nothing.** When the window system opens
+  the mouse, the kernel tries line speeds, and at each one it throws the
+  first packets away: 48 at 9600 baud, where it starts (`msopen`, `msrserv`
+  and `msrput` in the kernel). The emulated mouse has no line speed, so
+  SunOS stays at 9600. The pointer follows from packet 49 on. A hand on the
+  mouse loses a moment once; a script has to send 48 moves first.
+- **The pointer speeds up.** OpenWindows doubles some moves (`xset q`:
+  acceleration 2/1, threshold 15), so moves out and back may not end where
+  they began. `xset m 1 1` turns it off, and then they do.
 
 The emulated keyboard is a Type 5 with the US layout. Stop (L1) and the
 other keys on its left side have no key on a PC or Mac keyboard.
