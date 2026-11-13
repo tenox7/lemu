@@ -447,6 +447,11 @@ paused VM records nothing. Two options leave the waiting out:
 - **A VM is missing from `vm-list`.** It was started with `-mcp off` or
   under `-qtest`, or by another user. Each VM writes
   `/tmp/lemu-$UID/<pid>.json`; check that the file is there.
+- **A new tool is missing.** The agent gets its tool list once, when it
+  starts `lemu-mcp`: the tools that `lemu-mcp` was built with, plus any
+  other tools of the first VM it finds. After you rebuild, start a new
+  agent session. A VM that still runs an older build answers newer tools
+  and options with an error until you restart it.
 - **Your own socket.** `-mcp unix:vm.mcp,server=on,wait=off` gives a VM its
   own socket instead of the default one. `lemu-mcp` still finds it. On
   macOS, Unix socket paths must stay under about 104 bytes.

@@ -755,24 +755,27 @@ static bool tools_have(QList *list, const char *name)
     return false;
 }
 
+/* The tools this bridge was built with */
+static QList *tools_own(void)
+{
+    QList *list = qlist_new();
+    const McpToolDef *t;
+
+    for (t = mcp_tools; t->name; t++) {
+        qlist_append_obj(list, qobject_from_json(t->json, &error_abort));
+    }
+    /* A VM without HMP leaves hmp out, but other VMs may have it */
+    qlist_append_obj(list, qobject_from_json(mcp_tool_hmp, &error_abort));
+    qlist_append_obj(list, qobject_from_json(mcp_tool_qmp, &error_abort));
+    qlist_append_obj(list, qobject_from_json(mcp_tool_steps, &error_abort));
+    return list;
+}
+
+/* Adds the vm argument to each tool, then vm-list and vm-wait */
 static QList *tools_finish(QList *list)
 {
     const QListEntry *e;
 
-    /*
-     * The VMs add hmp, qmp and steps themselves, but the list must have
-     * them also when no VM was up yet, or when the first VM has no HMP.
-     */
-    if (!tools_have(list, "hmp")) {
-        qlist_append_obj(list, qobject_from_json(mcp_tool_hmp, &error_abort));
-    }
-    if (!tools_have(list, "qmp")) {
-        qlist_append_obj(list, qobject_from_json(mcp_tool_qmp, &error_abort));
-    }
-    if (!tools_have(list, "steps")) {
-        qlist_append_obj(list,
-                         qobject_from_json(mcp_tool_steps, &error_abort));
-    }
     QLIST_FOREACH_ENTRY(list, e) {
         QDict *tool = qobject_to(QDict, qlist_entry_obj(e));
 
@@ -785,22 +788,36 @@ static QList *tools_finish(QList *list)
     return list;
 }
 
+/*
+ * The bridge's own tools, then those of the first VM that it lacks, such
+ * as the tools of a newer build.  Its own come first: a VM that still
+ * runs an older build must not hide newer tools and options from the
+ * agent for its whole session.  That VM answers them with an error.
+ */
 static QList *tools_from_vm(QDict *result)
 {
     QList *tools = qdict_get_qlist(result, "tools");
+    QList *list;
+    const QListEntry *e;
 
-    return tools ? tools_finish(qlist_copy(tools)) : NULL;
+    if (!tools) {
+        return NULL;
+    }
+    list = tools_own();
+    QLIST_FOREACH_ENTRY(tools, e) {
+        QDict *tool = qobject_to(QDict, qlist_entry_obj(e));
+        const char *name = tool ? qdict_get_try_str(tool, "name") : NULL;
+
+        if (name && !tools_have(list, name)) {
+            qlist_append(list, qobject_ref(tool));
+        }
+    }
+    return tools_finish(list);
 }
 
 static QList *tools_builtin(void)
 {
-    QList *list = qlist_new();
-    const McpToolDef *t;
-
-    for (t = mcp_tools; t->name; t++) {
-        qlist_append_obj(list, qobject_from_json(t->json, &error_abort));
-    }
-    return tools_finish(list);
+    return tools_finish(tools_own());
 }
 
 static void tools_reply(QObject *id, QList *list)
