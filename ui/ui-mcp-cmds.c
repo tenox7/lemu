@@ -27,6 +27,8 @@
 #include "ui/input.h"
 #include "ui/png.h"
 #include "ui/pointer.h"
+#include "ui/record.h"
+#include "ui-mcp.h"
 #include "vnc_keysym.h"
 
 #define MCP_MAX_KEYS        100000
@@ -37,7 +39,7 @@
  * The input context: the MCP call's, or @local for a QMP caller.
  * Declare @local with g_auto(QemuInputCtx) so it ends with the call.
  */
-static QemuInputCtx *mcp_ctx(QemuInputCtx *local)
+QemuInputCtx *mcp_ctx(QemuInputCtx *local)
 {
     QemuInputCtx *ctx = mcp_current_input_ctx();
 
@@ -83,7 +85,7 @@ static char *mcp_console_list(void)
     return g_string_free(s, false);
 }
 
-static QemuConsole *mcp_console(QObject *arg, int head, Error **errp)
+QemuConsole *mcp_console(QObject *arg, int head, Error **errp)
 {
     QemuConsole *con = NULL;
     QNum *num = qobject_to(QNum, arg);
@@ -152,9 +154,8 @@ static void mcp_draw_pointer(pixman_image_t *img, QemuConsole *con,
 }
 
 /* PNG of @img, a capture of a @screen_w x @screen_h screen */
-static McpImage *mcp_image_encode(pixman_image_t *img, int screen_w,
-                                  int screen_h, ScreenRegion *region,
-                                  double scale, Error **errp)
+McpImage *mcp_image_encode(pixman_image_t *img, int screen_w, int screen_h,
+                           ScreenRegion *region, double scale, Error **errp)
 {
     g_autoptr(GByteArray) png = qemu_png_encode(img, errp);
     McpImage *mi;
@@ -1391,6 +1392,29 @@ static bool mcp_char_layout(kbd_layout_t *k, gunichar c, McpChar *out)
     return out->lnx != 0;
 }
 
+/*
+ * Human typing, for a video: a key every 125 ms or so, unevenly, and
+ * longer pauses after a word, punctuation and a line.  The same text
+ * gets the same rhythm every time.
+ */
+static void mcp_human_pace(gunichar c, uint32_t *seed, int *hold, int *gap)
+{
+    int iki;
+
+    *seed = *seed * 1103515245 + 12345;
+    iki = 125 * (60 + (*seed >> 16) % 81) / 100;     /* 75 to 175 ms */
+    *seed = *seed * 1103515245 + 12345;
+    *hold = 40 + (*seed >> 16) % 51;                 /* 40 to 90 ms */
+    *gap = MAX(10, iki - *hold);
+    if (c == '\n') {
+        *gap += 300;
+    } else if (c == ' ') {
+        *gap += 60;
+    } else if (g_unichar_ispunct(c)) {
+        *gap += 150;
+    }
+}
+
 McpInputResult *coroutine_fn qmp_type_text(const char *text,
                                            const char *layout,
                                            bool has_char_delay_ms,
@@ -1398,6 +1422,7 @@ McpInputResult *coroutine_fn qmp_type_text(const char *text,
                                            bool has_hold_ms, int64_t hold_ms,
                                            bool has_modifier_lead_ms,
                                            int64_t modifier_lead_ms,
+                                           bool has_human, bool human,
                                            QObject *console, McpThen *then,
                                            Error **errp)
 {
@@ -1410,6 +1435,8 @@ McpInputResult *coroutine_fn qmp_type_text(const char *text,
     int lead = has_modifier_lead_ms ? modifier_lead_ms : 20;
     int hold = has_hold_ms ? hold_ms : 20;
     int delay = has_char_delay_ms ? char_delay_ms : 30;
+    bool hum = has_human ? human : qemu_record_active();
+    uint32_t seed = 1;
     kbd_layout_t *k = NULL;
     QemuInputBatch *b;
     McpInputResult *res;
@@ -1454,6 +1481,9 @@ McpInputResult *coroutine_fn qmp_type_text(const char *text,
             qemu_input_batch_free(b);
             return NULL;
         }
+        if (hum) {
+            mcp_human_pace(c, &seed, &hold, &delay);
+        }
         if (mc.shift) {
             qemu_input_batch_key(b, shift, true);
             qemu_input_batch_delay(b, lead);
@@ -1484,8 +1514,8 @@ McpInputResult *coroutine_fn qmp_type_text(const char *text,
         return NULL;
     }
     res = g_new0(McpInputResult, 1);
-    g_string_printf(summary, "typed %ld character%s", count,
-                    count == 1 ? "" : "s");
+    g_string_printf(summary, "typed %ld character%s%s", count,
+                    count == 1 ? "" : "s", hum ? ", like a person" : "");
     mcp_key_warning(res, con);
     if (!mcp_co_input_finish(&in, res, summary, errp)) {
         qapi_free_McpInputResult(res);
@@ -1508,6 +1538,42 @@ static QemuPointerMethod mcp_method(bool has_method, McpPointerMethod m)
     default:
         return QEMU_POINTER_AUTO;
     }
+}
+
+static QemuPointerHome mcp_home(bool has_home, McpPointerHome home)
+{
+    switch (has_home ? home : MCP_POINTER_HOME_AUTO) {
+    case MCP_POINTER_HOME_ALWAYS:
+        return QEMU_POINTER_HOME_ALWAYS;
+    case MCP_POINTER_HOME_NEVER:
+        return QEMU_POINTER_HOME_NEVER;
+    default:
+        return QEMU_POINTER_HOME_AUTO;
+    }
+}
+
+/* Natural motion: when asked for, and by default while it records */
+static bool mcp_motion(QemuPointerOpts *o, bool has_motion,
+                       McpPointerMotion motion, bool has_duration_ms,
+                       int64_t duration_ms, Error **errp)
+{
+    if (!has_motion || motion == MCP_POINTER_MOTION_AUTO) {
+        o->natural = has_duration_ms || qemu_record_active();
+    } else {
+        o->natural = motion == MCP_POINTER_MOTION_NATURAL;
+    }
+    if (has_duration_ms) {
+        if (!o->natural) {
+            error_setg(errp, "duration-ms is for natural motion");
+            return false;
+        }
+        if (duration_ms < 1 || duration_ms > 60000) {
+            error_setg(errp, "duration-ms must be from 1 to 60000");
+            return false;
+        }
+        o->duration_ms = duration_ms;
+    }
+    return true;
 }
 
 static McpPointer *mcp_pointer_info(QemuConsole *con)
@@ -1581,6 +1647,10 @@ McpInputResult *coroutine_fn qmp_mouse_move(bool has_x, int64_t x,
                                             bool has_step_px, int64_t step_px,
                                             bool has_step_delay_ms,
                                             int64_t step_delay_ms,
+                                            bool has_motion,
+                                            McpPointerMotion motion,
+                                            bool has_duration_ms,
+                                            int64_t duration_ms,
                                             QObject *console, McpThen *then,
                                             Error **errp)
 {
@@ -1603,10 +1673,10 @@ McpInputResult *coroutine_fn qmp_mouse_move(bool has_x, int64_t x,
     }
     qemu_pointer_opts_init(&o);
     o.method = mcp_method(has_method, method);
-    if (has_home) {
-        o.home = home == MCP_POINTER_HOME_ALWAYS ? QEMU_POINTER_HOME_ALWAYS :
-                 home == MCP_POINTER_HOME_NEVER ? QEMU_POINTER_HOME_NEVER :
-                 QEMU_POINTER_HOME_AUTO;
+    o.home = mcp_home(has_home, home);
+    if (!mcp_motion(&o, has_motion, motion, has_duration_ms, duration_ms,
+                    errp)) {
+        return NULL;
     }
     if (has_step_px) {
         o.step_px = MAX(1, step_px);
@@ -1655,6 +1725,12 @@ McpInputResult *coroutine_fn qmp_mouse_click(bool has_x, int64_t x,
                                              bool has_hold_ms, int64_t hold_ms,
                                              bool has_method,
                                              McpPointerMethod method,
+                                             bool has_home,
+                                             McpPointerHome home,
+                                             bool has_motion,
+                                             McpPointerMotion motion,
+                                             bool has_duration_ms,
+                                             int64_t duration_ms,
                                              QObject *console, McpThen *then,
                                              Error **errp)
 {
@@ -1664,6 +1740,7 @@ McpInputResult *coroutine_fn qmp_mouse_click(bool has_x, int64_t x,
     g_autoptr(GString) summary = g_string_new(NULL);
     InputButton btn = has_button ? button : INPUT_BUTTON_LEFT;
     QemuPointerResult pr = { 0 };
+    QemuPointerOpts o;
     QemuInputBatch *b;
     McpInputResult *res;
     McpInput in;
@@ -1683,14 +1760,17 @@ McpInputResult *coroutine_fn qmp_mouse_click(bool has_x, int64_t x,
         error_setg(errp, "count must be 1, 2 or 3");
         return NULL;
     }
+    qemu_pointer_opts_init(&o);
+    o.method = mcp_method(has_method, method);
+    o.home = mcp_home(has_home, home);
+    if (!mcp_motion(&o, has_motion, motion, has_duration_ms, duration_ms,
+                    errp)) {
+        return NULL;
+    }
     if (!mcp_input_begin(&in, con, then, ctx, errp)) {
         return NULL;
     }
     if (has_x) {
-        QemuPointerOpts o;
-
-        qemu_pointer_opts_init(&o);
-        o.method = mcp_method(has_method, method);
         if (!qemu_pointer_co_move(con, ctx, x, y, &o, &pr, errp)) {
             mcp_input_abort(&in);
             return NULL;
@@ -1746,6 +1826,10 @@ McpInputResult *coroutine_fn qmp_mouse_drag(McpPoint *from, McpPoint *to,
                                             int64_t step_delay_ms,
                                             bool has_method,
                                             McpPointerMethod method,
+                                            bool has_motion,
+                                            McpPointerMotion motion,
+                                            bool has_duration_ms,
+                                            int64_t duration_ms,
                                             QObject *console, McpThen *then,
                                             Error **errp)
 {
@@ -1759,12 +1843,20 @@ McpInputResult *coroutine_fn qmp_mouse_drag(McpPoint *from, McpPoint *to,
     QemuPointerOpts o;
     McpInputResult *res;
     McpInput in;
+    int drag_ms;
 
     if (!con) {
         return NULL;
     }
     qemu_pointer_opts_init(&o);
     o.method = mcp_method(has_method, method);
+    if (!mcp_motion(&o, has_motion, motion, has_duration_ms, duration_ms,
+                    errp)) {
+        return NULL;
+    }
+    /* duration-ms is for the drag; the move to its start takes its own */
+    drag_ms = o.duration_ms;
+    o.duration_ms = 0;
     if (!mcp_input_begin(&in, con, then, ctx, errp)) {
         return NULL;
     }
@@ -1781,6 +1873,7 @@ McpInputResult *coroutine_fn qmp_mouse_drag(McpPoint *from, McpPoint *to,
         o.step_delay_ms = MAX(0, step_delay_ms);
     }
     o.home = QEMU_POINTER_HOME_NEVER;
+    o.duration_ms = drag_ms;
     if (!mcp_co_sleep(ctx, wait) ||
         !qemu_pointer_co_move(con, ctx, to->x, to->y, &o, &pr2, errp) ||
         !mcp_co_button(con, ctx, btn, false, wait, errp)) {
@@ -1974,6 +2067,7 @@ McpInputResult *coroutine_fn qmp_mouse_wheel(bool has_x, int64_t x,
 
         qemu_pointer_opts_init(&o);
         o.method = mcp_method(has_method, method);
+        o.natural = qemu_record_active();
         if (!qemu_pointer_co_move(con, ctx, x, y, &o, &pr, errp)) {
             mcp_input_abort(&in);
             return NULL;

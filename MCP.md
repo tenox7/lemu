@@ -52,6 +52,7 @@ only when exactly one VM is running and you started it.
 | `screenshot` | Take a picture of a screen (PNG) |
 | `frames` | List recent screens, to find one that went by too fast |
 | `sound` | Hear the guest's sound: whether it plays one, how long and how loud; wait for a sound and the quiet after it |
+| `record` | Record a screen as a video with the guest's sound, for YouTube: chapters, captions, an ffmpeg command that renders it |
 | `wait-screen` | Wait until the screen changes, settles, shows a colour or shows some text. Use it instead of sleeping |
 | `screen-text` | Read a text-mode screen (BIOS, DOS, NT setup) as text |
 | `key` | Press keys and key combinations |
@@ -173,6 +174,7 @@ Use these:
 | Change a CD or floppy | `media` |
 | Put host files into a guest | `media` `insert` with `files` |
 | Get files out of a guest | `media` `insert` with `files: []`, the guest writes to the floppy, then `media` `copy-out` |
+| Record a video of the guest (a demo, a how-to) | `record` `start`, use the tools as usual, `record` `stop`; see [Recording videos](#recording-videos) |
 
 - **Every serial port works.** The serial tools see what the guest
   writes to every serial port, whatever it is connected to: a socket, a
@@ -350,6 +352,50 @@ Use these:
 - **Guests with `rshd`:** an rsh MCP server such as
   [rsh-mcp](https://github.com/tenox7/rsh-mcp) runs commands and copies
   files over the network, which is faster.
+
+## Recording videos
+
+`record` records one screen as a video, with the sound the guest
+plays, for a screencast or a YouTube video.
+
+1. `record` `start`, with a `file` name (no extension). The files go
+   to the VM's folder unless the path says otherwise.
+2. Use the other tools as usual. While it records, the mouse tools
+   move the pointer like a hand: it speeds up, slows down before the
+   target and bends a little on the way. `type-text` types like a
+   person, about 8 characters a second. Give `motion: direct` or
+   `human: false` for the old speed, and `duration-ms` for a slower or
+   faster move.
+3. `record` `mark` as you go: a `chapter` with a title, a `caption`
+   (a subtitle for `duration-ms`), a `zoom` on a `region`, or a
+   `note` for the edit.
+4. `record` `stop`. It returns the files, the chapters as YouTube wants
+   them in the description, a contact sheet of the video, and a
+   `render` command.
+
+What you get:
+
+- **`<file>.avi`**: lossless video (ZMBV, as DOSBox makes) and the
+  sound as PCM. ffmpeg, VLC, mpv and most video editors read it. A new
+  file (`<file>-2.avi` and on) begins when the screen changes its size,
+  as when a guest leaves its text-mode boot for a desktop, and after
+  1 GiB. An hour is about 0.6 GB for the sound, plus the picture.
+- **`<file>.json`**: the files, the marks, every MCP call with its
+  time in the video, and the cuts. **`<file>.srt`**: the captions.
+- **`render`**: an ffmpeg command that makes `<file>.mp4` for YouTube:
+  4K with sharp pixels, 4:3 for old text modes, the files joined. Run
+  it in a shell (`brew install ffmpeg` on a Mac).
+
+The video runs on guest time: a busy host never drops a frame, and a
+paused VM records nothing. Two options leave the waiting out:
+
+- **`freeze: true`** pauses the VM between MCP calls, so the video has
+  no gaps while you think. The VM then runs only during tool calls
+  that act (keys, the mouse, waits); screenshots don't let it run. Use
+  a `then` wait or `wait-screen` to let the guest work, or a mark's
+  `hold-ms` to record some seconds of it.
+- **`skip-still-ms`** leaves out time when the screen and the sound
+  stand still for longer than that, such as a long install.
 
 ## Networking
 

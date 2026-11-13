@@ -663,12 +663,16 @@ static QDict *fake_run(FakeGuest *g, const char *cmd)
     return rsp;
 }
 
-/* mouse-move to @x, @y must land within @slack px; @want in the summary */
-static void fake_move(FakeGuest *g, int x, int y, int slack, const char *want)
+/*
+ * mouse-move to @x, @y, with the arguments @opts too, must land within
+ * @slack px; @want in the summary
+ */
+static void fake_move_opts(FakeGuest *g, int x, int y, const char *opts,
+                           int slack, const char *want)
 {
     g_autofree char *cmd = g_strdup_printf("{'execute': 'mouse-move',"
-                                           " 'arguments': {'x': %d, 'y': %d}}",
-                                           x, y);
+                                           " 'arguments': {'x': %d, 'y': %d"
+                                           "%s}}", x, y, opts);
     QDict *rsp = fake_run(g, cmd);
     QDict *ret = qdict_get_qdict(rsp, "return");
     const char *summary;
@@ -682,6 +686,11 @@ static void fake_move(FakeGuest *g, int x, int y, int slack, const char *want)
     g_assert_cmpint(abs(g->x - x), <=, slack);
     g_assert_cmpint(abs(g->y - y), <=, slack);
     qobject_unref(rsp);
+}
+
+static void fake_move(FakeGuest *g, int x, int y, int slack, const char *want)
+{
+    fake_move_opts(g, x, y, "", slack, want);
 }
 
 /*
@@ -731,6 +740,46 @@ static void test_pointer_accel(void)
     fake_init(&g, 1, 4);
     fake_move(&g, 150, 100, 0, "steps of 1 count, and a count moves 1.00");
     fake_move(&g, 90, 160, 0, NULL);
+    screen_free(&g.s);
+}
+
+/*
+ * Natural motion, for videos, lands as exactly as a direct move, in the
+ * open loop on a guest that speeds up moves of 4 counts or more
+ */
+static void test_pointer_natural(void)
+{
+    FakeGuest g;
+    QDict *rsp;
+
+    fake_init(&g, 1, 4);
+    fake_move(&g, 150, 100, 0, "steps of 1 count");
+    fake_move_opts(&g, 400, 300, ", 'motion': 'natural'", 0, NULL);
+    fake_move_opts(&g, 60, 420, ", 'motion': 'natural',"
+                   " 'duration-ms': 300", 0, NULL);
+    rsp = fake_run(&g, "{'execute': 'mouse-move', 'arguments': {'x': 1,"
+                   " 'y': 1, 'motion': 'direct', 'duration-ms': 100}}");
+    g_assert(strstr(qdict_get_str(qdict_get_qdict(rsp, "error"), "desc"),
+                    "duration-ms is for natural motion"));
+    qobject_unref(rsp);
+    screen_free(&g.s);
+}
+
+/*
+ * And in the closed loop, where it learns how far the guest moves
+ * steps of each size, through the cursor images of the windows
+ */
+static void test_pointer_natural_hw(void)
+{
+    FakeGuest g;
+
+    fake_init_hw(&g, 1, 4);
+    fake_move(&g, 100, 300, 0, "homed first");
+    fake_move_opts(&g, 500, 200, ", 'motion': 'natural'", 0, NULL);
+    fake_move_opts(&g, 330, 400, ", 'motion': 'natural'", 0, NULL);
+    fake_move_opts(&g, 20, 10, ", 'motion': 'natural'", 0, NULL);
+    fake_move_opts(&g, 600, 450, ", 'motion': 'natural',"
+                   " 'duration-ms': 400", 0, NULL);
     screen_free(&g.s);
 }
 
@@ -4561,6 +4610,109 @@ static void test_sound(void)
  * memory-write changes RAM and ROM but no device, and code made from
  * the old bytes goes away; debug-profile finds the loop
  */
+/* Whether @len bytes at @data hold @str, zero bytes and all */
+static bool buf_has(const char *data, size_t len, const char *str)
+{
+    size_t n = strlen(str), i;
+
+    for (i = 0; i + n <= len; i++) {
+        if (!memcmp(data + i, str, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* record: a video that plays, with its marks, captions and render command */
+static void test_record(void)
+{
+    g_autofree char *dir = g_dir_make_tmp("mcp-record-XXXXXX", NULL);
+    g_autofree char *base = g_build_filename(dir, "take", NULL);
+    g_autofree char *avi = g_strdup_printf("%s.avi", base);
+    g_autofree char *json = g_strdup_printf("%s.json", base);
+    g_autofree char *srt = g_strdup_printf("%s.srt", base);
+    g_autofree char *start = g_strdup_printf("{'action': 'start',"
+                                             " 'file': '%s'}", base);
+    char *data;
+    Screen s;
+    QDict *ret;
+    gsize len;
+    int i;
+
+    g_assert(dir);
+    screen_init_machine(&s, "pc,pcspk-audiodev=snd -audiodev none,id=snd");
+    ret = debug_ok(s.qts, "record", "{'action': 'status'}");
+    g_assert(!qdict_get_bool(ret, "recording"));
+    qobject_unref(ret);
+    debug_check_error(s.qts, "record", "{'action': 'stop'}",
+                      "it does not record");
+    debug_check_error(s.qts, "record", "{'action': 'start', 'fps': 0}",
+                      "fps must be from 1 to 60");
+    ret = debug_ok(s.qts, "record", start);
+    g_assert(qdict_get_bool(ret, "recording"));
+    debug_summary_has(ret, "at 30 fps with the sound of audiodev 'snd'");
+    qobject_unref(ret);
+    debug_check_error(s.qts, "record", start, "it records already");
+
+    /* two seconds of guest time, with a box that comes up */
+    for (i = 0; i < 40; i++) {
+        if (i == 10) {
+            screen_fill(&s, 100, 100, 200, 100, 0xff0000);
+        }
+        if (i == 20) {
+            ret = debug_ok(s.qts, "record", "{'action': 'mark',"
+                           " 'text': 'The box'}");
+            qobject_unref(ret);
+            debug_check_error(s.qts, "record", "{'action': 'mark',"
+                              " 'kind': 'zoom'}", "a zoom needs a region");
+            ret = debug_ok(s.qts, "record", "{'action': 'mark',"
+                           " 'kind': 'caption', 'text': 'A red box',"
+                           " 'duration-ms': 500}");
+            qobject_unref(ret);
+        }
+        qtest_clock_step(s.qts, 50 * SCALE_MS);
+    }
+    ret = debug_ok(s.qts, "record", "{'action': 'status'}");
+    g_assert(qdict_get_bool(ret, "recording"));
+    g_assert_cmpint(qdict_get_int(ret, "frames"), >=, 59);
+    qobject_unref(ret);
+
+    /* 2 s at 30 fps, and the screen at the stop as the last frame */
+    ret = debug_ok(s.qts, "record", "{'action': 'stop'}");
+    g_assert(!qdict_get_bool(ret, "recording"));
+    g_assert_cmpint(qdict_get_int(ret, "frames"), >=, 60);
+    g_assert_cmpint(qdict_get_int(ret, "frames"), <=, 62);
+    g_assert_cmpint(qdict_get_int(ret, "marks"), ==, 2);
+    g_assert(qdict_get_bool(ret, "sound"));
+    g_assert_cmpint(qlist_size(qdict_get_qlist(ret, "files")), ==, 1);
+    g_assert(strstr(qdict_get_str(ret, "render"), "ffmpeg -i"));
+    g_assert(strstr(qdict_get_str(ret, "chapters"), "0:01 The box"));
+    debug_summary_has(ret, "Recorded 2.1 s (");
+    qobject_unref(ret);
+
+    /* an AVI with ZMBV video and an index, the sidecar, the captions */
+    g_assert(g_file_get_contents(avi, &data, &len, NULL));
+    g_assert_cmpint(len, >, 4096);
+    g_assert(!memcmp(data, "RIFF", 4) && !memcmp(data + 8, "AVI LIST", 8));
+    g_assert(buf_has(data, MIN(len, 1024), "ZMBV"));
+    g_assert(buf_has(data, len, "idx1"));
+    g_free(data);
+    g_assert(g_file_get_contents(json, &data, NULL, NULL));
+    g_assert(strstr(data, "\"The box\""));
+    g_free(data);
+    g_assert(g_file_get_contents(srt, &data, NULL, NULL));
+    g_assert(strstr(data, "A red box"));
+    g_free(data);
+
+    /* it never writes over a recording */
+    debug_check_error(s.qts, "record", start, "exists: give another file");
+    screen_free(&s);
+    unlink(avi);
+    unlink(json);
+    unlink(srt);
+    rmdir(dir);
+}
+
 static void test_debug_memory(void)
 {
     g_autofree char *bios = debug_bios();
@@ -5194,9 +5346,12 @@ int main(int argc, char **argv)
     qtest_add_func("/mcp/pointer/slow", test_pointer_slow);
     qtest_add_func("/mcp/pointer/fast", test_pointer_fast);
     qtest_add_func("/mcp/pointer/accel", test_pointer_accel);
+    qtest_add_func("/mcp/pointer/natural", test_pointer_natural);
     if (qtest_has_device("ati-vga")) {
         qtest_add_func("/mcp/pointer/hw-cursor", test_pointer_hw_cursor);
+        qtest_add_func("/mcp/pointer/natural-hw", test_pointer_natural_hw);
     }
+    qtest_add_func("/mcp/record", test_record);
     qtest_add_func("/mcp/vm-stats", test_vm_stats);
     qtest_add_func("/mcp/serial/expect", test_serial_expect);
     qtest_add_func("/mcp/serial/run", test_serial_run);

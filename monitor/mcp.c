@@ -88,6 +88,11 @@ OBJECT_DEFINE_TYPE(MonitorMCP, monitor_mcp, MONITOR_MCP, MONITOR);
 /* The call running in each coroutine, for mcp_current_input_ctx() */
 static GHashTable *mcp_calls_by_co;
 
+static McpCallHook *mcp_call_hook;
+static void *mcp_call_hook_opaque;
+static int mcp_running;
+static int mcp_runstate_quiet;
+
 static void mcp_handle_message(void *opaque, QObject *msg, Error *err);
 
 static McpCall *mcp_current_call(void)
@@ -111,6 +116,31 @@ void mcp_quiet_runstate_events(void)
 
     if (call) {
         call->quiet_runstate = true;
+    }
+}
+
+void mcp_set_call_hook(McpCallHook *hook, void *opaque)
+{
+    mcp_call_hook = hook;
+    mcp_call_hook_opaque = opaque;
+}
+
+int mcp_calls_running(void)
+{
+    return mcp_running;
+}
+
+void mcp_quiet_runstate(bool quiet)
+{
+    mcp_runstate_quiet += quiet ? 1 : -1;
+    assert(mcp_runstate_quiet >= 0);
+}
+
+static void coroutine_fn mcp_hook(const char *tool, QDict *args,
+                                  bool begin, bool top)
+{
+    if (mcp_call_hook) {
+        mcp_call_hook(mcp_call_hook_opaque, tool, args, begin, top);
     }
 }
 
@@ -284,6 +314,9 @@ static void monitor_mcp_emit_event(Monitor *mon, QAPIEvent event,
     McpCall *call;
 
     if (event == QAPI_EVENT_STOP || event == QAPI_EVENT_RESUME) {
+        if (mcp_runstate_quiet) {
+            return;
+        }
         QTAILQ_FOREACH(call, &mcp->calls, node) {
             if (call->quiet_runstate) {
                 return;
@@ -769,7 +802,9 @@ static QDict *coroutine_fn mcp_steps(McpCall *call, QDict *args)
         g_free(call->step);
         call->step = g_strdup_printf("(%d of %d: %s)", i, n, tool);
         call->quiet_runstate = false;
+        mcp_hook(tool, a, true, false);
         rsp = mcp_run_tool(call, tool, a, &err);
+        mcp_hook(tool, a, false, false);
         qerr = rsp ? qdict_get_qdict(rsp, "error") : NULL;
         if (!rsp || qerr) {
             g_ptr_array_add(lines, g_strdup_printf(
@@ -854,6 +889,8 @@ static void coroutine_fn mcp_call_co(void *opaque)
 
     g_hash_table_insert(mcp_calls_by_co, qemu_coroutine_self(), call);
     trace_mcp_tool_start(mcp, call->tool);
+    mcp_running++;
+    mcp_hook(call->tool, call->args, true, true);
 
     if (!strcmp(call->tool, "steps")) {
         result = mcp_steps(call, call->args);
@@ -865,6 +902,8 @@ static void coroutine_fn mcp_call_co(void *opaque)
     }
     qobject_unref(rsp);
 
+    mcp_running--;
+    mcp_hook(call->tool, call->args, false, true);
     g_hash_table_remove(mcp_calls_by_co, qemu_coroutine_self());
     trace_mcp_tool_done(mcp, call->tool, call->discard,
                         qdict_get_bool(result, "isError"));

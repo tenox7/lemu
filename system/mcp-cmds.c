@@ -34,6 +34,7 @@
 #include "ui/input.h"
 #ifdef CONFIG_PIXMAN
 #include "ui/pointer.h"
+#include "ui/record.h"
 #endif
 
 #define STATS_DEFAULT_MS    5000
@@ -207,6 +208,12 @@ McpVmInfo *qmp_vm_info(Error **errp)
 
     g_string_printf(s, "%s, machine %s, %s", *vi->name ? vi->name : "VM",
                     vi->machine, vi->status);
+#ifdef CONFIG_PIXMAN
+    if (qemu_record_frozen()) {
+        g_string_append(s, " (by the recording's freeze: it runs during"
+                        " tool calls that act)");
+    }
+#endif
     if (dflt) {
         g_string_append_printf(s, ", screen %dx%d",
                                qemu_console_get_width(dflt, 0),

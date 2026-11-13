@@ -30,6 +30,28 @@ QemuInputCtx *mcp_current_input_ctx(void);
 void mcp_quiet_runstate_events(void);
 
 /*
+ * A hook that sees every MCP tool call: with @begin before it runs,
+ * and without after it ran.  The steps of a steps call show up one by
+ * one, with @top false, between the begin and the end of the steps
+ * call itself.  It runs in the call's coroutine and may yield there.
+ * @args may be NULL.  One hook at a time; NULL removes it.  The
+ * recorder (ui/record.c) uses it.
+ */
+typedef void coroutine_fn McpCallHook(void *opaque, const char *tool,
+                                      QDict *args, bool begin, bool top);
+void mcp_set_call_hook(McpCallHook *hook, void *opaque);
+
+/* How many MCP tool calls run now, on all MCP monitors */
+int mcp_calls_running(void);
+
+/*
+ * Between mcp_quiet_runstate(true) and (false), MCP clients get no STOP
+ * and RESUME events: for the recorder, which pauses the VM between
+ * calls.
+ */
+void mcp_quiet_runstate(bool quiet);
+
+/*
  * The longest a tool may wait: MCP_WAIT_MAX_MS less what the MCP call
  * running in this coroutine has used, so that the steps of a steps
  * call stay under it in all.  MCP_WAIT_MAX_MS outside MCP.

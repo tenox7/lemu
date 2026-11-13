@@ -615,6 +615,11 @@
 # @modifier-lead-ms: pause after Shift or AltGr goes down
 #     (default: 20)
 #
+# @human: type like a person, for a video: about 8 characters a
+#     second, unevenly, with longer pauses after words, punctuation
+#     and lines.  @char-delay-ms and @hold-ms do not count then.
+#     (default: true while a recording runs, see @record; else false)
+#
 # @console: console index (a number) or device id (a string) to
 #     send to (default: the default console)
 #
@@ -629,7 +634,7 @@
 { 'command': 'type-text',
   'data': { 'text': 'str', '*layout': 'str', '*char-delay-ms': 'int',
             '*hold-ms': 'int', '*modifier-lead-ms': 'int',
-            '*console': 'any', '*then': 'McpThen' },
+            '*human': 'bool', '*console': 'any', '*then': 'McpThen' },
   'returns': 'McpInputResult',
   'features': [ 'mcp' ],
   'coroutine': true,
@@ -675,6 +680,26 @@
   'data': [ 'auto', 'always', 'never' ] }
 
 ##
+# @McpPointerMotion:
+#     How the pointer travels to its target.
+#
+# @auto: natural while a recording runs (see @record), else direct
+#
+# @direct: as fast as the method allows
+#
+# @natural: like a hand on a mouse, for a video: it speeds up, slows
+#     down before the target and bends a little on the way, in about
+#     0.3 s for a short move to 1 s across the screen.  A relative
+#     mouse is homed only when its position is unknown, not when it
+#     is old, and still moves no faster than the guest takes without
+#     speeding the steps up.
+#
+# Since: 11.2
+##
+{ 'enum': 'McpPointerMotion',
+  'data': [ 'auto', 'direct', 'natural' ] }
+
+##
 # @mouse-move:
 #     Move the mouse pointer to @x, @y, or by @dx, @dy.  Works with
 #     relative mice: see @method.  Give either @x and @y, or @dx and
@@ -699,6 +724,12 @@
 #
 # @step-delay-ms: open loop: pause between steps (default: 20)
 #
+# @motion: how the pointer travels (default: auto)
+#
+# @duration-ms: natural motion: how long the move takes, 1 to 60000
+#     (default: from the distance).  Giving it asks for natural
+#     motion.
+#
 # @console: console index (a number) or device id (a string) to
 #     send to (default: the default console)
 #
@@ -714,6 +745,7 @@
   'data': { '*x': 'int', '*y': 'int', '*dx': 'int', '*dy': 'int',
             '*method': 'McpPointerMethod', '*home': 'McpPointerHome',
             '*step-px': 'int', '*step-delay-ms': 'int',
+            '*motion': 'McpPointerMotion', '*duration-ms': 'int',
             '*console': 'any', '*then': 'McpThen' },
   'returns': 'McpInputResult',
   'features': [ 'mcp' ],
@@ -740,6 +772,14 @@
 #
 # @method: how to move (default: auto)
 #
+# @home: when to home the pointer first (default: auto)
+#
+# @motion: how the pointer travels (default: auto)
+#
+# @duration-ms: natural motion: how long the move takes, 1 to 60000
+#     (default: from the distance).  Giving it asks for natural
+#     motion.
+#
 # @console: console index (a number) or device id (a string) to
 #     send to (default: the default console)
 #
@@ -754,8 +794,9 @@
 { 'command': 'mouse-click',
   'data': { '*x': 'int', '*y': 'int', '*button': 'InputButton',
             '*count': 'int', '*interval-ms': 'int', '*hold-ms': 'int',
-            '*method': 'McpPointerMethod', '*console': 'any',
-            '*then': 'McpThen' },
+            '*method': 'McpPointerMethod', '*home': 'McpPointerHome',
+            '*motion': 'McpPointerMotion', '*duration-ms': 'int',
+            '*console': 'any', '*then': 'McpThen' },
   'returns': 'McpInputResult',
   'features': [ 'mcp' ],
   'coroutine': true,
@@ -792,6 +833,13 @@
 #
 # @method: how to move to @from (default: auto)
 #
+# @motion: how the pointer travels, to @from and on to @to
+#     (default: auto)
+#
+# @duration-ms: natural motion: how long the drag from @from to @to
+#     takes, 1 to 60000 (default: from the distance).  Giving it asks
+#     for natural motion.
+#
 # @console: console index (a number) or device id (a string) to
 #     send to (default: the default console)
 #
@@ -807,6 +855,7 @@
   'data': { 'from': 'McpPoint', 'to': 'McpPoint', '*button': 'InputButton',
             '*press-wait-ms': 'int', '*step-px': 'int',
             '*step-delay-ms': 'int', '*method': 'McpPointerMethod',
+            '*motion': 'McpPointerMotion', '*duration-ms': 'int',
             '*console': 'any', '*then': 'McpThen' },
   'returns': 'McpInputResult',
   'features': [ 'mcp' ],
@@ -1569,6 +1618,189 @@
   'returns': 'McpSound',
   'features': [ 'mcp', 'mcp-read-only' ],
   'coroutine': true }
+
+##
+# @McpRecordAction:
+#     What @record does.
+#
+# @start: begin recording a console
+#
+# @mark: note this moment for the edit: a chapter, a caption, a
+#     close-up or a note
+#
+# @status: say how the recording goes
+#
+# @stop: stop, finish the files, and say how to make the video for
+#     YouTube
+#
+# Since: 11.2
+##
+{ 'enum': 'McpRecordAction',
+  'data': [ 'start', 'mark', 'status', 'stop' ],
+  'if': 'CONFIG_PIXMAN' }
+
+##
+# @McpRecordMarkKind:
+#     What a mark is.
+#
+# @chapter: a chapter begins: @text is its title.  @stop lists them
+#     as YouTube takes chapters in a video's description.
+#
+# @caption: @text is shown for @duration-ms, as a subtitle
+#
+# @zoom: @region is shown close up for @duration-ms
+#
+# @note: @text is a note for the edit
+#
+# Since: 11.2
+##
+{ 'enum': 'McpRecordMarkKind',
+  'data': [ 'chapter', 'caption', 'zoom', 'note' ],
+  'if': 'CONFIG_PIXMAN' }
+
+##
+# @McpRecordFile:
+#     One video file of a recording.  A new one begins when the screen
+#     changes its size, and after 1 GiB.
+#
+# @file: its path
+#
+# @width: its width in pixels
+#
+# @height: its height in pixels
+#
+# @start-ms: where it begins in the recording
+#
+# @length-ms: how long it is
+#
+# Since: 11.2
+##
+{ 'struct': 'McpRecordFile',
+  'data': { 'file': 'str', 'width': 'int', 'height': 'int',
+            'start-ms': 'int', 'length-ms': 'int' },
+  'if': 'CONFIG_PIXMAN' }
+
+##
+# @McpRecord:
+#     What @record returns.
+#
+# @recording: whether it records now
+#
+# @length-ms: how long the video is
+#
+# @frames: the frames in it
+#
+# @dropped-frames: frames it could not write in time, because the
+#     disk was too slow: the frame before shows longer instead
+#
+# @bytes: the size of the video files
+#
+# @sound: whether the video has the guest's sound
+#
+# @files: the video files, in order
+#
+# @marks: how many marks it has
+#
+# @skipped-ms: guest time left out by @skip-still-ms
+#
+# @paused-ms: time the VM was paused between calls by @freeze
+#
+# @chapters: with stop: the chapters, to paste into the video's
+#     description on YouTube
+#
+# @render: with stop: an ffmpeg command that makes the video for
+#     YouTube: 4K, sharp pixels, the right shape for old text modes,
+#     and the files joined
+#
+# @sidecar: with stop: a JSON file with the files, the marks, every
+#     MCP call and the cuts, for the edit
+#
+# @subtitles: with stop: an SRT file with the captions, if any
+#
+# Since: 11.2
+##
+{ 'struct': 'McpRecord',
+  'base': 'McpResult',
+  'data': { 'recording': 'bool', '*length-ms': 'int', '*frames': 'int',
+            '*dropped-frames': 'int', '*bytes': 'int', '*sound': 'bool',
+            '*files': [ 'McpRecordFile' ], '*marks': 'int',
+            '*skipped-ms': 'int', '*paused-ms': 'int',
+            '*chapters': 'str', '*render': 'str', '*sidecar': 'str',
+            '*subtitles': 'str' },
+  'if': 'CONFIG_PIXMAN' }
+
+##
+# @record:
+#     Record a console as a video, with the guest's sound, for a
+#     screencast or a YouTube video.  The video is lossless (ZMBV in
+#     AVI files, which ffmpeg, VLC and video editors read) and runs on
+#     guest time: every frame is there, a busy host only makes the
+#     recording take longer, and a paused VM records nothing.  The
+#     pointer is in it.  Call it with start, use the other tools as
+#     usual, add marks, then call it with stop, which returns the
+#     files, an ffmpeg command that renders them for YouTube, the
+#     chapters, and a contact sheet of the video.  With @freeze, the
+#     VM runs only during MCP calls, so the video has no waits while
+#     you think: let it run with a wait (a 'then', wait-screen) or a
+#     mark's @hold-ms, since screenshots then show no progress.
+#     While it records, the mouse tools move the pointer like a hand
+#     and type-text types like a person, unless their motion or human
+#     says otherwise.
+#
+# @action: start, mark, status or stop
+#
+# @file: with start: where to write, without an extension: <file>.avi
+#     (then <file>-2.avi and on), <file>.json and <file>.srt.  A
+#     relative path is relative to the VM's working directory
+#     (default: lemu-take-<date>-<time> there)
+#
+# @console: with start: console index (a number) or device id (a
+#     string) (default: the default console)
+#
+# @head: with start: head of a multi-head device (default: 0)
+#
+# @fps: with start: frames per second of guest time, from 1 to 60
+#     (default: 30)
+#
+# @audio: with start: record the sound that the guest plays into its
+#     audiodevs, if it has any (default: true)
+#
+# @freeze: with start: pause the VM between MCP calls (default: false)
+#
+# @skip-still-ms: with start: when the screen stands still and the
+#     sound is quiet for longer than this, leave the rest of that time
+#     out of the video; a blinking text cursor does not count as a
+#     change.  0 records everything (default: 0)
+#
+# @kind: with mark: chapter, caption, zoom or note (default: chapter)
+#
+# @text: with mark: the chapter's title, the caption or the note
+#
+# @region: with mark: the part of the screen a zoom shows
+#
+# @duration-ms: with mark: how long a caption or a zoom lasts
+#     (default: 3000)
+#
+# @hold-ms: with mark: then record this much more guest time before
+#     returning, also with @freeze, at most 60000 (default: 0)
+#
+# Features:
+#
+# @mcp: offered as an MCP tool
+#
+# Since: 11.2
+##
+{ 'command': 'record',
+  'data': { 'action': 'McpRecordAction', '*file': 'str',
+            '*console': 'any', '*head': 'int', '*fps': 'int',
+            '*audio': 'bool', '*freeze': 'bool', '*skip-still-ms': 'int',
+            '*kind': 'McpRecordMarkKind', '*text': 'str',
+            '*region': 'ScreenRegion', '*duration-ms': 'int',
+            '*hold-ms': 'int' },
+  'returns': 'McpRecord',
+  'features': [ 'mcp' ],
+  'coroutine': true,
+  'if': 'CONFIG_PIXMAN' }
 
 ##
 # @McpDebugMemory:

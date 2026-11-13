@@ -20,6 +20,11 @@
  * The model forgets the position when something else moves the mouse,
  * when the screen size changes, and on reset.
  *
+ * Natural motion, for videos, moves the pointer the way a hand moves a
+ * mouse, on top of any of the three: it speeds up, slows down before
+ * the target (minimum jerk) and bends a little on the way, in about
+ * the time Fitts' law gives a person.
+ *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
@@ -53,6 +58,10 @@
 #define POINTER_SHAPES          16      /* cursor images it keeps hotspots of */
 #define POINTER_PROBES          4       /* closed loop: steps sent again */
 #define POINTER_HOT_HOMINGS     2       /* closed loop: homings in one move */
+#define POINTER_GLIDE_TICK_MS   16      /* natural: time between moves */
+#define POINTER_GLIDE_MIN_MS    150     /* natural: the shortest move */
+#define POINTER_GLIDE_MAX_MS    2500    /* natural: the longest, by default */
+#define POINTER_GLIDE_BOW       40      /* natural: px it bends at most */
 
 /* Closed loop: the hotspot of a cursor image, from its top-left corner */
 typedef struct PointerHot {
@@ -84,6 +93,12 @@ typedef struct QemuPointer {
     double err_x, err_y;        /* how far off the gain may be, as a part */
     double drift;               /* px the position may be off, from that */
     int cal_w, cal_h;           /* the screen size it was measured at */
+    /*
+     * closed loop: px a count moved, across and down, in steps whose
+     * bigger axis had n counts; 0: not seen.  A guest that speeds up
+     * big steps moves them further.
+     */
+    float step_gain[2][POINTER_LOOP_CAP + 1];
     QLIST_ENTRY(QemuPointer) node;
 } QemuPointer;
 
@@ -97,6 +112,7 @@ static void pointer_reset(void *opaque)
         p->known = false;
         p->n_hot = 0;
         p->cal_done = false;    /* another guest may boot */
+        memset(p->step_gain, 0, sizeof(p->step_gain));
         p->unknown_told = false;
     }
 }
@@ -150,6 +166,40 @@ void qemu_pointer_opts_init(QemuPointerOpts *o)
     o->step_px = 4;
     o->step_auto = true;
     o->step_delay_ms = 20;
+    o->natural = false;
+    o->duration_ms = 0;
+}
+
+/* Natural motion: how long a person takes to move @d px */
+static int pointer_glide_ms(double d, const QemuPointerOpts *o)
+{
+    if (o->duration_ms > 0) {
+        return o->duration_ms;
+    }
+    return MAX(POINTER_GLIDE_MIN_MS,
+               MIN(POINTER_GLIDE_MAX_MS, (int)(250 + 120 * log2(1 + d / 24))));
+}
+
+/*
+ * Natural motion: where the hand is at @t (0 to 1) of its way from
+ * @x0, @y0 to @x1, @y1, on a @w x @h screen.  Minimum jerk: it starts
+ * and stops gently, fastest halfway.  Like a hand turning at the
+ * wrist, it bends upward, by 6% of the distance at most.
+ */
+static void pointer_glide_at(int x0, int y0, int x1, int y1, double t,
+                             int w, int h, int *x, int *y)
+{
+    double s = t * t * t * (10 - t * (15 - 6 * t));
+    double dx = x1 - x0, dy = y1 - y0, d = hypot(dx, dy);
+    double bow = d > 0 ? MIN(0.06 * d, POINTER_GLIDE_BOW) *
+                         4 * s * (1 - s) / d : 0;
+
+    if (dx < 0) {
+        bow = -bow;             /* (dy, -dx) * bow points up */
+    }
+
+    *x = MAX(0, MIN(w - 1, (int)lround(x0 + dx * s + dy * bow)));
+    *y = MAX(0, MIN(h - 1, (int)lround(y0 + dy * s - dx * bow)));
 }
 
 const char *qemu_pointer_method_str(QemuPointerMethod m)
@@ -265,14 +315,8 @@ static void pointer_add_homing(QemuInputBatch *b, int w, int h,
     }
 }
 
-static bool coroutine_fn pointer_co_absolute(QemuPointer *p,
-                                             QemuInputCtx *ctx, int x, int y,
-                                             int w, int h,
-                                             QemuPointerResult *res,
-                                             Error **errp)
+static void pointer_add_abs(QemuInputBatch *b, int x, int y, int w, int h)
 {
-    QemuInputBatch *b = qemu_input_batch_new(p->con);
-
     qemu_input_batch_move(b, INPUT_EVENT_KIND_ABS,
                           qemu_input_scale_axis(x, 0, MAX(w - 1, 1),
                                                 INPUT_EVENT_ABS_MIN,
@@ -280,12 +324,38 @@ static bool coroutine_fn pointer_co_absolute(QemuPointer *p,
                           qemu_input_scale_axis(y, 0, MAX(h - 1, 1),
                                                 INPUT_EVENT_ABS_MIN,
                                                 INPUT_EVENT_ABS_MAX));
+}
+
+static bool coroutine_fn pointer_co_absolute(QemuPointer *p,
+                                             QemuInputCtx *ctx, int x, int y,
+                                             int w, int h,
+                                             const QemuPointerOpts *o,
+                                             QemuPointerResult *res,
+                                             Error **errp)
+{
+    QemuInputBatch *b = qemu_input_batch_new(p->con);
+
+    /* natural: glide from where it is; from nowhere known, it jumps */
+    if (o->natural && pointer_valid(p, w, h) && (p->x != x || p->y != y)) {
+        int x0 = p->x, y0 = p->y, i, n, gx, gy;
+
+        n = DIV_ROUND_UP(pointer_glide_ms(hypot(x - x0, y - y0), o),
+                         POINTER_GLIDE_TICK_MS);
+        for (i = 1; i < n; i++) {
+            pointer_glide_at(x0, y0, x, y, (double)i / n, w, h, &gx, &gy);
+            pointer_add_abs(b, gx, gy, w, h);
+            qemu_input_batch_delay(b, POINTER_GLIDE_TICK_MS);
+            res->steps++;
+        }
+    }
+    pointer_add_abs(b, x, y, w, h);
     if (!qemu_input_co_run(ctx, b, errp)) {
+        p->known = false;
         return false;
     }
     pointer_set(p, x, y, w, h, QEMU_POINTER_ABSOLUTE);
     res->method = QEMU_POINTER_ABSOLUTE;
-    res->steps = 1;
+    res->steps++;
     return true;
 }
 
@@ -694,6 +764,53 @@ out:
     return true;
 }
 
+/*
+ * Natural motion with a relative mouse: @nx, @ny counts that take the
+ * pointer from @fx, @fy to @x, @y, sent along the hand's path, one move
+ * a tick.  A move holds @step counts at most, so the guest does not
+ * speed it up; what that holds back goes with the next ones.  Returns
+ * the number of moves.
+ */
+static int pointer_add_glide_rel(QemuInputBatch *b, int fx, int fy,
+                                 int x, int y, int nx, int ny,
+                                 double gx, double gy, int step,
+                                 int w, int h, const QemuPointerOpts *o)
+{
+    int tick = o->step_delay_ms > 0 ? o->step_delay_ms
+                                     : POINTER_GLIDE_TICK_MS;
+    /*
+     * The hand is fastest halfway, at 1.875 times its mean speed; a bit
+     * longer than the steps need lets it keep close to its path there
+     */
+    int steps_ms = DIV_ROUND_UP(MAX(abs(nx), abs(ny)), step) * tick;
+    int ms = MAX(pointer_glide_ms(hypot(x - fx, y - fy), o),
+                 steps_ms * 5 / 4);
+    int n = MAX(1, DIV_ROUND_UP(ms, tick));
+    int sx = 0, sy = 0, moves = 0, i;
+
+    for (i = 1; i <= n || sx != nx || sy != ny; i++) {
+        int cx = nx, cy = ny;
+
+        if (i < n) {
+            int px, py;
+
+            pointer_glide_at(fx, fy, x, y, (double)i / n, w, h, &px, &py);
+            cx = (int)lround((px - fx) / gx);
+            cy = (int)lround((py - fy) / gy);
+        }
+        cx = clamp_step(cx - sx, step);
+        cy = clamp_step(cy - sy, step);
+        if (cx || cy) {
+            qemu_input_batch_move(b, INPUT_EVENT_KIND_REL, cx, cy);
+            moves++;
+        }
+        qemu_input_batch_delay(b, tick);
+        sx += cx;
+        sy += cy;
+    }
+    return moves;
+}
+
 /* Step from the model's position (homing first if needed) to @x, @y */
 static bool coroutine_fn pointer_co_open_loop(QemuPointer *p,
                                               QemuInputCtx *ctx,
@@ -721,7 +838,13 @@ static bool coroutine_fn pointer_co_open_loop(QemuPointer *p,
         }
         break;
     default:
-        res->homed = !valid || now - p->sync_ms > POINTER_STALE_MS;
+        /*
+         * A natural move trusts an old position: homing would show on
+         * the video, and a recording that freezes the guest between
+         * tool calls makes every position old
+         */
+        res->homed = !valid ||
+                     (!o->natural && now - p->sync_ms > POINTER_STALE_MS);
         break;
     }
 
@@ -774,6 +897,11 @@ static bool coroutine_fn pointer_co_open_loop(QemuPointer *p,
     ny = (int)lround((y - fy) / gy);
     x = MAX(0, MIN(w - 1, (int)lround(fx + nx * gx)));
     y = MAX(0, MIN(h - 1, (int)lround(fy + ny * gy)));
+    if (o->natural && (nx || ny)) {
+        res->steps += pointer_add_glide_rel(b, fx, fy, x, y, nx, ny, gx, gy,
+                                            step, w, h, o);
+        nx = ny = 0;
+    }
     while (nx || ny) {
         int sx = clamp_step(nx, step);
         int sy = clamp_step(ny, step);
@@ -841,6 +969,42 @@ static bool coroutine_fn pointer_co_await_cursor(QemuPointer *p,
         }
     }
     return moved;
+}
+
+/*
+ * Natural motion: wait until @deadline_ms (one tick after the step) and
+ * until the cursor has moved, so the steps come at an even pace and the
+ * video shows the same number of them in every frame
+ */
+static bool coroutine_fn pointer_co_await_tick(QemuPointer *p,
+                                               QemuInputCtx *ctx,
+                                               const QemuCursorState *old,
+                                               QemuCursorState *cs,
+                                               int64_t deadline_ms)
+{
+    int64_t give_up = deadline_ms + POINTER_SETTLE_MS;
+
+    for (;;) {
+        int64_t now;
+
+        qemu_co_sleep_ns_wakeable(&ctx->sleep, QEMU_CLOCK_REALTIME,
+                                  2 * SCALE_MS);
+        if (ctx->cancelled) {
+            return false;
+        }
+        qemu_console_hw_cursor_state(p->con, cs);
+        if (cs->shape != old->shape || cs->visible != old->visible) {
+            /* a new image: let it settle as after any step */
+            return pointer_co_await_cursor(p, ctx, old, cs);
+        }
+        now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        if (now >= deadline_ms && !cursor_equal(old, cs)) {
+            return true;
+        }
+        if (now >= give_up) {
+            return false;
+        }
+    }
 }
 
 /*
@@ -1013,6 +1177,91 @@ static int coroutine_fn pointer_co_learn_hot(QemuPointer *p, QemuInputCtx *ctx,
     return pointer_hot_get(p, cs->shape, hot) ? 1 : 0;
 }
 
+/* Closed loop: px a count moves on @axis in steps of @m counts, if seen */
+static double pointer_step_gain_seen(QemuPointer *p, int axis, int m)
+{
+    int i;
+
+    /* the nearest size seen, the smaller one first */
+    for (i = 0; i < POINTER_LOOP_CAP; i++) {
+        if (m - i >= 1 && p->step_gain[axis][m - i] > 0) {
+            return p->step_gain[axis][m - i];
+        }
+        if (m + i <= POINTER_LOOP_CAP && p->step_gain[axis][m + i] > 0) {
+            return p->step_gain[axis][m + i];
+        }
+    }
+    return 0;
+}
+
+static double pointer_step_gain(QemuPointer *p, int axis, int m)
+{
+    double g = pointer_step_gain_seen(p, axis, m);
+
+    if (!g) {
+        g = pointer_step_gain_seen(p, !axis, m);
+    }
+    return g ? g : 1.0;
+}
+
+/*
+ * Closed loop, natural motion: the step that moves the pointer nearest
+ * to @dx, @dy px away, from how far steps of each size moved it
+ */
+static void pointer_plan_step(QemuPointer *p, int dx, int dy,
+                              int *sx, int *sy)
+{
+    int major = abs(dy) > abs(dx);
+    int e = major ? abs(dy) : abs(dx);
+    double best_err = e;
+    int best = 0, m, minor;
+
+    for (m = 1; m <= POINTER_LOOP_CAP; m++) {
+        double err = fabs(m * pointer_step_gain(p, major, m) - e);
+
+        if (err < best_err) {
+            best_err = err;
+            best = m;
+        }
+    }
+    minor = clamp_step((int)lround((major ? dx : dy) /
+                                   pointer_step_gain(p, !major, best)),
+                       best);
+    *sx = major ? minor : (dx > 0 ? best : -best);
+    *sy = major ? (dy > 0 ? best : -best) : minor;
+    if (!best) {
+        *sx = *sy = 0;
+    }
+}
+
+/*
+ * Closed loop: remember that the step @sx, @sy moved the cursor by
+ * @mx, @my px; @edge_x, @edge_y: it ended at the edge, which may have
+ * stopped it
+ */
+static void pointer_learn_step(QemuPointer *p, int sx, int sy, int mx,
+                               int my, bool edge_x, bool edge_y)
+{
+    int m = MAX(abs(sx), abs(sy));
+    int n[2] = { sx, sy }, moved[2] = { mx, my };
+    bool edge[2] = { edge_x, edge_y };
+    int a;
+
+    if (m < 1 || m > POINTER_LOOP_CAP) {
+        return;
+    }
+    for (a = 0; a < 2; a++) {
+        double g = n[a] ? (double)moved[a] / n[a] : 0;
+
+        /* a count or two moves the pointer too little to tell */
+        if (edge[a] || abs(n[a]) < MIN(2, m) || g < POINTER_GAIN_MIN ||
+            g > POINTER_GAIN_MAX) {
+            continue;
+        }
+        p->step_gain[a][m] = g;
+    }
+}
+
 static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
                                                 QemuInputCtx *ctx,
                                                 int x, int y, int w, int h,
@@ -1021,10 +1270,12 @@ static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
                                                 Error **errp)
 {
     int capx = POINTER_LOOP_CAP, capy = POINTER_LOOP_CAP;
-    int stuck = 0, homings = 0;
+    int stuck = 0, homings = 0, glide_ms = 0, x0 = 0, y0 = 0, limit;
+    int overshot = 0;
+    int64_t glide_start = 0;
     QemuCursorState cs;
     PointerHot hot;
-    bool hot_known;
+    bool hot_known, plan = o->natural;
     int i;
 
     qemu_console_hw_cursor_state(p->con, &cs);
@@ -1037,31 +1288,90 @@ static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
         homings++;
         res->homed = true;
     }
+    if (o->natural) {
+        /* steer toward a point that moves along the hand's path */
+        x0 = cs.x + hot.x;
+        y0 = cs.y + hot.y;
+        glide_ms = pointer_glide_ms(hypot(x - x0, y - y0), o);
+        glide_start = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    }
+    limit = POINTER_LOOP_MAX + glide_ms / POINTER_GLIDE_TICK_MS;
 
-    for (i = 0; i < POINTER_LOOP_MAX; i++) {
-        int dx = x - (cs.x + hot.x);
-        int dy = y - (cs.y + hot.y);
+    for (i = 0; i < limit; i++) {
+        int tx = x, ty = y, dx, dy;
         QemuCursorState old = cs;
         PointerHot from = hot;
         QemuInputBatch *b;
         int sx, sy, ndx, ndy, r;
+        int64_t tick_end;
 
+        if (glide_ms) {
+            int64_t t = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) - glide_start;
+
+            if (t < glide_ms) {
+                pointer_glide_at(x0, y0, x, y, (double)t / glide_ms, w, h,
+                                 &tx, &ty);
+            } else {
+                glide_ms = 0;       /* the rest as without it */
+            }
+        }
+        dx = tx - (cs.x + hot.x);
+        dy = ty - (cs.y + hot.y);
+        if (!dx && !dy && (tx != x || ty != y)) {
+            /* on the path: wait for the path to move on */
+            qemu_co_sleep_ns_wakeable(&ctx->sleep, QEMU_CLOCK_REALTIME,
+                                      POINTER_GLIDE_TICK_MS * SCALE_MS);
+            if (ctx->cancelled) {
+                error_setg(errp, "cancelled");
+                p->known = false;
+                return false;
+            }
+            continue;
+        }
         if (!dx && !dy) {
             pointer_set(p, x, y, w, h, QEMU_POINTER_CLOSED_LOOP);
             res->method = QEMU_POINTER_CLOSED_LOOP;
             res->hot_guess = !hot_known;
             return true;
         }
-        sx = clamp_step(dx, capx);
-        sy = clamp_step(dy, capy);
+        if (plan) {
+            /*
+             * natural: a step the guest moves as far as the path wants,
+             * as far as it is known how the guest speeds steps up
+             */
+            pointer_plan_step(p, dx, dy, &sx, &sy);
+            if (!sx && !sy) {
+                if (glide_ms) {
+                    /* closer than a count moves: let the path move on */
+                    qemu_co_sleep_ns_wakeable(&ctx->sleep,
+                                              QEMU_CLOCK_REALTIME,
+                                              POINTER_GLIDE_TICK_MS *
+                                              SCALE_MS);
+                    if (ctx->cancelled) {
+                        error_setg(errp, "cancelled");
+                        p->known = false;
+                        return false;
+                    }
+                    continue;
+                }
+                plan = false;
+            }
+        }
+        if (!plan) {
+            sx = clamp_step(dx, capx);
+            sy = clamp_step(dy, capy);
+        }
         b = qemu_input_batch_new(p->con);
         qemu_input_batch_move(b, INPUT_EVENT_KIND_REL, sx, sy);
+        tick_end = qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                   POINTER_GLIDE_TICK_MS;
         if (!qemu_input_co_run(ctx, b, errp)) {
             p->known = false;
             return false;
         }
         res->steps++;
-        if (!pointer_co_await_cursor(p, ctx, &old, &cs)) {
+        if (!(glide_ms ? pointer_co_await_tick(p, ctx, &old, &cs, tick_end)
+                       : pointer_co_await_cursor(p, ctx, &old, &cs))) {
             if (ctx->cancelled) {
                 error_setg(errp, "cancelled");
                 return false;
@@ -1074,6 +1384,13 @@ static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
         stuck = 0;
         trace_pointer_cursor(qemu_console_get_index(p->con), sx, sy,
                              cs.x, cs.y, cs.visible, cs.shape);
+        if (cs.shape == old.shape && cs.visible && old.visible) {
+            int hx = cs.x + hot.x, hy = cs.y + hot.y;
+
+            pointer_learn_step(p, sx, sy, cs.x - old.x, cs.y - old.y,
+                               hx <= 0 || hx >= w - 1,
+                               hy <= 0 || hy >= h - 1);
+        }
 
         if (cs.shape != old.shape) {
             /* another cursor image: is its hotspot known? */
@@ -1106,12 +1423,18 @@ static bool coroutine_fn pointer_co_closed_loop(QemuPointer *p,
             }
         }
         /* overshot: the guest accelerated the move, so move less */
-        ndx = x - (cs.x + hot.x);
-        ndy = y - (cs.y + hot.y);
-        if (ndx && (ndx > 0) != (dx > 0)) {
+        ndx = tx - (cs.x + hot.x);
+        ndy = ty - (cs.y + hot.y);
+        if ((ndx && (ndx > 0) != (dx > 0)) || (ndy && (ndy > 0) != (dy > 0))) {
+            /* planned steps learn from it, but not for ever at the end */
+            if (plan && !glide_ms && ++overshot >= 3) {
+                plan = false;
+            }
+        }
+        if (!plan && ndx && (ndx > 0) != (dx > 0)) {
             capx = MAX(1, capx / 2);
         }
-        if (ndy && (ndy > 0) != (dy > 0)) {
+        if (!plan && ndy && (ndy > 0) != (dy > 0)) {
             capy = MAX(1, capy / 2);
         }
     }
@@ -1165,7 +1488,7 @@ bool coroutine_fn qemu_pointer_co_move(QemuConsole *con, QemuInputCtx *ctx,
             error_setg(errp, "the mouse of this console is relative");
             return false;
         }
-        ok = pointer_co_absolute(p, ctx, x, y, w, h, res, errp);
+        ok = pointer_co_absolute(p, ctx, x, y, w, h, o, res, errp);
         break;
     case QEMU_POINTER_CLOSED_LOOP:
         if (!qemu_console_hw_cursor_state(con, &cs) || !cs.visible) {

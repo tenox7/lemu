@@ -29,6 +29,12 @@ typedef struct QemuPointerOpts {
     int step_px;                /* open loop: largest step */
     bool step_auto;             /* step_px is the default: calibrate */
     int step_delay_ms;          /* open loop: time between steps */
+    /*
+     * Move like a hand: speed up, slow down before the target and bend
+     * a little on the way, so a video of it looks natural
+     */
+    bool natural;
+    int duration_ms;            /* natural: how long; 0: from the distance */
 } QemuPointerOpts;
 
 typedef struct QemuPointerResult {
