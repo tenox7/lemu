@@ -175,8 +175,7 @@
 # Since: 11.2
 ##
 { 'struct': 'ScreenRegion',
-  'data': { 'x': 'int', 'y': 'int', 'w': 'int', 'h': 'int' },
-  'if': 'CONFIG_PIXMAN' }
+  'data': { 'x': 'int', 'y': 'int', 'w': 'int', 'h': 'int' } }
 
 ##
 # @screendump:
