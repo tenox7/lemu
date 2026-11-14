@@ -675,6 +675,7 @@ static bool trans_LSWI(DisasContext *ctx, arg_LSWI *a)
     int start = a->rt;
     int ra = a->ra;
     int nr;
+    uint32_t keep = 0;
 
     REQUIRE_INSNS_FLAGS(ctx, STRING);
     if (ctx->le_mode) {
@@ -686,14 +687,20 @@ static bool trans_LSWI(DisasContext *ctx, arg_LSWI *a)
     }
     nr = DIV_ROUND_UP(nb, 4);
     if (unlikely(lsw_reg_in_range(start, nr, ra))) {
-        gen_inval_exception(ctx, POWERPC_EXCP_INVAL_LSWX);
-        return true;
+        /* Invalid form, but the 601 does not load rA: see HELPER(LSWX) */
+        if (!(ctx->insns_flags & PPC_POWER_BR)) {
+            gen_inval_exception(ctx, POWERPC_EXCP_INVAL_LSWX);
+            return true;
+        }
+        if (ra != 0) {
+            keep = 1u << ra;
+        }
     }
     gen_set_access_type(ctx, ACCESS_INT);
     t0 = do_ea_calc_ra(ctx, ra);
     t1 = tcg_constant_i32(nb);
     t2 = tcg_constant_i32(start);
-    gen_helper_LSW(tcg_env, t0, t1, t2);
+    gen_helper_LSW(tcg_env, t0, t1, t2, tcg_constant_i32(keep));
 
     return true;
 }

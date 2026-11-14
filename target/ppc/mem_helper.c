@@ -123,8 +123,17 @@ void HELPER(STMW)(CPUPPCState *env, target_ulong addr, uint32_t reg)
     }
 }
 
+/* Registers with their bit set in keep are skipped, see HELPER(LSWX) */
+static inline void lsw_set(CPUPPCState *env, uint32_t reg, uint32_t keep,
+                           uint32_t val)
+{
+    if (!(keep & (1u << reg))) {
+        env->gpr[reg] = val;
+    }
+}
+
 static void do_lsw(CPUPPCState *env, target_ulong addr, uint32_t nb,
-                   uint32_t reg, uintptr_t raddr)
+                   uint32_t reg, uint32_t keep, uintptr_t raddr)
 {
     int mmu_idx;
     void *host;
@@ -140,7 +149,7 @@ static void do_lsw(CPUPPCState *env, target_ulong addr, uint32_t nb,
     if (likely(host)) {
         /* Fast path -- the entire operation is in RAM at host.  */
         for (; nb > 3; nb -= 4) {
-            env->gpr[reg] = (uint32_t)ldl_be_p(host);
+            lsw_set(env, reg, keep, (uint32_t)ldl_be_p(host));
             reg = (reg + 1) % 32;
             host += 4;
         }
@@ -163,7 +172,7 @@ static void do_lsw(CPUPPCState *env, target_ulong addr, uint32_t nb,
 
         /* Slow path -- at least some of the operation requires i/o.  */
         for (; nb > 3; nb -= 4) {
-            env->gpr[reg] = cpu_ldl_mmu(env, addr, oi, raddr);
+            lsw_set(env, reg, keep, cpu_ldl_mmu(env, addr, oi, raddr));
             reg = (reg + 1) % 32;
             addr = addr_add(env, addr, 4);
         }
@@ -187,34 +196,41 @@ static void do_lsw(CPUPPCState *env, target_ulong addr, uint32_t nb,
             break;
         }
     }
-    env->gpr[reg] = val;
+    lsw_set(env, reg, keep, val);
 }
 
 void HELPER(LSW)(CPUPPCState *env, target_ulong addr,
-                uint32_t nb, uint32_t reg)
+                uint32_t nb, uint32_t reg, uint32_t keep)
 {
-    do_lsw(env, addr, nb, reg, GETPC());
+    do_lsw(env, addr, nb, reg, keep, GETPC());
 }
 
 /*
- * PPC32 specification says we must generate an exception if rA is in
- * the range of registers to be loaded.  In an other hand, IBM says
- * this is valid, but rA won't be loaded.  For now, I'll follow the
- * spec...
+ * rA or rB in the range of registers to be loaded is an invalid form in
+ * PowerPC, so we raise an exception.  The 601 and POWER skip those
+ * registers instead (as for lscbx), and POWER compilers rely on it: gcc
+ * for AIX 3.2 loads a struct into r3..r10 with lsi from an r9 that it
+ * uses afterwards (Mathematica 2.2's X front end).
  */
 void HELPER(LSWX)(CPUPPCState *env, target_ulong addr, uint32_t reg,
                  uint32_t ra, uint32_t rb)
 {
     if (likely(xer_bc != 0)) {
         int num_used_regs = DIV_ROUND_UP(xer_bc, 4);
-        if (unlikely((ra != 0 && lsw_reg_in_range(reg, num_used_regs, ra)) ||
-                     lsw_reg_in_range(reg, num_used_regs, rb))) {
+        uint32_t keep = 0;
+
+        if (ra != 0 && lsw_reg_in_range(reg, num_used_regs, ra)) {
+            keep |= 1u << ra;
+        }
+        if (lsw_reg_in_range(reg, num_used_regs, rb)) {
+            keep |= 1u << rb;
+        }
+        if (unlikely(keep) && !(env->insns_flags & PPC_POWER_BR)) {
             raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
                                    POWERPC_EXCP_INVAL |
                                    POWERPC_EXCP_INVAL_LSWX, GETPC());
-        } else {
-            do_lsw(env, addr, xer_bc, reg, GETPC());
         }
+        do_lsw(env, addr, xer_bc, reg, keep, GETPC());
     }
 }
 
