@@ -44,6 +44,11 @@
  * FIFO, and SunOS loads the next buffer only after PI, so taking a whole
  * buffer at once would leave the pipe empty.
  *
+ * Because the samples are taken that far ahead, the voice stays on for
+ * CS_DRAIN_NS after playback stops, at the end of the last buffer or when
+ * the driver turns the DMA off, so that the audiodev still plays what was
+ * taken: turning it off at once drops the last 50 ms of every sound.
+ *
  * Capture is not done: its registers keep what is written, and the
  * capture pipe always reads as empty.
  */
@@ -65,6 +70,7 @@
 #include "qom/object.h"
 
 #define CS_SIZE 0x40
+#define CS_DRAIN_NS (200 * SCALE_MS)   /* well past the 50 ms taken ahead */
 #define CS_REGS 16
 #define CS_DREGS 32
 #define CS_MAXDREG (CS_DREGS - 1)
@@ -146,6 +152,7 @@ struct CSState {
     bool play_running;      /* since play_start, without a gap */
     int64_t play_start;     /* QEMU_CLOCK_VIRTUAL ns */
     uint64_t play_units;    /* taken since play_start */
+    int64_t play_drain;     /* the voice stays on until then */
 };
 
 #define CS_RAP(s) ((s)->regs[CS_IAR] & CS_MAXDREG)
@@ -232,17 +239,28 @@ static void cs_play_next(CSState *s)
     }
 }
 
+/* Playback stopped: let the audiodev play what was taken ahead */
+static void cs_play_stopped(CSState *s, int64_t now)
+{
+    s->play_running = false;
+    s->play_drain = now + CS_DRAIN_NS;
+}
+
 static void cs_play_update(CSState *s)
 {
     bool run = cs_play_active(s);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (run && !s->play_running) {
-        s->play_start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->play_start = now;
         s->play_units = 0;
+    } else if (!run && s->play_running) {
+        cs_play_stopped(s, now);
     }
     s->play_running = run;
     if (s->voice) {
-        audio_be_set_active_out(s->audio_be, s->voice, run);
+        audio_be_set_active_out(s->audio_be, s->voice,
+                                run || now < s->play_drain);
     }
     cs_update_irq(s);
 }
@@ -346,13 +364,18 @@ static void cs_audio_callback(void *opaque, int avail)
 
     uint32_t room = MAX(avail, 0);
     uint64_t rate, due, budget;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (!s->play_running) {
+        /* stopped: the voice is on only to play out the last samples */
+        if (now >= s->play_drain) {
+            audio_be_set_active_out(s->audio_be, s->voice, false);
+        }
         return;
     }
     /* units a second: one sample of each channel, two for ADPCM */
     rate = s->play_freq / (s->play_fmt == CS_FMT_ADPCM ? 2 : 1);
-    due = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - s->play_start,
+    due = muldiv64(now - s->play_start,
                    rate, NANOSECONDS_PER_SECOND) + rate / 20;
     budget = due > s->play_units ? due - s->play_units : 0;
 
@@ -402,7 +425,9 @@ static void cs_audio_callback(void *opaque, int avail)
         }
     }
     /* after a gap the clock starts again with the next buffer */
-    s->play_running = cs_play_active(s);
+    if (!cs_play_active(s)) {
+        cs_play_stopped(s, now);
+    }
 }
 
 /* DAC attenuation is 1.5 dB a step; the mixer wants 0-255 */
@@ -445,6 +470,9 @@ static void cs_play_setup(CSState *s)
     s->play_freq = as.freq;
     s->play_fmt = (val >> 5) & ((s->dregs[CS_MODE] & CS_MODE2) ? 7 : 3);
     trace_cs4231_play_format(as.freq, as.nchannels, s->play_fmt);
+    if (!s->audio_be) {
+        return;
+    }
     s->voice = audio_be_open_out(s->audio_be, s->voice, "cs4231", s,
                                  cs_audio_callback, &as);
     cs_set_volume(s);
@@ -460,6 +488,7 @@ static void cs_reset(DeviceState *d)
     s->dregs[25] = CS_VER;
     s->play_next = false;
     s->play_running = false;
+    s->play_drain = 0;
     if (s->audio_be) {
         cs_play_setup(s);
         cs_play_update(s);
@@ -585,6 +614,7 @@ static int cs_post_load(void *opaque, int version_id)
     CSState *s = opaque;
 
     s->play_running = false;
+    s->play_drain = 0;
     cs_play_setup(s);
     cs_play_update(s);
     return 0;
@@ -618,6 +648,10 @@ static void cs4231_realize(DeviceState *dev, Error **errp)
 {
     CSState *s = CS4231(dev);
 
+    /* no audiodev: the registers only, no sound (the machine's default) */
+    if (!s->audio_be) {
+        return;
+    }
     if (!audio_be_check(&s->audio_be, errp)) {
         return;
     }

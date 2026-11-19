@@ -199,6 +199,60 @@ static int sun4u_NVRAM_set_params(Nvram *nvram, uint16_t NVRAM_size,
     return 0;
 }
 
+/*
+ * Without an onboard NIC the IDPROM's MAC address is filled in once the
+ * machine is complete, from the NICs added with -device (see below).
+ */
+typedef struct Sun4uIdprom {
+    Notifier machine_done;
+    Nvram *nvram;
+    const char *nic_model;
+} Sun4uIdprom;
+
+typedef struct Sun4uNicSearch {
+    const char *model;
+    NICState *nic;
+} Sun4uNicSearch;
+
+static void sun4u_find_nic(NICState *nic, void *opaque)
+{
+    Sun4uNicSearch *search = opaque;
+
+    if (!search->nic && (!search->model ||
+                         !strcmp(qemu_get_queue(nic)->model, search->model))) {
+        search->nic = nic;
+    }
+}
+
+static void sun4u_idprom_machine_done(Notifier *notifier, void *data)
+{
+    Sun4uIdprom *idprom = container_of(notifier, Sun4uIdprom, machine_done);
+    NvramClass *k = NVRAM_GET_CLASS(idprom->nvram);
+    Sun4uNicSearch search = { .model = idprom->nic_model };
+    struct Sun_nvram header;
+    unsigned int i;
+
+    /*
+     * The first NIC of the machine's own model (sunhme, the onboard NIC of
+     * a real Ultra 5/10, whose MAC address is the one in its IDPROM), else
+     * the first NIC of any model.
+     */
+    qemu_foreach_nic(sun4u_find_nic, &search);
+    if (!search.nic) {
+        search.model = NULL;
+        qemu_foreach_nic(sun4u_find_nic, &search);
+    }
+    if (!search.nic) {
+        return;
+    }
+
+    memset(&header, 0, sizeof(header));
+    Sun_init_header(&header, search.nic->conf->macaddr.a, 0x80);
+    for (i = 0; i < sizeof(header); i++) {
+        (k->write)(idprom->nvram, 0x1fd8 + i, ((uint8_t *)&header)[i]);
+    }
+}
+
 static uint64_t sun4u_load_kernel(const char *kernel_filename,
                                   const char *initrd_filename,
                                   ram_addr_t RAM_size, uint64_t *initrd_size,
@@ -734,6 +788,23 @@ static void sun4uv_init(MemoryRegion *address_space_mem,
                            0,
                            graphic_width, graphic_height, graphic_depth,
                            (uint8_t *)&macaddr);
+
+    /*
+     * OpenBIOS gives the guest the IDPROM's MAC address as the system's,
+     * and the sunhme has no other: NetBSD and Solaris use it for hme0. A
+     * NIC added with -device (as most management tools do) doesn't exist
+     * yet, so without an onboard NIC the IDPROM has a default address that
+     * is the same for every machine. Take the address from the NICs once
+     * they are all there, before the firmware reads it.
+     */
+    if (!onboard_nic) {
+        Sun4uIdprom *idprom = g_new0(Sun4uIdprom, 1);
+
+        idprom->nvram = nvram;
+        idprom->nic_model = mc->default_nic;
+        idprom->machine_done.notify = sun4u_idprom_machine_done;
+        qemu_add_machine_init_done_notifier(&idprom->machine_done);
+    }
 
     dev = qdev_new(TYPE_FW_CFG_IO);
     qdev_prop_set_bit(dev, "dma_enabled", false);

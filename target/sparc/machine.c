@@ -200,6 +200,39 @@ static const VMStateDescription vmstate_fq = {
         VMSTATE_END_OF_LIST()
     },
 };
+
+/*
+ * A CPU halted in the multiprocessor idle loop of Solaris waits for a kick
+ * or a timer that the destination doesn't have: wake it there, it looks
+ * for work and halts again.
+ */
+static bool solaris_idle_mp_needed(void *opaque)
+{
+    SPARCCPU *cpu = opaque;
+    return cpu->env.solaris_idle_mp_halted;
+}
+
+static int solaris_idle_mp_post_load(void *opaque, int version_id)
+{
+    SPARCCPU *cpu = opaque;
+
+    if (cpu->env.solaris_idle_mp_halted) {
+        cpu->env.solaris_idle_kick = true;
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_solaris_idle_mp = {
+    .name = "cpu/solaris_idle_mp",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = solaris_idle_mp_needed,
+    .post_load = solaris_idle_mp_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(env.solaris_idle_mp_halted, SPARCCPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
 #endif
 
 static int cpu_pre_save(void *opaque)
@@ -331,6 +364,7 @@ const VMStateDescription vmstate_sparc_cpu = {
 #ifndef TARGET_SPARC64
     .subsections = (const VMStateDescription * const []) {
         &vmstate_fq,
+        &vmstate_solaris_idle_mp,
         NULL
     },
 #endif

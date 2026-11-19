@@ -794,6 +794,35 @@ static void sun4m_set_sunos_idle(Object *obj, bool value, Error **errp)
     sun4m_sunos_idle = value;
 }
 
+/* Halt the CPU in the Solaris 2.x idle loop, see target/sparc/solaris_idle.c */
+static bool sun4m_solaris_idle = true;
+
+static bool sun4m_get_solaris_idle(Object *obj, Error **errp)
+{
+    return sun4m_solaris_idle;
+}
+
+static void sun4m_set_solaris_idle(Object *obj, bool value, Error **errp)
+{
+    sun4m_solaris_idle = value;
+}
+
+/*
+ * Halt the CPUs in the multiprocessor idle loop of Solaris 2.x, see
+ * target/sparc/solaris_idle.c
+ */
+static bool sun4m_solaris_smp_idle = true;
+
+static bool sun4m_get_solaris_smp_idle(Object *obj, Error **errp)
+{
+    return sun4m_solaris_smp_idle;
+}
+
+static void sun4m_set_solaris_smp_idle(Object *obj, bool value, Error **errp)
+{
+    sun4m_solaris_smp_idle = value;
+}
+
 static DeviceState *cpu_devinit(const char *cpu_type, unsigned int id,
                                 uint64_t prom_addr)
 {
@@ -852,6 +881,11 @@ static void sun4m_hw_init(MachineState *machine)
         cpus[i] = cpu_devinit(machine->cpu_type, i, hwdef->slavio_base);
         /* With more CPUs, one gives another work without an interrupt */
         SPARC_CPU(cpus[i])->env.sunos_idle = sun4m_sunos_idle && smp_cpus == 1;
+        SPARC_CPU(cpus[i])->env.solaris_idle = sun4m_solaris_idle &&
+                                               smp_cpus == 1;
+        /* That loop wakes a CPU when another queues work for it */
+        SPARC_CPU(cpus[i])->env.solaris_idle_mp = sun4m_solaris_smp_idle &&
+                                                  smp_cpus > 1;
     }
 
     /* Create and map RAM frontend */
@@ -1161,6 +1195,19 @@ static void sun4m_machine_class_init(ObjectClass *oc, const void *data)
     object_class_property_set_description(oc, "sunos-idle",
         "Halt the CPU while SunOS 4.1.4 is idle, instead of spinning "
         "(default: on)");
+
+    object_class_property_add_bool(oc, "solaris-idle", sun4m_get_solaris_idle,
+                                   sun4m_set_solaris_idle);
+    object_class_property_set_description(oc, "solaris-idle",
+        "Halt the CPU while Solaris 2.5.1 to 9 is idle, instead of spinning "
+        "(default: on)");
+
+    object_class_property_add_bool(oc, "solaris-smp-idle",
+                                   sun4m_get_solaris_smp_idle,
+                                   sun4m_set_solaris_smp_idle);
+    object_class_property_set_description(oc, "solaris-smp-idle",
+        "Halt idle CPUs of Solaris 2.5.1 to 9 with more than one CPU, "
+        "instead of spinning (default: on)");
 }
 
 static void ss5_class_init(ObjectClass *oc, const void *data)

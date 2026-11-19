@@ -198,6 +198,8 @@ typedef struct DisasContext {
 #else
     bool fsr_qne;
     bool sunos_idle;
+    bool solaris_idle;
+    bool solaris_idle_mp;
 #endif
 #endif
 
@@ -2626,6 +2628,19 @@ static bool advance_pc(DisasContext *dc)
             break;
 
         case JUMP_PC:
+            if (dc->base.is_jmp == DISAS_EXIT) {
+                /*
+                 * The insn in the delay slot asked for an exit to the
+                 * main loop (e.g. a write to %psr that lowered PIL):
+                 * resolve the branch at run time instead of chaining.
+                 */
+                gen_generic_branch(dc);
+                tcg_gen_mov_tl(cpu_pc, cpu_npc);
+                tcg_gen_addi_tl(cpu_npc, cpu_npc, 4);
+                dc->pc = DYNAMIC_PC;
+                dc->npc = DYNAMIC_PC;
+                break;
+            }
             /* we can do a static jump */
             l1 = gen_new_label();
             tcg_gen_brcondi_tl(dc->jump.cond, dc->jump.c1, dc->jump.c2, l1);
@@ -5841,6 +5856,10 @@ static void sparc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     dc->fsr_qne = (dc->base.tb->flags & TB_FLAG_FSR_QNE) != 0;
     dc->sunos_idle = cpu_env(cs)->sunos_idle && dc->supervisor &&
                      !(tb_cflags(dc->base.tb) & CF_SINGLE_STEP);
+    dc->solaris_idle = cpu_env(cs)->solaris_idle && dc->supervisor &&
+                       !(tb_cflags(dc->base.tb) & CF_SINGLE_STEP);
+    dc->solaris_idle_mp = cpu_env(cs)->solaris_idle_mp && dc->supervisor &&
+                          !(tb_cflags(dc->base.tb) & CF_SINGLE_STEP);
 # endif
 #endif
 #ifdef TARGET_SPARC64
@@ -5964,6 +5983,285 @@ static void gen_sunos_idle(DisasContext *dc, CPUSPARCState *env)
                           tcg_constant_tl(whichqs),
                           tcg_constant_tl(qrunflag));
 }
+
+/*
+ * Solaris 2.5.1 to 9 call idle_cpu from the idle loop in idle() when no
+ * thread is runnable; see solaris_idle.c. These are the words of that
+ * loop from the load of disp_nrunnable to the call, each with its mask,
+ * as the compiler of each release laid them out. Registers, offsets and
+ * addresses are left out; gen_solaris_idle() checks that the words use
+ * the registers consistently.
+ */
+#define SOLARIS_CALL            0x9fc00000  /* call %rs1 (jmpl %rs1, %o7) */
+#define SOLARIS_CALL_MASK       0xfff83fff
+
+#define SOL_ANY         { 0x00000000, 0x00000000 }
+/* ld [%rs1 + simm13], %rd */
+#define SOL_LD_IMM      { 0xc0002000, 0xc1f82000 }
+/* ld [%rs1], %rd */
+#define SOL_LD_REG      { 0xc0000000, 0xc1f83fff }
+/* cmp %rs1, 0 */
+#define SOL_CMP0        { 0x80a02000, 0xfff83fff }
+/* tst %rs2 */
+#define SOL_TST         { 0x80900000, 0xffffffe0 }
+/* sethi %hi(idle_cpu), %rd */
+#define SOL_SETHI       { 0x01000000, 0xc1c00000 }
+/* call disp30, such as call swtch */
+#define SOLARIS_CALL_DISP       0x40000000
+#define SOLARIS_CALL_DISP_MASK  0xc0000000
+#define SOL_CALL_DISP   { SOLARIS_CALL_DISP, SOLARIS_CALL_DISP_MASK }
+#define SOL_NOP_INSN    0x01000000
+#define SOL_NOP         { SOL_NOP_INSN, 0xffffffff }
+/* b top */
+#define SOL_BA          { 0x10800000, 0xffc00000 }
+#define SOL_CALL_REG    { SOLARIS_CALL, SOLARIS_CALL_MASK }
+
+typedef struct SolarisIdleLoop {
+    const char *kernel;
+    int len;
+    /*
+     * w[0] loads disp_nrunnable, w[1] tests it, w[2] branches on it,
+     * w[3] is the sethi of &idle_cpu, w[len - 2] loads idle_cpu and
+     * w[len - 1] calls it.
+     */
+    uint32_t w[10][2];
+} SolarisIdleLoop;
+
+static const SolarisIdleLoop solaris_idle_loops[] = {
+    { "2.6/7/8", 10, {
+        SOL_LD_IMM,                 /*        ld    [%cpu + nrunnable], %x */
+        SOL_CMP0,                   /*        cmp   %x, 0 */
+        { 0x02800006, 0xffffffff }, /*        be    idle */
+        SOL_SETHI,                  /*         sethi %hi(idle_cpu), %y */
+        SOL_CALL_DISP,              /*        call  swtch */
+        SOL_NOP,                    /*         nop */
+        SOL_BA,                     /*        b     top */
+        SOL_ANY,                    /*         ... */
+        SOL_LD_IMM,                 /* idle:  ld    [%y + lo], %z */
+        SOL_CALL_REG,               /*        call  %z */
+    } },
+    { "9", 6, {
+        SOL_LD_IMM,                 /*        ld    [%cpu + nrunnable], %x */
+        SOL_CMP0,                   /*        cmp   %x, 0 */
+        { 0x12800007, 0xffffffff }, /*        bne   run */
+        SOL_SETHI,                  /*         sethi %hi(idle_cpu), %y */
+        SOL_LD_IMM,                 /*        ld    [%y + lo], %z */
+        SOL_CALL_REG,               /*        call  %z */
+    } },
+    { "2.5.1", 10, {
+        SOL_LD_REG,                 /*        ld    [%nrunnable], %x */
+        SOL_TST,                    /*        tst   %x */
+        { 0x22800006, 0xffffffff }, /*        be,a  idle */
+        SOL_SETHI,                  /*         sethi %hi(idle_cpu), %y */
+        SOL_CALL_DISP,              /*        call  swtch */
+        SOL_NOP,                    /*         nop */
+        SOL_BA,                     /*        b     top */
+        SOL_ANY,                    /*         ... */
+        SOL_LD_IMM,                 /* idle:  ld    [%y + lo], %z */
+        SOL_CALL_REG,               /*        call  %z */
+    } },
+};
+
+/*
+ * At a call through a register, if it is the call of idle_cpu in the
+ * Solaris idle loop, let helper_solaris_idle() halt the CPU
+ */
+static void gen_solaris_idle(DisasContext *dc, CPUSPARCState *env,
+                             uint32_t insn)
+{
+    uint32_t w[ARRAY_SIZE(solaris_idle_loops[0].w)];
+    int k, i;
+
+    /* The call is not in a delay slot */
+    if (dc->npc != dc->pc + 4) {
+        return;
+    }
+    /* Off RAM, translator_ldl_end() would record these words as code */
+    if (tb_page_addr0(dc->base.tb) == -1) {
+        return;
+    }
+    for (k = 0; k < ARRAY_SIZE(solaris_idle_loops); k++) {
+        const SolarisIdleLoop *l = &solaris_idle_loops[k];
+        target_ulong start = dc->pc - 4 * (l->len - 1);
+        int cpu, x, y, z;
+        int32_t off;
+        TCGv addr;
+
+        if (!translator_is_same_page(&dc->base, start)) {
+            continue;
+        }
+        for (i = 0; i < l->len - 1; i++) {
+            w[i] = translator_ldl_end(env, &dc->base, start + 4 * i, MO_BE);
+            if ((w[i] & l->w[i][1]) != l->w[i][0]) {
+                break;
+            }
+        }
+        if (i < l->len - 1) {
+            continue;
+        }
+        w[l->len - 1] = insn;
+
+        /* ld [%cpu + off], %x; tst %x */
+        cpu = extract32(w[0], 14, 5);
+        off = extract32(w[0], 13, 1) ? sextract32(w[0], 0, 13) : 0;
+        x = extract32(w[0], 25, 5);
+        if (x != (extract32(w[1], 13, 1) ? extract32(w[1], 14, 5)
+                                         : extract32(w[1], 0, 5))) {
+            continue;
+        }
+        /* sethi %hi(idle_cpu), %y; ld [%y + lo], %z; call %z */
+        y = extract32(w[3], 25, 5);
+        z = extract32(w[l->len - 2], 25, 5);
+        if (extract32(w[l->len - 2], 14, 5) != y ||
+            extract32(w[l->len - 1], 14, 5) != z) {
+            continue;
+        }
+        /* The loop writes %x, %y and %z, so %cpu must be another one */
+        if (cpu == x || cpu == y || cpu == z) {
+            continue;
+        }
+
+        trace_sparc_solaris_idle_match(l->kernel, dc->pc, cpu, off);
+
+        /* The helper reads the clock */
+        translator_io_start(&dc->base);
+        addr = tcg_temp_new();
+        tcg_gen_addi_tl(addr, gen_load_gpr(dc, cpu), off);
+        gen_helper_solaris_idle(tcg_env, tcg_constant_tl(dc->pc), addr);
+        return;
+    }
+}
+
+/*
+ * With more than one CPU, Solaris 2.5.1 to 9 call disp_getwork from the
+ * multiprocessor idle loop when the CPU has no thread queued; see
+ * solaris_idle.c. These are the words of that loop from the load of
+ * disp_nrunnable to the call of disp_getwork, as the compiler of each
+ * release laid them out.
+ */
+/* lduh [%rs1 + simm13], %rd */
+#define SOL_LDUH_IMM    { 0xc0102000, 0xc1f82000 }
+/* lduh [%rs1], %rd */
+#define SOL_LDUH_REG    { 0xc0100000, 0xc1f83fff }
+/* btst CPU_OFFLINE, %rs1 */
+#define SOL_BTST_OFFLINE { 0x80882020, 0xfff83fff }
+
+enum { SOL_MP_LEN = 14 };
+
+typedef struct SolarisIdleMPLoop {
+    const char *kernel;
+    /*
+     * w[0] loads disp_nrunnable, w[1] tests it, w[3] (and w[12] if it is
+     * not a nop) loads cpu_flags, w[10] tests CPU_OFFLINE in it and w[13]
+     * calls disp_getwork.
+     */
+    uint32_t w[SOL_MP_LEN][2];
+} SolarisIdleMPLoop;
+
+static const SolarisIdleMPLoop solaris_idle_mp_loops[] = {
+    { "2.6/7/8/9", {
+        SOL_LD_IMM,                 /* top:  ld    [%cpu + nrunnable], %x */
+        SOL_CMP0,                   /*       cmp   %x, 0 */
+        { 0x22800008, 0xffffffff }, /*       be,a  idle */
+        SOL_LDUH_IMM,               /*        lduh [%cpu + flags], %f */
+        SOL_CALL_DISP,              /*       call  unset_idle_cpu */
+        SOL_ANY,                    /*        ... */
+        SOL_CALL_DISP,              /*       call  swtch */
+        SOL_NOP,                    /*        nop */
+        SOL_BA,                     /*       b     ... */
+        SOL_ANY,                    /*        ... */
+        SOL_BTST_OFFLINE,           /* idle: btst  CPU_OFFLINE, %f */
+        { 0x32800000, 0xffc00000 }, /*       bne,a quiesced */
+        SOL_LDUH_IMM,               /*        lduh [%cpu + flags], %f */
+        SOL_CALL_DISP,              /*       call  disp_getwork */
+    } },
+    { "2.5.1", {
+        SOL_LD_REG,                 /* top:  ld    [%nrunnable], %x */
+        SOL_TST,                    /*       tst   %x */
+        { 0x22800008, 0xffffffff }, /*       be,a  idle */
+        SOL_LDUH_REG,               /*        lduh [%flags], %f */
+        SOL_CALL_DISP,              /*       call  unset_idle_cpu */
+        SOL_ANY,                    /*        ... */
+        SOL_CALL_DISP,              /*       call  swtch */
+        SOL_NOP,                    /*        nop */
+        SOL_BA,                     /*       b     ... */
+        SOL_ANY,                    /*        ... */
+        SOL_BTST_OFFLINE,           /* idle: btst  CPU_OFFLINE, %f */
+        { 0x12800000, 0xffc00000 }, /*       bne   quiesced */
+        SOL_NOP,                    /*        nop */
+        SOL_CALL_DISP,              /*       call  disp_getwork */
+    } },
+};
+
+/*
+ * At a call, if it is the call of disp_getwork in the multiprocessor idle
+ * loop of Solaris, let helper_solaris_idle_mp() halt the CPU
+ */
+static void gen_solaris_idle_mp(DisasContext *dc, CPUSPARCState *env,
+                                uint32_t insn)
+{
+    target_ulong start = dc->pc - 4 * (SOL_MP_LEN - 1);
+    uint32_t w[SOL_MP_LEN];
+    int k, i;
+
+    /* The call is not in a delay slot */
+    if (dc->npc != dc->pc + 4) {
+        return;
+    }
+    /* Off RAM, translator_ldl_end() would record these words as code */
+    if (tb_page_addr0(dc->base.tb) == -1 ||
+        !translator_is_same_page(&dc->base, start)) {
+        return;
+    }
+    for (i = 0; i < SOL_MP_LEN - 1; i++) {
+        w[i] = translator_ldl_end(env, &dc->base, start + 4 * i, MO_BE);
+    }
+    w[SOL_MP_LEN - 1] = insn;
+
+    for (k = 0; k < ARRAY_SIZE(solaris_idle_mp_loops); k++) {
+        const SolarisIdleMPLoop *l = &solaris_idle_mp_loops[k];
+        int base, x, f;
+        int32_t off;
+        TCGv addr;
+
+        for (i = 0; i < SOL_MP_LEN; i++) {
+            if ((w[i] & l->w[i][1]) != l->w[i][0]) {
+                break;
+            }
+        }
+        if (i < SOL_MP_LEN) {
+            continue;
+        }
+
+        /*
+         * ld [%base + off], %x; tst %x. The calls in the loop keep only the
+         * local and in registers, so %base must be one of them.
+         */
+        base = extract32(w[0], 14, 5);
+        off = extract32(w[0], 13, 1) ? sextract32(w[0], 0, 13) : 0;
+        x = extract32(w[0], 25, 5);
+        if (base < 16 || x == base ||
+            x != (extract32(w[1], 13, 1) ? extract32(w[1], 14, 5)
+                                         : extract32(w[1], 0, 5))) {
+            continue;
+        }
+        /* lduh [...], %f; btst CPU_OFFLINE, %f; [lduh [...], %f] */
+        f = extract32(w[3], 25, 5);
+        if (f == base || extract32(w[10], 14, 5) != f ||
+            (w[12] != SOL_NOP_INSN && extract32(w[12], 25, 5) != f)) {
+            continue;
+        }
+
+        trace_sparc_solaris_idle_mp_match(l->kernel, dc->pc, base, off);
+
+        /* The helper reads the clock */
+        translator_io_start(&dc->base);
+        addr = tcg_temp_new();
+        tcg_gen_addi_tl(addr, gen_load_gpr(dc, base), off);
+        gen_helper_solaris_idle_mp(tcg_env, tcg_constant_tl(dc->pc), addr);
+        return;
+    }
+}
 #endif
 
 static void sparc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
@@ -5978,6 +6276,13 @@ static void sparc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     if (insn == sunos_idle_loop[SUNOS_IDLE_BRANCH][0] && dc->sunos_idle) {
         gen_sunos_idle(dc, cpu_env(cs));
     }
+    if ((insn & SOLARIS_CALL_MASK) == SOLARIS_CALL && dc->solaris_idle) {
+        gen_solaris_idle(dc, cpu_env(cs), insn);
+    }
+    if ((insn & SOLARIS_CALL_DISP_MASK) == SOLARIS_CALL_DISP &&
+        dc->solaris_idle_mp) {
+        gen_solaris_idle_mp(dc, cpu_env(cs), insn);
+    }
 #endif
 
     if (!decode(dc, insn)) {
@@ -5987,7 +6292,12 @@ static void sparc_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     if (dc->base.is_jmp == DISAS_NORETURN) {
         return;
     }
-    if (dc->pc != dc->base.pc_next) {
+    /*
+     * Keep DISAS_EXIT when the insn was in a delay slot: it is how a
+     * write to %psr (or a membar #Sync on sparc64) gets the main loop
+     * to look at pending interrupts again.
+     */
+    if (dc->pc != dc->base.pc_next && dc->base.is_jmp != DISAS_EXIT) {
         dc->base.is_jmp = DISAS_TOO_MANY;
     }
 }
@@ -6051,8 +6361,11 @@ static void sparc_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
        break;
 
     case DISAS_EXIT:
-        /* Exit TB */
-        save_state(dc);
+        /* Exit TB; after a delay slot the PC may be known only at run time */
+        if (!(dc->pc & 3)) {
+            tcg_gen_movi_tl(cpu_pc, dc->pc);
+        }
+        save_npc(dc);
         tcg_gen_exit_tb(NULL, 0);
         break;
 

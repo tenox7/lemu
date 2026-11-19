@@ -506,10 +506,28 @@ struct CPUArchState {
     uint64_t mmubpaction;
     uint64_t mmubpregs[4];
     uint64_t prom_addr;
+    /*
+     * The TLB holds an entry that sparc_cpu_tlb_fill made for a failed
+     * translation (no-fault mode or traps disabled), with its permissions
+     * overridden. A change of MMU_NF flushes the TLB only while this is set.
+     */
+    bool mmu_nf_entries;
     /* Halt in the idle loop of SunOS 4.1.4, see sunos_idle.c */
     bool sunos_idle;
     int64_t sunos_idle_since;   /* when the loop first found no work */
     int64_t sunos_idle_last;    /* when the loop last found no work */
+    /* Halt in the idle loop of Solaris 2.x, see solaris_idle.c */
+    bool solaris_idle;
+    int64_t solaris_idle_since; /* when the loop first found no work */
+    int64_t solaris_idle_last;  /* when the loop last found no work */
+    /* Halt in the multiprocessor idle loop of Solaris 2.x, likewise */
+    bool solaris_idle_mp;
+    bool solaris_idle_mp_halted;  /* halted there */
+    uint8_t solaris_idle_mp_timeout; /* how the timer ended the last halt */
+    bool solaris_idle_kick;       /* end the halt: there may be work */
+    uint32_t *solaris_idle_nr;    /* host address of disp_nrunnable */
+    target_ulong solaris_idle_va; /* its address in the kernel */
+    QEMUTimer *solaris_idle_timer;
 #endif
     float_status fp_status;
 #if defined(TARGET_SPARC64)
@@ -626,6 +644,12 @@ target_ulong cpu_get_psr(CPUSPARCState *env1);
 void cpu_put_psr(CPUSPARCState *env1, target_ulong val);
 void cpu_put_psr_icc(CPUSPARCState *env1, target_ulong val);
 void cpu_put_psr_raw(CPUSPARCState *env1, target_ulong val);
+#if !defined(TARGET_SPARC64) && !defined(CONFIG_USER_ONLY)
+/* solaris_idle.c */
+void sparc_solaris_idle_mp_leave(CPUSPARCState *env);
+void sparc_solaris_idle_mp_poke(CPUSPARCState *env);
+void sparc_solaris_idle_mp_reset(CPUSPARCState *env);
+#endif
 #ifdef TARGET_SPARC64
 void cpu_change_pstate(CPUSPARCState *env1, uint32_t new_pstate);
 void cpu_gl_switch_gregs(CPUSPARCState *env, uint32_t new_gl);

@@ -32,6 +32,7 @@
 #include "user/page-protection.h"
 #endif
 #include "asi.h"
+#include "trace.h"
 
 //#define DEBUG_MMU
 //#define DEBUG_MXCC
@@ -996,18 +997,31 @@ void HELPER(st_asi)(CPUSPARCState *env, target_ulong addr, uint64_t val,
     case ASI_LEON_MMUREGS: /* LEON3 write MMU regs */
         {
             int reg = (addr >> 8) & 0x1f;
-            uint32_t oldreg;
+            uint32_t oldreg, changed;
 
             oldreg = env->mmuregs[reg];
             switch (reg) {
             case 0: /* Control Register */
                 env->mmuregs[reg] = (env->mmuregs[reg] & 0xff000000) |
                     (val & 0x00ffffff);
-                /* Mappings generated during no-fault mode
-                   are invalid in normal mode.  */
-                if ((oldreg ^ env->mmuregs[reg])
-                    & (MMU_NF | env->def.mmu_bm)) {
+                changed = oldreg ^ env->mmuregs[reg];
+                /*
+                 * Of the bits here only boot mode changes a translation
+                 * (instruction fetches with the MMU off). MMU_E selects
+                 * another mmu_idx; caches, PSO and parity aren't modelled.
+                 * MMU_NF only decides whether a failed translation traps:
+                 * the one kind of entry that depends on it is the one that
+                 * sparc_cpu_tlb_fill makes for such a failure with
+                 * overridden permissions, which is invalid in normal mode.
+                 * Flush on a change of NF only when there is one: Solaris
+                 * sets and clears NF around each user window spill and fill
+                 * on the microSPARC, and nearly always nothing faults.
+                 */
+                if ((changed & env->def.mmu_bm) ||
+                    ((changed & MMU_NF) && env->mmu_nf_entries)) {
+                    trace_sparc_mmu_ctrl_flush(oldreg, env->mmuregs[reg]);
                     tlb_flush(cs);
+                    env->mmu_nf_entries = false;
                 }
                 break;
             case 1: /* Context Table Pointer Register */

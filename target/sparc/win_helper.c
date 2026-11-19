@@ -170,6 +170,11 @@ void HELPER(wrpsr)(CPUSPARCState *env, target_ulong new_psr)
         /* cpu_put_psr may trigger interrupts, hence BQL */
         bql_lock();
         cpu_put_psr(env, new_psr);
+#ifndef CONFIG_USER_ONLY
+        if (env->solaris_idle_mp) {
+            sparc_solaris_idle_mp_poke(env);
+        }
+#endif
         bql_unlock();
     }
 }

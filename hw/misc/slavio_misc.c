@@ -67,11 +67,19 @@ typedef struct APCState APCState;
 DECLARE_INSTANCE_CHECKER(APCState, APC,
                          TYPE_APC)
 
+/*
+ * The power management node has 16 bytes of registers. Writing register 0
+ * idles the CPU until the next interrupt; the others are kept as written.
+ */
+#define APC_SIZE 16
+#define APC_IDLE 0
+
 struct APCState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq cpu_halt;
+    uint8_t regs[APC_SIZE];
 };
 
 #define MISC_SIZE 1
@@ -294,16 +302,24 @@ static void apc_mem_writeb(void *opaque, hwaddr addr,
 {
     APCState *s = opaque;
 
-    trace_apc_mem_writeb(val & 0xff);
-    qemu_irq_raise(s->cpu_halt);
+    trace_apc_mem_writeb(addr, val & 0xff);
+    if (addr == APC_IDLE) {
+        qemu_irq_raise(s->cpu_halt);
+    } else {
+        s->regs[addr] = val;
+    }
 }
 
 static uint64_t apc_mem_readb(void *opaque, hwaddr addr,
                               unsigned size)
 {
+    APCState *s = opaque;
     uint32_t ret = 0;
 
-    trace_apc_mem_readb(ret);
+    if (addr != APC_IDLE) {
+        ret = s->regs[addr];
+    }
+    trace_apc_mem_readb(addr, ret);
     return ret;
 }
 
@@ -429,8 +445,53 @@ static void apc_init(Object *obj)
 
     /* Power management (APC) XXX: not a Slavio device */
     memory_region_init_io(&s->iomem, obj, &apc_mem_ops, s,
-                          "apc", MISC_SIZE);
+                          "apc", APC_SIZE);
     sysbus_init_mmio(dev, &s->iomem);
+}
+
+static void apc_reset_hold(Object *obj, ResetType type)
+{
+    APCState *s = APC(obj);
+
+    memset(s->regs, 0, sizeof(s->regs));
+}
+
+/*
+ * Only guests that write the registers other than the idle one (Solaris'
+ * pmc driver) need them migrated. Linux and NetBSD write register 0 only,
+ * so their stream stays as it was before the registers were kept.
+ */
+static bool apc_regs_needed(void *opaque)
+{
+    APCState *s = opaque;
+    int i;
+
+    for (i = 0; i < APC_SIZE; i++) {
+        if (s->regs[i]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const VMStateDescription vmstate_apc = {
+    .name = "apc",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = apc_regs_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8_ARRAY(regs, APCState, APC_SIZE),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static void apc_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
+
+    rc->phases.hold = apc_reset_hold;
+    dc->vmsd = &vmstate_apc;
 }
 
 static void slavio_misc_init(Object *obj)
@@ -502,8 +563,9 @@ static const TypeInfo slavio_misc_info = {
 static const TypeInfo apc_info = {
     .name          = TYPE_APC,
     .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(MiscState),
+    .instance_size = sizeof(APCState),
     .instance_init = apc_init,
+    .class_init    = apc_class_init,
 };
 
 static void slavio_misc_register_types(void)

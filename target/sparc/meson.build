@@ -21,6 +21,7 @@ sparc_system_ss.add(files(
   'monitor.c',
 ))
 sparc_system_ss.add(when: 'TARGET_SPARC', if_true: files('sunos_idle.c'))
+sparc_system_ss.add(when: 'TARGET_SPARC', if_true: files('solaris_idle.c'))
 
 target_arch += {'sparc': sparc_ss}
 target_system_arch += {'sparc': sparc_system_ss}

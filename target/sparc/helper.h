@@ -6,6 +6,8 @@ DEF_HELPER_1(rdasr17, tl, env)
 DEF_HELPER_1(power_down, void, env)
 #ifndef CONFIG_USER_ONLY
 DEF_HELPER_5(sunos_idle, void, env, tl, tl, tl, tl)
+DEF_HELPER_3(solaris_idle, void, env, tl, tl)
+DEF_HELPER_3(solaris_idle_mp, void, env, tl, tl)
 #endif
 #else
 DEF_HELPER_FLAGS_2(wrpil, TCG_CALL_NO_RWG, void, env, tl)

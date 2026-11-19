@@ -267,15 +267,19 @@ trap_state *cpu_tsptr(CPUSPARCState* env)
     return &env->ts[env->tl & MAXTL_MASK];
 }
 
+/*
+ * The tick, stick and hstick timers set their bits in softint from the
+ * main loop, with the BQL held.  The guest's writes to softint must read,
+ * modify and write it under the BQL too: a timer bit set between the read
+ * and the write would be lost, and with it the timer interrupt.
+ */
 static bool do_modify_softint(CPUSPARCState *env, uint32_t value)
 {
     if (env->softint != value) {
         env->softint = value;
 #if !defined(CONFIG_USER_ONLY)
         if (cpu_interrupts_enabled(env)) {
-            bql_lock();
             cpu_check_irqs(env);
-            bql_unlock();
         }
 #endif
         return true;
@@ -285,6 +289,8 @@ static bool do_modify_softint(CPUSPARCState *env, uint32_t value)
 
 void HELPER(set_softint)(CPUSPARCState *env, uint64_t value)
 {
+    BQL_LOCK_GUARD();
+
     if (do_modify_softint(env, env->softint | (uint32_t)value)) {
         trace_int_helper_set_softint(env->softint);
     }
@@ -292,6 +298,8 @@ void HELPER(set_softint)(CPUSPARCState *env, uint64_t value)
 
 void HELPER(clear_softint)(CPUSPARCState *env, uint64_t value)
 {
+    BQL_LOCK_GUARD();
+
     if (do_modify_softint(env, env->softint & (uint32_t)~value)) {
         trace_int_helper_clear_softint(env->softint);
     }
@@ -299,6 +307,8 @@ void HELPER(clear_softint)(CPUSPARCState *env, uint64_t value)
 
 void HELPER(write_softint)(CPUSPARCState *env, uint64_t value)
 {
+    BQL_LOCK_GUARD();
+
     if (do_modify_softint(env, (uint32_t)value)) {
         trace_int_helper_write_softint(env->softint);
     }

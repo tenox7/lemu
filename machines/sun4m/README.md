@@ -17,6 +17,8 @@ kit `sunos414-lemu` (see [README.txt](sunos414/README.txt));
 | Option | What it does |
 |---|---|
 | `-M SS-5,sunos-idle=off` | Let the idle loop spin, as SunOS does on a real machine (default: on) |
+| `-M SS-20,solaris-idle=off` | The same for Solaris 2.5.1 to 9 with one CPU (default: on) |
+| `-M SS-20,solaris-smp-idle=off` | The same for Solaris 2.5.1 to 9 with more than one CPU (default: on) |
 | `-vga cg3 -g 1920x1080x8` | Screen size: 640x480 or more, a width that 8 divides. See [cgthree](cgthree/README.md) |
 | `-m 256` | RAM. SunOS gets 16 MB less than this |
 
@@ -40,6 +42,41 @@ kit `sunos414-lemu` (see [README.txt](sunos414/README.txt));
   before.
 - It knows the loop of the 4.1.4 kernel. `-trace sparc_sunos_idle_match`
   prints a line when it finds it. It is off with more than one CPU.
+
+## Solaris 2.x
+
+LEMU's sun4m also runs Solaris 2.5.1 to 9 better than QEMU does:
+
+- **Idle, one CPU.** Solaris calls the CPU module's `idle_cpu` hook in its
+  idle loop. Only the microSPARC-II with the `pmc` driver stops the CPU
+  there; the SS-10 and SS-20 always spin. LEMU finds the call and halts the
+  CPU until the next interrupt (`target/sparc/solaris_idle.c`,
+  `-trace sparc_solaris_idle_match`). Off with more than one CPU.
+- **Idle, more CPUs.** That loop never calls `idle_cpu`, and nothing tells
+  an idle CPU that another queued work for it. LEMU halts it at the call of
+  `disp_getwork` and wakes it when another CPU lowers its interrupt level
+  with work queued, at an interrupt, or after 10 ms
+  (`-trace sparc_solaris_idle_mp_match`).
+- **More CPUs hung.** A write to `%psr` in a delay slot, as in Solaris's
+  `splx`, did not end the translation block, so an interrupt it let in
+  waited. Two CPUs running Solaris stopped within minutes (QEMU 8.2 and
+  later).
+- **Power management (APC).** The registers are 16 bytes, as the firmware
+  says, not 1. Solaris 2.6's `pmc` writes several at attach and panicked
+  with `kernel write fault at addr=0x6a000002`. Register 0 still halts the
+  CPU; the others keep what is written.
+- **No-fault mode.** Solaris's window trap handlers on the SS-5 set and
+  clear the MMU's no-fault bit twice per trap, and QEMU flushed the whole
+  TLB each time: deep calls ran 4 to 10 times slower than on the SS-20.
+  LEMU flushes only when the TLB holds an entry made in no-fault mode
+  (`-trace sparc_mmu_ctrl_flush`).
+- **CD after a SCSI bus reset.** The ESP refused Select with ATN after a
+  bus reset, and Solaris 2.5.1 looped on `gross error in esp status` at
+  its CD (QEMU 10.1 and later).
+
+The qtests `sun4m-solaris-idle-test`, `sun4m-solaris-smp-idle-test`,
+`sun4m-pil-delay-slot-test`, `sun4m-apc-test` and `sun4m-mmu-nofault-test`
+check these, and `am53c974-test` (i386) the ESP.
 
 ## Keyboard and mouse
 

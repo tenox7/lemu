@@ -182,12 +182,13 @@ static void bmdma_setup_bar(PCIIDEState *d)
 
 static void cmd646_update_irq(PCIDevice *pd)
 {
+    PCIIDEState *d = PCI_IDE(pd);
     int pci_level;
 
-    pci_level = ((pd->config[MRDMODE] & MRDMODE_INTR_CH0) &&
-                 !(pd->config[MRDMODE] & MRDMODE_BLK_CH0)) ||
-        ((pd->config[MRDMODE] & MRDMODE_INTR_CH1) &&
-         !(pd->config[MRDMODE] & MRDMODE_BLK_CH1));
+    /* The interrupt line follows the drives' INTRQ, not the latched status */
+    pci_level =
+        ((d->intrq & 1) && !(pd->config[MRDMODE] & MRDMODE_BLK_CH0)) ||
+        ((d->intrq & 2) && !(pd->config[MRDMODE] & MRDMODE_BLK_CH1));
     pci_set_irq(pd, pci_level);
 }
 
@@ -199,10 +200,17 @@ static void cmd646_set_irq(void *opaque, int channel, int level)
     int irq_mask;
 
     irq_mask = MRDMODE_INTR_CH0 << channel;
+    /*
+     * The interrupt status bits (MRDMODE, mirrored in CFR/ARTTIM23) latch
+     * the drive's INTRQ and stay set until the guest writes 1 to clear
+     * them; INTRQ dropping (the guest reading the drive's status register)
+     * doesn't clear them. The PCI interrupt line follows INTRQ itself.
+     */
     if (level) {
+        d->intrq |= 1 << channel;
         pd->config[MRDMODE] |= irq_mask;
     } else {
-        pd->config[MRDMODE] &= ~irq_mask;
+        d->intrq &= ~(1 << channel);
     }
     cmd646_update_dma_interrupts(pd);
     cmd646_update_irq(pd);
@@ -216,6 +224,8 @@ static void cmd646_reset(DeviceState *dev)
     for (i = 0; i < 2; i++) {
         ide_bus_reset(&d->bus[i], IDE_RESET_HARDWARE);
     }
+    /* The drives come out of reset with INTRQ low */
+    d->intrq = 0;
 }
 
 static uint32_t cmd646_pci_config_read(PCIDevice *d,

@@ -10,6 +10,9 @@ mmu_helper_get_phys_addr_code(uint32_t tl, int mmu_idx, uint64_t prim_context, u
 mmu_helper_get_phys_addr_data(uint32_t tl, int mmu_idx, uint64_t prim_context, uint64_t sec_context, uint64_t address) "tl=%d mmu_idx=%d primary context=0x%"PRIx64" secondary context=0x%"PRIx64" address=0x%"PRIx64
 mmu_helper_mmu_fault(uint64_t address, uint64_t paddr, int mmu_idx, uint32_t tl, uint64_t prim_context, uint64_t sec_context) "Translate at 0x%"PRIx64" -> 0x%"PRIx64", mmu_idx=%d tl=%d primary context=0x%"PRIx64" secondary context=0x%"PRIx64
 
+# ldst_helper.c
+sparc_mmu_ctrl_flush(uint32_t old, uint32_t val) "MMU control register 0x%08x -> 0x%08x: TLB flush"
+
 # int32_helper.c
 sun4m_cpu_interrupt(unsigned int level) "Set CPU IRQ %d"
 sun4m_cpu_reset_interrupt(unsigned int level) "Reset CPU IRQ %d"
@@ -17,7 +20,14 @@ sun4m_cpu_reset_interrupt(unsigned int level) "Reset CPU IRQ %d"
 # sunos_idle.c
 sparc_sunos_idle(uint32_t pc) "idle loop halt, go on at 0x%08x"
 
+# solaris_idle.c
+sparc_solaris_idle(uint32_t pc) "idle loop halt, go on at 0x%08x"
+sparc_solaris_idle_mp(int cpu, uint32_t pc) "cpu %d: multiprocessor idle loop halt, go on at 0x%08x"
+sparc_solaris_idle_mp_wake(int cpu, const char *why) "cpu %d: wake from the idle loop halt (%s)"
+
 # translate.c
+sparc_solaris_idle_mp_match(const char *kernel, uint32_t pc, int reg, int off) "Solaris multiprocessor idle loop (%s): disp_getwork call at 0x%08x, disp_nrunnable at register %d offset %d"
+sparc_solaris_idle_match(const char *kernel, uint32_t pc, int reg, int off) "Solaris idle loop (%s): idle_cpu call at 0x%08x, disp_nrunnable at register %d offset %d"
 sparc_sunos_idle_match(uint32_t pc, uint32_t top, uint32_t nrunnable, uint32_t whichqs, uint32_t qrunflag) "SunOS idle loop: branch at 0x%08x to 0x%08x, Nrunnable 0x%08x whichqs 0x%08x qrunflag 0x%08x"
 
 # int64_helper.c

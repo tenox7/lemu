@@ -248,10 +248,13 @@ bool sparc_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
     env->mmuregs[4] = address; /* Fault address register */
 
     if ((env->mmuregs[0] & MMU_NF) || env->psret == 0)  {
-        /* No fault mode: if a mapping is available, just override
-           permissions. If no mapping is available, redirect accesses to
-           neverland. Fake/overridden mappings will be flushed when
-           switching to normal mode. */
+        /*
+         * No fault mode: if a mapping is available, just override
+         * permissions. If no mapping is available, redirect accesses to
+         * neverland. Fake/overridden mappings will be flushed when
+         * switching to normal mode (helper_st_asi, ASI_M_MMUREGS).
+         */
+        env->mmu_nf_entries = true;
         full.prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
         tlb_set_page_full(cs, mmu_idx, vaddr, &full);
         return true;

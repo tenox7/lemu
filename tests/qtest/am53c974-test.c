@@ -289,6 +289,72 @@ static void test_reset_before_transfer_ok(void)
     qtest_quit(s);
 }
 
+/* am53c974 at PCI 00:02.0, BAR0 (I/O) at 0xc000, ESP registers 4 bytes apart */
+#define ESP_IO_BASE 0xc000
+#define ESP_REG(r) (ESP_IO_BASE + (r) * 4)
+
+#define ESP_FIFO   0x2
+#define ESP_CMD    0x3
+#define ESP_RSTAT  0x4
+#define ESP_WBUSID 0x4
+#define ESP_RINTR  0x5
+
+#define CMD_BUSRESET 0x03
+#define CMD_SELATN   0x42
+
+#define STAT_GE  0x40
+#define INTR_RST 0x80
+
+/* Select target 0 with ATN, no DMA: IDENTIFY and TEST UNIT READY in the FIFO */
+static void esp_select_atn_tur(QTestState *s)
+{
+    int i;
+
+    qtest_outb(s, ESP_REG(ESP_FIFO), 0x80);
+    for (i = 0; i < 6; i++) {
+        qtest_outb(s, ESP_REG(ESP_FIFO), 0x00);
+    }
+    qtest_outb(s, ESP_REG(ESP_WBUSID), 0);
+    qtest_outb(s, ESP_REG(ESP_CMD), CMD_SELATN);
+}
+
+/*
+ * A SCSI bus reset disconnects every device, so the chip is back in
+ * disconnected mode and Select with ATN is a valid command again. Guests
+ * such as Solaris 2.5.1 reset the bus to recover from errors and then
+ * select a target again; an illegal command interrupt there shows up as
+ * a gross error (STAT_GE) in the status register.
+ */
+static void test_select_after_bus_reset_ok(void)
+{
+    QTestState *s = qtest_init(
+        "-device am53c974,id=scsi "
+        "-device scsi-hd,drive=disk0 -drive "
+        "id=disk0,if=none,file=null-co://,format=raw -nodefaults");
+    uint8_t stat, intr;
+
+    qtest_outl(s, 0xcf8, 0x80001010);
+    qtest_outl(s, 0xcfc, ESP_IO_BASE);
+    qtest_outl(s, 0xcf8, 0x80001004);
+    qtest_outw(s, 0xcfc, 0x01);
+
+    /* Selecting target 0 puts the chip in initiator mode */
+    esp_select_atn_tur(s);
+    stat = qtest_inb(s, ESP_REG(ESP_RSTAT));
+    g_assert_cmphex(stat & STAT_GE, ==, 0);
+    qtest_inb(s, ESP_REG(ESP_RINTR));
+
+    qtest_outb(s, ESP_REG(ESP_CMD), CMD_BUSRESET);
+    intr = qtest_inb(s, ESP_REG(ESP_RINTR));
+    g_assert_cmphex(intr & INTR_RST, ==, INTR_RST);
+
+    esp_select_atn_tur(s);
+    stat = qtest_inb(s, ESP_REG(ESP_RSTAT));
+    g_assert_cmphex(stat & STAT_GE, ==, 0);
+
+    qtest_quit(s);
+}
+
 int main(int argc, char **argv)
 {
     const char *arch = qtest_get_arch();
@@ -318,6 +384,8 @@ int main(int argc, char **argv)
                        test_inflight_cancel_ok);
         qtest_add_func("am53c974/test_reset_before_transfer_ok",
                        test_reset_before_transfer_ok);
+        qtest_add_func("am53c974/test_select_after_bus_reset_ok",
+                       test_select_after_bus_reset_ok);
     }
 
     return g_test_run();

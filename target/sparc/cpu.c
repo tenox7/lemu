@@ -76,6 +76,7 @@ static void sparc_cpu_reset_hold(Object *obj, ResetType type)
 #else
     env->mmuregs[0] &= ~(MMU_E | MMU_NF);
     env->mmuregs[0] |= env->def.mmu_bm;
+    sparc_solaris_idle_mp_reset(env);
 #endif
     env->pc = 0;
     env->npc = env->pc + 4;
@@ -787,6 +788,12 @@ static void sparc_restore_state_to_opc(CPUState *cs,
 #ifndef CONFIG_USER_ONLY
 static bool sparc_cpu_has_work(CPUState *cs)
 {
+#ifndef TARGET_SPARC64
+    /* Work queued for a CPU halted in the Solaris idle loop */
+    if (qatomic_read(&cpu_env(cs)->solaris_idle_kick)) {
+        return true;
+    }
+#endif
     return cpu_test_interrupt(cs, CPU_INTERRUPT_HARD) &&
            cpu_interrupts_enabled(cpu_env(cs));
 }
