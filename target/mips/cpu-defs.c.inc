@@ -546,6 +546,32 @@ const mips_def_t mips_defs[] =
                       ASE_DSP | ASE_DSP_R2 | ASE_DSP_R3,
         .mmu_type = MMU_TYPE_R4000,
     },
+    {
+        /*
+         * MIPS R3000A with an R3010A FPU, as used by the original Jazz
+         * machines.  This uses the MIPS-I TLB: one EntryLo register, 64
+         * single 4 KiB pages and a shifted Index register.  KSEG0 starts
+         * uncached: the ARC firmware for these boards relies on that.
+         */
+        .name = "R3000A",
+        .CP0_PRid = 0x00000230,
+        .CP0_Config0 = (2 << CP0C0_Impl) | (1 << CP0C0_IC) | (1 << CP0C0_DC) |
+                       (2 << CP0C0_K0) | (MMU_TYPE_R3000 << CP0C0_MT),
+        .CP0_Config1 = (1 << CP0C1_FP) | (47 << CP0C1_MMU),
+        .CP0_LLAddr_rw_bitmask = 0xFFFFFFFF,
+        .CP0_LLAddr_shift = 4,
+        .SYNCI_Step = 16,
+        .CCRes = 2,
+        /* MIPS-I Status has the cache-isolate bit that MIPS32 dropped. */
+        .CP0_Status_rw_bitmask = 0x3678FFFF | (1 << 16),
+        .CP1_fcr0 = 0x00003300,
+        .CP1_fcr31 = 0,
+        .CP1_fcr31_rw_bitmask = 0x0183FFFF,
+        .SEGBITS = 32,
+        .PABITS = 32,
+        .insn_flags = CPU_MIPS32R1,
+        .mmu_type = MMU_TYPE_R3000,
+    },
 #if defined(TARGET_MIPS64)
     {
         .name = "R4000",

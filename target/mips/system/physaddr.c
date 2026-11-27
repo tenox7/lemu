@@ -130,6 +130,21 @@ int get_physical_address(const CPUMIPSState *env, hwaddr *physical,
     int ret = TLBRET_MATCH;
     target_ulong address = real_address;
 
+    /*
+     * MIPS-I isolate-cache mode (Status.IsC) makes data references hit the
+     * cache only; instruction fetches still come from main memory.  The ARC
+     * PROM uses this to zero cache lines while executing out of RAM.  LEMU
+     * does not model real caches, so give isolated data accesses a private
+     * shadow instead of letting them overwrite the code being executed.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000 &&
+        access_type != MMU_INST_FETCH &&
+        (env->CP0_Status & (1 << 16))) {
+        *physical = 0x20000000 | ((hwaddr)real_address & 0x03ffffff);
+        *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+        return TLBRET_MATCH;
+    }
+
     if (address <= USEG_LIMIT) {
         /* useg */
         uint16_t segctl;

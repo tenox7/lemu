@@ -315,14 +315,27 @@ static inline void compute_hflags(CPUMIPSState *env)
                      MIPS_HFLAG_AWRAP | MIPS_HFLAG_DSP | MIPS_HFLAG_DSP_R2 |
                      MIPS_HFLAG_DSP_R3 | MIPS_HFLAG_SBRI | MIPS_HFLAG_MSA |
                      MIPS_HFLAG_FRE | MIPS_HFLAG_ELPA | MIPS_HFLAG_ERL);
-    if (env->CP0_Status & (1 << CP0St_ERL)) {
-        env->hflags |= MIPS_HFLAG_ERL;
-    }
-    if (!(env->CP0_Status & (1 << CP0St_EXL)) &&
-        !(env->CP0_Status & (1 << CP0St_ERL)) &&
-        !(env->hflags & MIPS_HFLAG_DM)) {
-        env->hflags |= (env->CP0_Status >> CP0St_KSU) &
-                       MIPS_HFLAG_KSU;
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * MIPS-I has no EXL/ERL/KSU fields: Status bits 0..5 are the
+         * three-level interrupt/user pipeline (IEc/KUc, IEp/KUp, IEo/KUo).
+         * Only KUc controls the current privilege level; interpreting the
+         * saved bits as ERL/KSU would make kernel code look like user code
+         * after an exception and trigger bogus address errors.
+         */
+        if (env->CP0_Status & (1 << 1)) {
+            env->hflags |= MIPS_HFLAG_UM;
+        }
+    } else {
+        if (env->CP0_Status & (1 << CP0St_ERL)) {
+            env->hflags |= MIPS_HFLAG_ERL;
+        }
+        if (!(env->CP0_Status & (1 << CP0St_EXL)) &&
+            !(env->CP0_Status & (1 << CP0St_ERL)) &&
+            !(env->hflags & MIPS_HFLAG_DM)) {
+            env->hflags |= (env->CP0_Status >> CP0St_KSU) &
+                           MIPS_HFLAG_KSU;
+        }
     }
 #if defined(TARGET_MIPS64)
     if ((env->insn_flags & ISA_MIPS3) &&

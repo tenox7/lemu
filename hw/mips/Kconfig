@@ -36,6 +36,28 @@ config JAZZ
     select DS1225Y
     select JAZZ_LED
 
+config R3KJAZZ
+    bool
+    default y
+    depends on MIPS && !MIPS64 && !TARGET_BIG_ENDIAN
+    select ISA_BUS
+    select RC4030
+    select I8259
+    select I8254
+    select I8257
+    select PCSPK
+    select G300FB
+    select DP8393X
+    select ESP
+    select FDC_SYSBUS
+    select MC146818RTC
+    select PCKBD
+    select VMMOUSE_MMIO
+    select SERIAL_MM
+    select PARALLEL
+    select DS1225Y
+    select JAZZ_LED
+
 config FULOONG
     bool
     default y
