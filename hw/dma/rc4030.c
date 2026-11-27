@@ -34,6 +34,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/main-loop.h"
+#include "hw/core/qdev-properties.h"
 #include "system/address-spaces.h"
 #include "system/physmem.h"
 #include "hw/isa/isa.h"
@@ -69,6 +70,7 @@ struct rc4030State {
     SysBusDevice parent;
 
     uint32_t config; /* 0x0000: RC4030 config register */
+    bool rev1; /* revision 1 (MCT-ADR) reports a different config at reset */
     uint32_t revision; /* 0x0008: RC4030 Revision register */
     uint32_t invalid_address_register; /* 0x0010: Invalid Address register */
 
@@ -525,7 +527,8 @@ static IOMMUTLBEntry rc4030_dma_translate(IOMMUMemoryRegion *iommu, hwaddr addr,
 
     i = addr / DMA_PAGESIZE;
     if (i < s->dma_tl_limit / sizeof(entry)) {
-        entry_address = (s->dma_tl_base & 0x7fffffff) + i * sizeof(entry);
+        entry_address = (s->dma_tl_base & (s->rev1 ? 0x0fffffff : 0x7fffffff))
+                        + i * sizeof(entry);
         if (address_space_read(ret.target_as, entry_address,
                                MEMTXATTRS_UNSPECIFIED, &entry, sizeof(entry))
                 == MEMTX_OK) {
@@ -542,7 +545,7 @@ static void rc4030_reset(DeviceState *dev)
     rc4030State *s = RC4030(dev);
     int i;
 
-    s->config = 0x410; /* some boards seem to accept 0x104 too */
+    s->config = s->rev1 ? 0x104 : 0x410;
     s->revision = 1;
     s->invalid_address_register = 0;
     s->nmi_interrupt = 0;
@@ -587,6 +590,7 @@ static const VMStateDescription vmstate_rc4030 = {
     .post_load = rc4030_post_load,
     .fields = (const VMStateField []) {
         VMSTATE_UINT32(config, rc4030State),
+        VMSTATE_BOOL(rev1, rc4030State),
         VMSTATE_UINT32(invalid_address_register, rc4030State),
         VMSTATE_UINT32_2DARRAY(dma_regs, rc4030State, 8, 4),
         VMSTATE_UINT32(dma_tl_base, rc4030State),
@@ -796,6 +800,15 @@ static void rc4030_unrealize(DeviceState *dev)
     object_unparent(OBJECT(&s->dma_mr));
 }
 
+static const Property rc4030_properties[] = {
+    /*
+     * The R3000 Jazz uses the MCT-ADR, a close relative of the RC4030 which
+     * reports itself as revision 1 and has a different translation table
+     * base mask.
+     */
+    DEFINE_PROP_BOOL("rev1", rc4030State, rev1, false),
+};
+
 static void rc4030_class_init(ObjectClass *klass, const void *class_data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -805,6 +818,7 @@ static void rc4030_class_init(ObjectClass *klass, const void *class_data)
     dc->unrealize = rc4030_unrealize;
     device_class_set_legacy_reset(dc, rc4030_reset);
     dc->vmsd = &vmstate_rc4030;
+    device_class_set_props(dc, rc4030_properties);
 
     idc->has_autoinitialization = rc4030_isadma_has_autoinit;
     idc->read_memory = rc4030_isadma_read_memory;
@@ -849,14 +863,28 @@ static void rc4030_register_types(void)
 
 type_init(rc4030_register_types)
 
-DeviceState *rc4030_init(rc4030_dma **dmas, IOMMUMemoryRegion **dma_mr)
+static DeviceState *rc4030_init_common(rc4030_dma **dmas,
+                                       IOMMUMemoryRegion **dma_mr, bool rev1)
 {
     DeviceState *dev;
 
     dev = qdev_new(TYPE_RC4030);
+    if (rev1) {
+        qdev_prop_set_bit(dev, "rev1", true);
+    }
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
     *dmas = rc4030_allocate_dmas(dev, 4);
     *dma_mr = &RC4030(dev)->dma_mr;
     return dev;
+}
+
+DeviceState *rc4030_init(rc4030_dma **dmas, IOMMUMemoryRegion **dma_mr)
+{
+    return rc4030_init_common(dmas, dma_mr, false);
+}
+
+DeviceState *rc4030_init_rev1(rc4030_dma **dmas, IOMMUMemoryRegion **dma_mr)
+{
+    return rc4030_init_common(dmas, dma_mr, true);
 }

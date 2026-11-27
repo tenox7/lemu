@@ -18,5 +18,6 @@ void rc4030_dma_read(void *dma, uint8_t *buf, int len);
 void rc4030_dma_write(void *dma, uint8_t *buf, int len);
 
 DeviceState *rc4030_init(rc4030_dma **dmas, IOMMUMemoryRegion **dma_mr);
+DeviceState *rc4030_init_rev1(rc4030_dma **dmas, IOMMUMemoryRegion **dma_mr);
 
 #endif
