@@ -49,6 +49,16 @@
  * the driver turns the DMA off, so that the audiodev still plays what was
  * taken: turning it off at once drops the last 50 ms of every sound.
  *
+ * The interrupts are not raised when the samples are taken but when the
+ * codec clock gets to that point, as on the real chip: PI when the
+ * codec starts on the next buffer, PMI when it has played the last one.
+ * PMI also waits until the driver has cleared the PI before it. SunOS
+ * 4.1.4's audio_4231_cintr looks at PMI before PI and acts on PMI only
+ * after a PI has found no next buffer to load; when both come in one
+ * interrupt it drops the PMI, the last buffers are never marked played,
+ * and a process in AUDIO_DRAIN (SimCity's audiomixer) sleeps for ever.
+ * Taking a short buffer ahead would raise both at once.
+ *
  * Capture is not done: its registers keep what is written, and the
  * capture pipe always reads as empty.
  */
@@ -154,6 +164,10 @@ struct CSState {
     int64_t play_start;     /* QEMU_CLOCK_VIRTUAL ns */
     uint64_t play_units;    /* taken since play_start */
     int64_t play_drain;     /* the voice stays on until then */
+    int64_t play_end;       /* what was taken has been played by then */
+    int64_t pi_at;          /* PI is due then, or -1 */
+    int64_t pmi_at;         /* PMI is due then, or -1 */
+    QEMUTimer *irq_timer;   /* raises them when they are due */
 };
 
 #define CS_RAP(s) ((s)->regs[CS_IAR] & CS_MAXDREG)
@@ -200,8 +214,15 @@ static uint32_t cs_read_csr(CSState *s)
     if (csr & APC_INTS) {
         csr |= APC_IP;
     }
-    if (!s->play_next) {
+    /*
+     * The next registers are free when the codec gets to the buffer
+     * taken from them, with its PI: a driver that loads on PD would
+     * otherwise load one more before that PI, and lose a PI.
+     */
+    if (!s->play_next && s->pi_at < 0) {
         csr |= APC_PD;
+    }
+    if (!s->play_next) {
         if (s->regs[CS_PC] == 0) {
             csr |= APC_PM;
         }
@@ -225,19 +246,80 @@ static void cs_update_irq(CSState *s)
     qemu_set_irq(s->irq, level);
 }
 
-/* The current playback buffer is done: take the next one, if any. */
+/* units a second: one sample of each channel, two for ADPCM */
+static uint64_t cs_play_rate(CSState *s)
+{
+    return s->play_freq / (s->play_fmt == CS_FMT_ADPCM ? 2 : 1);
+}
+
+/* Raise the PI and PMI that are due, and set the timer for the others */
+static void cs_play_irqs(CSState *s)
+{
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t next = INT64_MAX;
+    uint32_t csr = s->regs[CS_CSR];
+    bool pi_pending;
+
+    /* paused: nothing moves on until the driver lets it go again */
+    if (cs_play_go(s)) {
+        if (s->pi_at >= 0) {
+            if (now >= s->pi_at) {
+                s->regs[CS_CSR] |= APC_PI;
+                s->pi_at = -1;
+            } else {
+                next = s->pi_at;
+            }
+        }
+        /* PMI after the driver has taken the PI before it */
+        pi_pending = s->pi_at >= 0 ||
+                     ((s->regs[CS_CSR] & APC_PI) &&
+                      (csr & APC_IE) && (csr & APC_PIE));
+        /* a buffer loaded in time keeps the pipe from running empty */
+        if (s->pmi_at >= 0 && !pi_pending && !s->play_next) {
+            if (now >= s->pmi_at) {
+                s->regs[CS_CSR] |= APC_PMI;
+                s->pmi_at = -1;
+                trace_cs4231_play_empty();
+            } else {
+                next = MIN(next, s->pmi_at);
+            }
+        }
+    }
+    if (next != INT64_MAX) {
+        timer_mod(s->irq_timer, next);
+    } else {
+        timer_del(s->irq_timer);
+    }
+    cs_update_irq(s);
+}
+
+static void cs_irq_timer(void *opaque)
+{
+    cs_play_irqs(opaque);
+}
+
+/*
+ * The current playback buffer is done: take the next one, if any. The
+ * codec gets to this point when it has played what was taken before.
+ */
 static void cs_play_next(CSState *s)
 {
+    int64_t at = MAX(s->play_end, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+
     if (s->play_next) {
         s->regs[CS_PVA] = s->regs[CS_PNVA];
         s->regs[CS_PC] = s->regs[CS_PNC];
         s->play_next = false;
-        s->regs[CS_CSR] |= APC_PI;
+        /* loaded before the pipe ran empty: no PMI, the PI then */
+        s->pmi_at = -1;
+        if (s->pi_at < 0) {
+            s->pi_at = at;
+        }
         trace_cs4231_play_next(s->regs[CS_PVA], s->regs[CS_PC]);
     } else {
-        s->regs[CS_CSR] |= APC_PMI;
-        trace_cs4231_play_empty();
+        s->pmi_at = at;
     }
+    cs_play_irqs(s);
 }
 
 /* Playback stopped: let the audiodev play what was taken ahead */
@@ -253,7 +335,9 @@ static void cs_play_update(CSState *s)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if (run && !s->play_running) {
-        s->play_start = now;
+        /* the codec goes on after what it still has to play */
+        s->play_start = MAX(now, s->play_end);
+        s->play_end = s->play_start;
         s->play_units = 0;
     } else if (!run && s->play_running) {
         cs_play_stopped(s, now);
@@ -355,29 +439,24 @@ static void cs_convert(CSState *s, const uint8_t *in, int16_t *out,
     }
 }
 
-/* The audiodev has room for avail bytes: feed it from the DMA buffers. */
-static void cs_audio_callback(void *opaque, int avail)
+/* Feed the audiodev, which has room for room bytes, from the DMA buffers. */
+static void cs_play_feed(CSState *s, uint32_t room, int64_t now)
 {
-    CSState *s = opaque;
     uint8_t in[1024];
     int16_t out[2048];
     uint32_t unit_in, unit_out;
-
-    uint32_t room = MAX(avail, 0);
     uint64_t rate, due, budget;
-    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int64_t ahead;
 
-    if (!s->play_running) {
-        /* stopped: the voice is on only to play out the last samples */
-        if (now >= s->play_drain) {
-            audio_be_set_active_out(s->audio_be, s->voice, false);
-        }
-        return;
+    /* the codec starts when it asks for its first samples: now */
+    if (s->play_units == 0 && now > s->play_start) {
+        s->play_start = now;
+        s->play_end = now;
     }
-    /* units a second: one sample of each channel, two for ADPCM */
-    rate = s->play_freq / (s->play_fmt == CS_FMT_ADPCM ? 2 : 1);
-    due = muldiv64(now - s->play_start,
-                   rate, NANOSECONDS_PER_SECOND) + rate / 20;
+    /* up to 50 ms ahead of the codec, which may start in the future */
+    rate = cs_play_rate(s);
+    ahead = now - s->play_start + NANOSECONDS_PER_SECOND / 20;
+    due = ahead > 0 ? muldiv64(ahead, rate, NANOSECONDS_PER_SECOND) : 0;
     budget = due > s->play_units ? due - s->play_units : 0;
 
     cs_play_units(s, &unit_in, &unit_out);
@@ -391,7 +470,6 @@ static void cs_audio_callback(void *opaque, int avail)
                 break;
             }
             cs_play_next(s);
-            cs_update_irq(s);
             continue;
         }
         if (pc < unit_in) {
@@ -419,16 +497,33 @@ static void cs_audio_callback(void *opaque, int avail)
             room -= units * unit_out;
             budget -= units;
             s->play_units += units;
+            s->play_end = s->play_start +
+                muldiv64(s->play_units, NANOSECONDS_PER_SECOND, rate);
         }
         if (s->regs[CS_PC] == 0) {
             cs_play_next(s);
-            cs_update_irq(s);
         }
     }
     /* after a gap the clock starts again with the next buffer */
     if (!cs_play_active(s)) {
         cs_play_stopped(s, now);
     }
+}
+
+/* The audiodev has room for avail bytes */
+static void cs_audio_callback(void *opaque, int avail)
+{
+    CSState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (!s->play_running) {
+        /* stopped: the voice is on only to play out the last samples */
+        if (now >= s->play_drain) {
+            audio_be_set_active_out(s->audio_be, s->voice, false);
+        }
+        return;
+    }
+    cs_play_feed(s, MAX(avail, 0), now);
 }
 
 /* DAC attenuation is 1.5 dB a step; the mixer wants 0-255 */
@@ -490,6 +585,10 @@ static void cs_reset(DeviceState *d)
     s->play_next = false;
     s->play_running = false;
     s->play_drain = 0;
+    s->play_end = 0;
+    s->pi_at = -1;
+    s->pmi_at = -1;
+    timer_del(s->irq_timer);
     cs_play_setup(s);
     cs_play_update(s);
 }
@@ -530,7 +629,8 @@ static void cs_mem_write(void *opaque, hwaddr addr,
 {
     CSState *s = opaque;
     uint32_t saddr, csr;
-    bool was_go;
+    bool was_go, feed;
+    int64_t now;
 
     saddr = addr >> 2;
     trace_cs4231_mem_writel_reg(saddr, s->regs[saddr], val);
@@ -583,8 +683,12 @@ static void cs_mem_write(void *opaque, hwaddr addr,
             /* playback DMA off: drop what it still had */
             s->regs[CS_PC] = 0;
             s->play_next = false;
+            s->pi_at = -1;
+            s->pmi_at = -1;
         }
         cs_play_update(s);
+        /* a PMI may have waited for this PI to be cleared */
+        cs_play_irqs(s);
         break;
     case CS_PC:
         s->regs[saddr] = val;
@@ -594,7 +698,22 @@ static void cs_mem_write(void *opaque, hwaddr addr,
         /* the count loads the next buffer; a count of 0 unloads it */
         s->regs[saddr] = val;
         s->play_next = val != 0;
+        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        feed = s->play_next && s->regs[CS_PC] == 0 && now < s->play_end;
         cs_play_update(s);
+        /*
+         * Loaded while the codec still plays the end of the last buffer:
+         * take it now, for the codec to go on without a gap. At the next
+         * audio callback a buffer shorter than the callback's period
+         * would be late every time. The PI comes when the codec gets to
+         * it. After the pipe ran dry the codec asks again at the next
+         * callback, as after PEN.
+         */
+        if (feed && s->voice && s->play_running) {
+            cs_play_feed(s, UINT32_MAX, now);
+        }
+        /* a PMI still due waits while a next buffer is loaded */
+        cs_play_irqs(s);
         break;
     default:
         s->regs[saddr] = val;
@@ -608,6 +727,17 @@ static const MemoryRegionOps cs_mem_ops = {
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
+/* without the subsection nothing is due */
+static int cs_pre_load(void *opaque)
+{
+    CSState *s = opaque;
+
+    s->play_end = 0;
+    s->pi_at = -1;
+    s->pmi_at = -1;
+    return 0;
+}
+
 static int cs_post_load(void *opaque, int version_id)
 {
     CSState *s = opaque;
@@ -616,19 +746,47 @@ static int cs_post_load(void *opaque, int version_id)
     s->play_drain = 0;
     cs_play_setup(s);
     cs_play_update(s);
+    /* a PI or PMI still due: set the timer again */
+    cs_play_irqs(s);
     return 0;
 }
+
+/* A PI or PMI still due must come after a migration, or AUDIO_DRAIN hangs */
+static bool cs_irqs_needed(void *opaque)
+{
+    CSState *s = opaque;
+
+    return s->pi_at >= 0 || s->pmi_at >= 0;
+}
+
+static const VMStateDescription vmstate_cs4231_irqs = {
+    .name = "cs4231/irqs",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cs_irqs_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_INT64(play_end, CSState),
+        VMSTATE_INT64(pi_at, CSState),
+        VMSTATE_INT64(pmi_at, CSState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 static const VMStateDescription vmstate_cs4231 = {
     .name ="cs4231",
     .version_id = 2,
     .minimum_version_id = 1,
+    .pre_load = cs_pre_load,
     .post_load = cs_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, CSState, CS_REGS),
         VMSTATE_UINT8_ARRAY(dregs, CSState, CS_DREGS),
         VMSTATE_BOOL_V(play_next, CSState, 2),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_cs4231_irqs,
+        NULL
     }
 };
 
@@ -641,6 +799,9 @@ static void cs4231_init(Object *obj)
                           CS_SIZE);
     sysbus_init_mmio(dev, &s->iomem);
     sysbus_init_irq(dev, &s->irq);
+    s->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, cs_irq_timer, s);
+    s->pi_at = -1;
+    s->pmi_at = -1;
 }
 
 static void cs4231_realize(DeviceState *dev, Error **errp)
