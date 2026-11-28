@@ -590,7 +590,6 @@ static const VMStateDescription vmstate_rc4030 = {
     .post_load = rc4030_post_load,
     .fields = (const VMStateField []) {
         VMSTATE_UINT32(config, rc4030State),
-        VMSTATE_BOOL(rev1, rc4030State),
         VMSTATE_UINT32(invalid_address_register, rc4030State),
         VMSTATE_UINT32_2DARRAY(dma_regs, rc4030State, 8, 4),
         VMSTATE_UINT32(dma_tl_base, rc4030State),
