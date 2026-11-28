@@ -9,20 +9,21 @@ Linux-x86_64) q=bin/linux-x86_64/qemu-system-hppa ;;
 Linux-aarch64) q=bin/linux-aarch64/qemu-system-hppa ;;
 *) echo "No QEMU binary for $(uname -sm)" >&2; exit 1 ;;
 esac
-# The firmware is LEMU's SeaBIOS-hppa (bin/share/qemu/hppa-firmware64.img), and the
-# card's PCI ROM is bin/share/qemu/vgabios-ati.bin.
+# The firmware is LEMU's SeaBIOS-hppa (bin/share/qemu/hppa-firmware64.img).
 # tb-size=512 keeps the code buffer where it is fast on Apple Silicon.
-# The terminal is the serial console. Ctrl-A c = QEMU monitor (again = back), Ctrl-A x = quit.
-# CONSOLE=graphics ./run.sh: the card is the system console. The card's ROM is then
-#   hppa-sti-radeon.rom (the VGA BIOS and an STI ROM): firmware text, HP-UX boot messages
-#   and the console login are in the window, with the USB keyboard. The terminal gets a
-#   copy of the firmware text and no login. The firmware boot menu reads the terminal.
+# The card is the system console: its PCI ROM is bin/share/qemu/hppa-sti-radeon.rom (the VGA
+#   BIOS and an STI ROM), and the firmware gets opt/console=graphics. Firmware text, HP-UX
+#   boot messages and the console login are in the window, with the USB keyboard. The
+#   terminal gets a copy of the firmware text and no login. The firmware boot menu reads the
+#   terminal. Ctrl-A c = QEMU monitor (again = back), Ctrl-A x = quit.
+# CONSOLE=serial ./run.sh: the terminal is the serial console, and the card's ROM is
+#   bin/share/qemu/vgabios-ati.bin. The window stays black until CDE starts.
 # guest_hwcursor=true: QEMU draws the mouse pointer into the screen, so it does not jump.
 # HP-UX takes 10.0.2.15 from QEMU's DHCP (hostname hpux11v3).
-rom= con=
-if [ "$CONSOLE" = graphics ]; then
-	rom=,romfile=hppa-sti-radeon.rom
-	con="-fw_cfg opt/console,string=graphics"
+rom=,romfile=hppa-sti-radeon.rom
+con="-fw_cfg opt/console,string=graphics"
+if [ "$CONSOLE" = serial ]; then
+	rom= con=
 fi
 exec "$q" \
 	-name "HP-UX 11i v3 PA-RISC A400" \

@@ -197,6 +197,8 @@ With the card ROM `hppa-sti-radeon.rom` and `opt/console=graphics`, the Radeon i
 console: the firmware text, the HP-UX boot and rc messages and the console login are on the
 screen, with the USB keyboard. CDE starts as before, and the console text comes back when X
 stops.
+The 11.31 kit (`machines/hppa/hpux11v3/run.sh`) starts this way; `CONSOLE=serial` gives the serial
+console and the plain `vgabios-ati.bin`.
 
 ```
   -device ati-vga,model=rv200,x-linear-aper-size=0x4000000,guest_hwcursor=true,romfile=hppa-sti-radeon.rom \
