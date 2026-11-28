@@ -9,6 +9,14 @@ cs4231_play_format(int freq, int channels, int fmt) "playback %d Hz, %d channels
 cs4231_play_next(uint32_t va, uint32_t count) "playback buffer 0x%08x, %u bytes"
 cs4231_play_empty(void) "playback pipe empty"
 
+# cs4281.c
+cs4281_read(uint64_t addr, uint32_t val) "0x%03"PRIx64" -> 0x%08x"
+cs4281_write(uint64_t addr, uint64_t val) "0x%03"PRIx64" <- 0x%08"PRIx64
+cs4281_codec_read(uint8_t reg, uint16_t val) "codec 0x%02x -> 0x%04x"
+cs4281_codec_write(uint8_t reg, uint16_t val) "codec 0x%02x <- 0x%04x"
+cs4281_voice(int ch, const char *dir, uint32_t rate, int channels, int fmt, int be) "dma %d %s %u Hz, %d channels, format %d, big endian %d"
+cs4281_dma_advance(int ch, uint32_t frames, uint32_t dca, uint32_t dcc, uint32_t hdsr) "dma %d +%u frames dca 0x%08x dcc %u hdsr 0x%08x"
+
 # es1370.c
 es1370_frame_address_rd(int ch, uint32_t addr) "ch=%d addr=0x%08x"
 es1370_frame_address_wr(int ch, uint32_t addr) "ch=%d addr=0x%08x"

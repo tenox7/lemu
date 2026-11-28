@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
 slow_qtests = {
   'ahci-test': 150,
   'aspeed_smc-test': 360,
@@ -87,6 +88,7 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_WDT_IB700') ? ['wdt_ib700-test'] : []) +              \
   (config_all_devices.has_key('CONFIG_PVPANIC_ISA') ? ['pvpanic-test'] : []) +              \
   (config_all_devices.has_key('CONFIG_PVPANIC_PCI') ? ['pvpanic-pci-test'] : []) +          \
+  (config_all_devices.has_key('CONFIG_ATI_VGA') ? ['ati-3d-test', 'ati-cursor-test', 'ati-gate-test'] : []) + \
   (config_all_devices.has_key('CONFIG_HDA') ? ['intel-hda-test'] : []) +                    \
   (config_all_devices.has_key('CONFIG_I82801B11') ? ['i82801b11-test'] : []) +             \
   (config_all_devices.has_key('CONFIG_IOH3420') ? ['ioh3420-test'] : []) +                  \
@@ -101,6 +103,9 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['tpm-tis-test'] : []) +              \
   (config_all_devices.has_key('CONFIG_TPM_TIS_ISA') ? ['tpm-tis-swtpm-test'] : []) +        \
   (config_all_devices.has_key('CONFIG_RTL8139_PCI') ? ['rtl8139-test'] : []) +              \
+  (config_all_devices.has_key('CONFIG_VIA_RHINE') ? ['via-rhine-test'] : []) +             \
+  (config_all_devices.has_key('CONFIG_TC90X') ? ['3c90x-test'] : []) +                     \
+  (config_all_devices.has_key('CONFIG_CS4281') ? ['cs4281-test'] : []) +                   \
   (config_all_devices.has_key('CONFIG_E1000E_PCI_EXPRESS') ? ['fuzz-e1000e-test'] : []) +   \
   (config_all_devices.has_key('CONFIG_MEGASAS_SCSI_PCI') ? ['fuzz-megasas-test'] : []) +    \
   (config_all_devices.has_key('CONFIG_LSI_SCSI_PCI') ? ['fuzz-lsi53c895a-test'] : []) +     \
@@ -198,6 +203,9 @@ qtests_ppc = \
   (config_all_accel.has_key('CONFIG_TCG') ? ['prom-env-test'] : []) +                              \
   (config_all_accel.has_key('CONFIG_TCG') ? ['boot-serial-test'] : []) +                           \
   (config_all_devices.has_key('CONFIG_PREP') ? ['prep-rtc-test'] : []) +                     \
+  (config_all_devices.has_key('CONFIG_SAM440EP') or                                          \
+   config_all_devices.has_key('CONFIG_SAM460EX') ? ['ppc4xx-emac-test'] : []) +              \
+  (config_all_devices.has_key('CONFIG_PEGASOS') ? ['mv643xx-eth-test'] : []) +              \
   ['boot-order-test']
 
 qtests_ppc64 = \

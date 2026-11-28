@@ -1,7 +1,8 @@
 /*
- * QEMU SiI3112A PCI to Serial ATA Controller Emulation
+ * QEMU SiI3112A and SiI3114 PCI to Serial ATA Controller Emulation
  *
  * Copyright (C) 2017 BALATON Zoltan <balaton@eik.bme.hu>
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -10,6 +11,9 @@
 
 /* For documentation on this and similar cards see:
  * http://wiki.osdev.org/User:Quok/Silicon_Image_Datasheets
+ *
+ * The SiI3114 is the four port version of the SiI3112: ports 0 and 1 are
+ * where the SiI3112 has them, ports 2 and 3 are 0x200 above them in BAR5.
  */
 
 #include "qemu/osdep.h"
@@ -20,7 +24,10 @@
 #include "ide-internal.h"
 
 #define TYPE_SII3112_PCI "sii3112"
-OBJECT_DECLARE_SIMPLE_TYPE(SiI3112PCIState, SII3112_PCI)
+#define TYPE_SII3114_PCI "sii3114"
+OBJECT_DECLARE_TYPE(SiI3112PCIState, SiI3112PCIClass, SII3112_PCI)
+
+#define SII_MAX_PORTS 4
 
 typedef struct SiI3112Regs {
     uint32_t confstat;
@@ -32,8 +39,82 @@ typedef struct SiI3112Regs {
 struct SiI3112PCIState {
     PCIIDEState i;
     MemoryRegion mmio;
-    SiI3112Regs regs[2];
+    SiI3112Regs regs[SII_MAX_PORTS];
+    /* ports 2 and 3 of the SiI3114 */
+    IDEBus bus23[2];
+    BMDMAState bmdma23[2];
 };
+
+struct SiI3112PCIClass {
+    PCIDeviceClass parent_class;
+    int ports;
+};
+
+/* Where each port's registers are in BAR5 */
+static const struct {
+    hwaddr bmdma;   /* bus master DMA: command, status, PRD address */
+    hwaddr bmdma2;  /* the same with the SATA interrupt bits */
+    hwaddr tf;      /* task file; device control at +0xa, status at +0x20 */
+    hwaddr scr;     /* SControl, SStatus, SError; SIEN at +0x48 */
+} sii_port[SII_MAX_PORTS] = {
+    { 0x000, 0x010, 0x080, 0x100 },
+    { 0x008, 0x018, 0x0c0, 0x180 },
+    { 0x200, 0x210, 0x280, 0x300 },
+    { 0x208, 0x218, 0x2c0, 0x380 },
+};
+
+static int sii_ports(SiI3112PCIState *d)
+{
+    return SII3112_PCI_GET_CLASS(d)->ports;
+}
+
+static IDEBus *sii_bus(SiI3112PCIState *d, int port)
+{
+    return port < 2 ? &d->i.bus[port] : &d->bus23[port - 2];
+}
+
+static BMDMAState *sii_bmdma(SiI3112PCIState *d, int port)
+{
+    return port < 2 ? &d->i.bmdma[port] : &d->bmdma23[port - 2];
+}
+
+/*
+ * Find the port and the kind of register an address of BAR5 belongs to.
+ * Returns the port, or -1; *off is the offset in the register block.
+ */
+enum { SII_BMDMA, SII_BMDMA2, SII_TF, SII_SCR };
+
+static int sii_decode(SiI3112PCIState *d, hwaddr addr, int *kind, hwaddr *off)
+{
+    for (int p = 0; p < sii_ports(d); p++) {
+        if (addr >= sii_port[p].bmdma && addr < sii_port[p].bmdma + 8) {
+            *kind = SII_BMDMA;
+            *off = addr - sii_port[p].bmdma;
+            return p;
+        }
+        if (addr >= sii_port[p].bmdma2 && addr < sii_port[p].bmdma2 + 8) {
+            *kind = SII_BMDMA2;
+            *off = addr - sii_port[p].bmdma2;
+            return p;
+        }
+        if (addr >= sii_port[p].tf && addr < sii_port[p].tf + 0x40) {
+            *kind = SII_TF;
+            *off = addr - sii_port[p].tf;
+            return p;
+        }
+        if (addr >= sii_port[p].scr && addr < sii_port[p].scr + 0x80) {
+            *kind = SII_SCR;
+            *off = addr - sii_port[p].scr;
+            return p;
+        }
+    }
+    return -1;
+}
+
+static bool sii_irq_pending(SiI3112PCIState *d, int port)
+{
+    return d->regs[port].confstat & (1UL << 11);
+}
 
 /* The sii3112_reg_read and sii3112_reg_write functions implement the
  * Internal Register Space - BAR5 (section 6.7 of the data sheet).
@@ -43,91 +124,80 @@ static uint64_t sii3112_reg_read(void *opaque, hwaddr addr,
                                 unsigned int size)
 {
     SiI3112PCIState *d = opaque;
-    uint64_t val;
+    BMDMAState *bm;
+    uint64_t val = 0;
+    hwaddr off;
+    int kind, p;
 
-    switch (addr) {
-    case 0x00:
-        val = d->i.bmdma[0].cmd;
+    p = sii_decode(d, addr, &kind, &off);
+    if (p < 0) {
+        trace_sii3112_read(size, addr, 0);
+        return 0;
+    }
+    bm = sii_bmdma(d, p);
+
+    switch (kind) {
+    case SII_BMDMA:
+        switch (off) {
+        case 0:
+            val = bm->cmd;
+            break;
+        case 1:
+            val = d->regs[p].swdata;
+            break;
+        case 2:
+            val = bm->status;
+            break;
+        case 4 ... 7:
+            val = bmdma_addr_ioport_ops.read(bm, off - 4, size);
+            break;
+        }
         break;
-    case 0x01:
-        val = d->regs[0].swdata;
+    case SII_BMDMA2:
+        if (off != 0) {
+            break;
+        }
+        val = bm->cmd;
+        val |= sii_irq_pending(d, p) ? (1 << 4) : 0;    /* SATAINT */
+        val |= (uint32_t)bm->status << 16;
+        if ((p & 1) == 0) {
+            /* the even port also shows its odd neighbour */
+            BMDMAState *bm1 = sii_bmdma(d, p + 1);
+
+            val |= sii_irq_pending(d, p + 1) ? (1 << 6) : 0;
+            val |= (bm1->status & BM_STATUS_INT) ? (1 << 14) : 0;
+            val |= (uint32_t)bm1->status << 24;
+        }
         break;
-    case 0x02:
-        val = d->i.bmdma[0].status;
+    case SII_TF:
+        if (off < 8) {
+            val = pci_ide_data_le_ops.read(sii_bus(d, p), off, size);
+        } else if (off == 0xa) {
+            val = pci_ide_cmd_le_ops.read(sii_bus(d, p), 2, size);
+        } else if (off >= 0x20 && off < 0x24) {
+            /* drivers read its bytes too, such as the interrupt bit */
+            val = d->regs[p].confstat >> ((off & 3) * 8);
+        }
         break;
-    case 0x03:
-        val = 0;
+    case SII_SCR:
+        switch (off & ~3) {
+        case 0x00:
+            val = d->regs[p].scontrol;
+            break;
+        case 0x04:
+            /* SStatus: a device at 1.5 Gb/s, or nothing */
+            val = sii_bus(d, p)->ifs[0].blk ? 0x113 : 0;
+            break;
+        case 0x48:
+            val = (uint32_t)d->regs[p].sien << 16;
+            break;
+        }
+        /* the 32-bit registers here can be read a byte at a time */
+        val >>= (off & 3) * 8;
         break;
-    case 0x04 ... 0x07:
-        val = bmdma_addr_ioport_ops.read(&d->i.bmdma[0], addr - 4, size);
-        break;
-    case 0x08:
-        val = d->i.bmdma[1].cmd;
-        break;
-    case 0x09:
-        val = d->regs[1].swdata;
-        break;
-    case 0x0a:
-        val = d->i.bmdma[1].status;
-        break;
-    case 0x0b:
-        val = 0;
-        break;
-    case 0x0c ... 0x0f:
-        val = bmdma_addr_ioport_ops.read(&d->i.bmdma[1], addr - 12, size);
-        break;
-    case 0x10:
-        val = d->i.bmdma[0].cmd;
-        val |= (d->regs[0].confstat & (1UL << 11) ? (1 << 4) : 0); /*SATAINT0*/
-        val |= (d->regs[1].confstat & (1UL << 11) ? (1 << 6) : 0); /*SATAINT1*/
-        val |= (d->i.bmdma[1].status & BM_STATUS_INT ? (1 << 14) : 0);
-        val |= (uint32_t)d->i.bmdma[0].status << 16;
-        val |= (uint32_t)d->i.bmdma[1].status << 24;
-        break;
-    case 0x18:
-        val = d->i.bmdma[1].cmd;
-        val |= (d->regs[1].confstat & (1UL << 11) ? (1 << 4) : 0);
-        val |= (uint32_t)d->i.bmdma[1].status << 16;
-        break;
-    case 0x80 ... 0x87:
-        val = pci_ide_data_le_ops.read(&d->i.bus[0], addr - 0x80, size);
-        break;
-    case 0x8a:
-        val = pci_ide_cmd_le_ops.read(&d->i.bus[0], 2, size);
-        break;
-    case 0xa0:
-        val = d->regs[0].confstat;
-        break;
-    case 0xc0 ... 0xc7:
-        val = pci_ide_data_le_ops.read(&d->i.bus[1], addr - 0xc0, size);
-        break;
-    case 0xca:
-        val = pci_ide_cmd_le_ops.read(&d->i.bus[1], 2, size);
-        break;
-    case 0xe0:
-        val = d->regs[1].confstat;
-        break;
-    case 0x100:
-        val = d->regs[0].scontrol;
-        break;
-    case 0x104:
-        val = (d->i.bus[0].ifs[0].blk) ? 0x113 : 0;
-        break;
-    case 0x148:
-        val = (uint32_t)d->regs[0].sien << 16;
-        break;
-    case 0x180:
-        val = d->regs[1].scontrol;
-        break;
-    case 0x184:
-        val = (d->i.bus[1].ifs[0].blk) ? 0x113 : 0;
-        break;
-    case 0x1c8:
-        val = (uint32_t)d->regs[1].sien << 16;
-        break;
-    default:
-        val = 0;
-        break;
+    }
+    if (size < 4) {
+        val &= (1ULL << (size * 8)) - 1;
     }
     trace_sii3112_read(size, addr, val);
     return val;
@@ -137,70 +207,56 @@ static void sii3112_reg_write(void *opaque, hwaddr addr,
                               uint64_t val, unsigned int size)
 {
     SiI3112PCIState *d = opaque;
+    BMDMAState *bm;
+    hwaddr off;
+    int kind, p;
 
     trace_sii3112_write(size, addr, val);
-    switch (addr) {
-    case 0x00:
-    case 0x10:
-        bmdma_cmd_writeb(&d->i.bmdma[0], val);
-        break;
-    case 0x01:
-    case 0x11:
-        d->regs[0].swdata = val & 0x3f;
-        break;
-    case 0x02:
-    case 0x12:
-        bmdma_status_writeb(&d->i.bmdma[0], val);
-        break;
-    case 0x04 ... 0x07:
-        bmdma_addr_ioport_ops.write(&d->i.bmdma[0], addr - 4, val, size);
-        break;
-    case 0x08:
-    case 0x18:
-        bmdma_cmd_writeb(&d->i.bmdma[1], val);
-        break;
-    case 0x09:
-    case 0x19:
-        d->regs[1].swdata = val & 0x3f;
-        break;
-    case 0x0a:
-    case 0x1a:
-        bmdma_status_writeb(&d->i.bmdma[1], val);
-        break;
-    case 0x0c ... 0x0f:
-        bmdma_addr_ioport_ops.write(&d->i.bmdma[1], addr - 12, val, size);
-        break;
-    case 0x80 ... 0x87:
-        pci_ide_data_le_ops.write(&d->i.bus[0], addr - 0x80, val, size);
-        break;
-    case 0x8a:
-        pci_ide_cmd_le_ops.write(&d->i.bus[0], 2, val, size);
-        break;
-    case 0xc0 ... 0xc7:
-        pci_ide_data_le_ops.write(&d->i.bus[1], addr - 0xc0, val, size);
-        break;
-    case 0xca:
-        pci_ide_cmd_le_ops.write(&d->i.bus[1], 2, val, size);
-        break;
-    case 0x100:
-        d->regs[0].scontrol = val & 0xfff;
-        if (val & 1) {
-            ide_bus_reset(&d->i.bus[0], IDE_RESET_HARDWARE);
+    p = sii_decode(d, addr, &kind, &off);
+    if (p < 0) {
+        return;
+    }
+    bm = sii_bmdma(d, p);
+
+    switch (kind) {
+    case SII_BMDMA:
+    case SII_BMDMA2:
+        switch (off) {
+        case 0:
+            bmdma_cmd_writeb(bm, val);
+            break;
+        case 1:
+            d->regs[p].swdata = val & 0x3f;
+            break;
+        case 2:
+            bmdma_status_writeb(bm, val);
+            break;
+        case 4 ... 7:
+            if (kind == SII_BMDMA) {
+                bmdma_addr_ioport_ops.write(bm, off - 4, val, size);
+            }
+            break;
         }
         break;
-    case 0x148:
-        d->regs[0].sien = (val >> 16) & 0x3eed;
-        break;
-    case 0x180:
-        d->regs[1].scontrol = val & 0xfff;
-        if (val & 1) {
-            ide_bus_reset(&d->i.bus[1], IDE_RESET_HARDWARE);
+    case SII_TF:
+        if (off < 8) {
+            pci_ide_data_le_ops.write(sii_bus(d, p), off, val, size);
+        } else if (off == 0xa) {
+            pci_ide_cmd_le_ops.write(sii_bus(d, p), 2, val, size);
         }
         break;
-    case 0x1c8:
-        d->regs[1].sien = (val >> 16) & 0x3eed;
-        break;
-    default:
+    case SII_SCR:
+        switch (off) {
+        case 0x00:
+            d->regs[p].scontrol = val & 0xfff;
+            if (val & 1) {
+                ide_bus_reset(sii_bus(d, p), IDE_RESET_HARDWARE);
+            }
+            break;
+        case 0x48:
+            d->regs[p].sien = (val >> 16) & 0x3eed;
+            break;
+        }
         break;
     }
 }
@@ -211,13 +267,13 @@ static const MemoryRegionOps sii3112_reg_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-/* the PCI irq level is the logical OR of the two channels */
+/* the PCI irq level is the logical OR of the channels */
 static void sii3112_update_irq(SiI3112PCIState *s)
 {
     int i, set = 0;
 
-    for (i = 0; i < 2; i++) {
-        set |= s->regs[i].confstat & (1UL << 11);
+    for (i = 0; i < sii_ports(s); i++) {
+        set |= sii_irq_pending(s, i);
     }
     pci_set_irq(PCI_DEVICE(s), (set ? 1 : 0));
 }
@@ -241,9 +297,9 @@ static void sii3112_reset(DeviceState *dev)
     SiI3112PCIState *s = SII3112_PCI(dev);
     int i;
 
-    for (i = 0; i < 2; i++) {
+    for (i = 0; i < sii_ports(s); i++) {
         s->regs[i].confstat = 0x6515 << 16;
-        ide_bus_reset(&s->i.bus[i], IDE_RESET_HARDWARE);
+        ide_bus_reset(sii_bus(s, i), IDE_RESET_HARDWARE);
     }
 }
 
@@ -252,6 +308,7 @@ static void sii3112_pci_realize(PCIDevice *dev, Error **errp)
     SiI3112PCIState *d = SII3112_PCI(dev);
     PCIIDEState *s = PCI_IDE(dev);
     DeviceState *ds = DEVICE(dev);
+    int ports = sii_ports(d);
     MemoryRegion *mr;
     int i;
 
@@ -260,10 +317,10 @@ static void sii3112_pci_realize(PCIDevice *dev, Error **errp)
 
     /* BAR5 is in PCI memory space */
     memory_region_init_io(&d->mmio, OBJECT(d), &sii3112_reg_ops, d,
-                         "sii3112.bar5", 0x200);
+                         "sii3112.bar5", ports > 2 ? 0x400 : 0x200);
     pci_register_bar(dev, 5, PCI_BASE_ADDRESS_SPACE_MEMORY, &d->mmio);
 
-    /* BAR0-BAR4 are PCI I/O space aliases into BAR5 */
+    /* BAR0-BAR4 are PCI I/O space aliases into BAR5, for ports 0 and 1 */
     mr = g_new(MemoryRegion, 1);
     memory_region_init_alias(mr, OBJECT(d), "sii3112.bar0", &d->mmio, 0x80, 8);
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_IO, mr);
@@ -280,13 +337,15 @@ static void sii3112_pci_realize(PCIDevice *dev, Error **errp)
     memory_region_init_alias(mr, OBJECT(d), "sii3112.bar4", &d->mmio, 0, 16);
     pci_register_bar(dev, 4, PCI_BASE_ADDRESS_SPACE_IO, mr);
 
-    qdev_init_gpio_in(ds, sii3112_set_irq, 2);
-    for (i = 0; i < 2; i++) {
-        ide_bus_init(&s->bus[i], sizeof(s->bus[i]), ds, i, 1);
-        ide_bus_init_output_irq(&s->bus[i], qdev_get_gpio_in(ds, i));
+    qdev_init_gpio_in(ds, sii3112_set_irq, ports);
+    for (i = 0; i < ports; i++) {
+        IDEBus *bus = sii_bus(d, i);
 
-        bmdma_init(&s->bus[i], &s->bmdma[i], s);
-        ide_bus_register_restart_cb(&s->bus[i]);
+        ide_bus_init(bus, sizeof(*bus), ds, i, 1);
+        ide_bus_init_output_irq(bus, qdev_get_gpio_in(ds, i));
+
+        bmdma_init(bus, sii_bmdma(d, i), s);
+        ide_bus_register_restart_cb(bus);
     }
 }
 
@@ -294,27 +353,49 @@ static void sii3112_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *pd = PCI_DEVICE_CLASS(klass);
+    SiI3112PCIClass *sc = SII3112_PCI_CLASS(klass);
 
     pd->vendor_id = 0x1095;
     pd->device_id = 0x3112;
     pd->class_id = PCI_CLASS_STORAGE_RAID;
     pd->revision = 1;
     pd->realize = sii3112_pci_realize;
+    sc->ports = 2;
     device_class_set_legacy_reset(dc, sii3112_reset);
     dc->desc = "SiI3112A SATA controller";
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+}
+
+static void sii3114_pci_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *pd = PCI_DEVICE_CLASS(klass);
+    SiI3112PCIClass *sc = SII3112_PCI_CLASS(klass);
+
+    pd->device_id = 0x3114;
+    pd->revision = 2;
+    sc->ports = 4;
+    dc->desc = "SiI3114 SATA controller";
 }
 
 static const TypeInfo sii3112_pci_info = {
     .name = TYPE_SII3112_PCI,
     .parent = TYPE_PCI_IDE,
     .instance_size = sizeof(SiI3112PCIState),
+    .class_size = sizeof(SiI3112PCIClass),
     .class_init = sii3112_pci_class_init,
+};
+
+static const TypeInfo sii3114_pci_info = {
+    .name = TYPE_SII3114_PCI,
+    .parent = TYPE_SII3112_PCI,
+    .class_init = sii3114_pci_class_init,
 };
 
 static void sii3112_register_types(void)
 {
     type_register_static(&sii3112_pci_info);
+    type_register_static(&sii3114_pci_info);
 }
 
 type_init(sii3112_register_types)

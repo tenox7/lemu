@@ -20,6 +20,11 @@ typedef struct {
     uint32_t clen;
 } ViaAC97SGDChannel;
 
+/* SGD channels: playback at 0x00, capture at 0x10, FM at 0x20 */
+#define VIA_AC97_SGD_PLAY     0
+#define VIA_AC97_SGD_REC      1
+#define VIA_AC97_SGD_CHANNELS 3
+
 OBJECT_DECLARE_SIMPLE_TYPE(ViaAC97State, VIA_AC97);
 
 struct ViaAC97State {
@@ -29,7 +34,9 @@ struct ViaAC97State {
     MemoryRegion fm;
     MemoryRegion midi;
     SWVoiceOut *vo;
-    ViaAC97SGDChannel aur;
+    SWVoiceIn *vi;
+    ViaAC97SGDChannel sgd_ch[VIA_AC97_SGD_CHANNELS];
+    uint32_t gpi_intr;
     uint16_t codec_regs[128];
     uint32_t ac97_cmd;
 };

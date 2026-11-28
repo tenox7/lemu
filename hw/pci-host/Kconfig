@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
 config PAM
     bool
 
@@ -96,6 +97,7 @@ config MV64361
     bool
     select PCI
     select I8259
+    select MV643XX_ETH
 
 config DINO
     bool

@@ -1,3 +1,5 @@
+.. Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+
 =======================================================================
 AmigaNG boards (``amigaone``, ``pegasos1``, ``pegasos2``, ``sam460ex``)
 =======================================================================
@@ -82,6 +84,10 @@ Emulated devices
  * Articia S north bridge (for ``pegasos1``)
  * Marvell MV64361 Discovery II north bridge (for ``pegasos2``)
  * VIA VT8231 south bridge
+ * VIA Rhine-II Ethernet on board (for ``pegasos2``), the default NIC
+ * Gigabit Ethernet port 1 of the MV64361 (for ``pegasos2``); it gets a
+   ``-nic`` given with ``model=mv643xx_eth``, as MorphOS's
+   ``mv6436x_eth.device`` and Linux's ``mv643xx_eth`` use it
  * PCI VGA compatible card (guests may need other card instead)
  * PS/2 keyboard and mouse
 
@@ -98,6 +104,12 @@ The ROM image can be extracted from it with the following command:
 .. code-block:: bash
 
   $ tail -c +85581 up050404 | head -c 524288 > pegasos2.rom
+
+With ``-bios`` the firmware is in ROM and forgets its NVRAM settings at
+each reset. Given as ``-drive if=pflash,file=pegasos2.rom,format=raw``
+instead, the image is the board's flash, an AMD Am29F040, and the
+firmware keeps its NVRAM in it, so ``setenv`` settings such as
+``auto-boot?`` stay.
 
 Running Linux
 -------------
@@ -147,7 +159,11 @@ Emulated devices
  * M41T80 serial RTC chip
  * Silicon Motion SM501 display parts (identical to SM502 on real board)
  * Silicon Image SiI3112 2 port SATA controller
- * USB keyboard and mouse
+ * USB keyboard and mouse (full speed, on the OHCI)
+ * Two gigabit EMAC4 Ethernet controllers with Marvell 88E1121R PHYs, the
+   default NICs; MorphOS uses the first one (``ppc4xx_eth.device``)
+ * Bootstrap EEPROM at I2C address 0x52, which holds the first EMAC's MAC
+   address at offset 0x14
 
 Running Linux
 -------------

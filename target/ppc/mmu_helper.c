@@ -2,6 +2,7 @@
  *  PowerPC MMU, TLB, SLB and BAT emulation helpers for QEMU.
  *
  *  Copyright (c) 2003-2007 Jocelyn Mayer
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -864,25 +865,6 @@ target_ulong HELPER(4xx_tlbsx)(CPUPPCState *env, target_ulong address)
     return ppcemb_tlb_search(env, address, env->spr[SPR_40x_PID]);
 }
 
-static bool mmubooke_pid_match(CPUPPCState *env, ppcemb_tlb_t *tlb)
-{
-    if (tlb->PID == env->spr[SPR_BOOKE_PID]) {
-        return true;
-    }
-    if (!env->nb_pids) {
-        return false;
-    }
-
-    if (env->spr[SPR_BOOKE_PID1] && tlb->PID == env->spr[SPR_BOOKE_PID1]) {
-        return true;
-    }
-    if (env->spr[SPR_BOOKE_PID2] && tlb->PID == env->spr[SPR_BOOKE_PID2]) {
-        return true;
-    }
-
-    return false;
-}
-
 /* PowerPC 440 TLB management */
 void HELPER(440_tlbwe)(CPUPPCState *env, uint32_t word, target_ulong entry,
                       target_ulong value)
@@ -894,12 +876,18 @@ void HELPER(440_tlbwe)(CPUPPCState *env, uint32_t word, target_ulong entry,
     entry &= 0x3F;
     tlb = &env->tlb.tlbe[entry];
 
-    /* Invalidate previous TLB (if it's valid) */
-    if ((tlb->prot & PAGE_VALID) && mmubooke_pid_match(env, tlb)) {
+    /*
+     * The 440 fetches and loads through shadow TLBs, which take up a change
+     * to the UTLB only at the next context synchronizing event (isync, rfi
+     * or an interrupt). So the old translation stays in use until then:
+     * MorphOS rewrites the entry that maps the code it runs, one word at a
+     * time. Flush QEMU's TLB at that point, not now.
+     */
+    if (tlb->prot & PAGE_VALID) {
         qemu_log_mask(CPU_LOG_MMU, "%s: invalidate old TLB %d start "
                       TARGET_FMT_lx " end " TARGET_FMT_lx "\n", __func__,
                       (int)entry, tlb->EPN, tlb->EPN + tlb->size);
-        ppcemb_tlb_flush(env_cpu(env), tlb);
+        env->tlb_need_flush |= TLB_NEED_LOCAL_FLUSH;
     }
 
     switch (word) {

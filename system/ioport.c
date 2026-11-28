@@ -2,6 +2,7 @@
  * QEMU System Emulator
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -148,6 +149,11 @@ void portio_list_destroy(PortioList *piolist)
         object_unref(mrpio);
     }
     g_free(piolist->regions);
+    /* the list may be set up again later, as IDE does on each reset */
+    piolist->regions = NULL;
+    piolist->nr = 0;
+    piolist->address_space = NULL;
+    piolist->owner = NULL;
 }
 
 static const MemoryRegionPortio *find_portio(MemoryRegionPortioList *mrpio,

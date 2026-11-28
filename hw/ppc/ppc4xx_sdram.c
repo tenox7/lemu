@@ -3,6 +3,7 @@
  *
  * DDR SDRAM controller:
  * Copyright (c) 2007 Jocelyn Mayer
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -301,7 +302,11 @@ static void sdram_ddr_dcr_write(void *opaque, int dcrn, uint32_t val)
                                            1);
                     }
                 }
-                s->status &= ~0x80000000;
+                /*
+                 * MCSTS[MRSC]: the controller has set the mode registers of
+                 * the memory, which it does when it is enabled.
+                 */
+                s->status |= 0x80000000;
             } else if ((s->cfg & 0x80000000) && !(val & 0x80000000)) {
                 trace_ppc4xx_sdram_enable("disable");
                 /* invalidate all RAM mappings */
@@ -312,7 +317,7 @@ static void sdram_ddr_dcr_write(void *opaque, int dcrn, uint32_t val)
                                            0);
                     }
                 }
-                s->status |= 0x80000000;
+                s->status &= ~0x80000000;
             }
             if (!(s->cfg & 0x40000000) && (val & 0x40000000)) {
                 s->status |= 0x40000000;

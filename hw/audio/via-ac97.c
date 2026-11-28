@@ -2,13 +2,14 @@
  * VIA south bridges sound support
  *
  * Copyright (c) 2022-2023 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  */
 
 /*
- * TODO: This is only a basic implementation of one audio playback channel
- *       more functionality should be added here.
+ * Playback and capture SGD channels with the AC97 codec. The FM channel
+ * and the mixer settings are kept but make no sound.
  */
 
 #include "qemu/osdep.h"
@@ -34,6 +35,7 @@
 #define CNTL_PAUSE  BIT(3)
 
 static void open_voice_out(ViaAC97State *s);
+static void open_voice_in(ViaAC97State *s);
 
 static uint16_t codec_rates[] = { 8000, 11025, 16000, 22050, 32000, 44100,
                                   48000 };
@@ -113,6 +115,7 @@ static void codec_write(ViaAC97State *s, uint8_t addr, uint16_t val)
             CODEC_REG(s, AC97_PCM_Front_DAC_Rate) = 48000;
             CODEC_REG(s, AC97_PCM_LR_ADC_Rate) = 48000;
             open_voice_out(s);
+            open_voice_in(s);
         }
         return;
     case AC97_PCM_Front_DAC_Rate:
@@ -132,11 +135,33 @@ static void codec_write(ViaAC97State *s, uint8_t addr, uint16_t val)
                 rate = 48000;
             }
             CODEC_REG(s, addr) = rate;
-            open_voice_out(s);
+            if (addr == AC97_PCM_Front_DAC_Rate) {
+                open_voice_out(s);
+            } else {
+                open_voice_in(s);
+            }
         }
         return;
     case AC97_Powerdown_Ctrl_Stat:
         CODEC_REG(s, addr) = (val & 0xff00) | (CODEC_REG(s, addr) & 0xff);
+        return;
+    case AC97_Headphone_Volume_Mute:
+    case AC97_Master_Volume_Mono_Mute:
+    case AC97_Master_Tone_RL:
+    case AC97_PC_BEEP_Volume_Mute:
+    case AC97_Phone_Volume_Mute:
+    case AC97_Mic_Volume_Mute:
+    case AC97_Line_In_Volume_Mute:
+    case AC97_CD_Volume_Mute:
+    case AC97_Video_Volume_Mute:
+    case AC97_Aux_Volume_Mute:
+    case AC97_Record_Select:
+    case AC97_Record_Gain_Mute:
+    case AC97_Record_Gain_Mic_Mute:
+    case AC97_General_Purpose:
+    case AC97_3D_Control:
+        /* mixer settings: kept for the driver, not applied to the sound */
+        CODEC_REG(s, addr) = val;
         return;
     case AC97_Extended_Audio_ID:
     case AC97_Vendor_ID1:
@@ -169,10 +194,60 @@ static void fetch_sgd(ViaAC97SGDChannel *c, PCIDevice *d)
                              CLEN_IS_FLAG(c) ? 'F' : '-', CLEN_LEN(c));
 }
 
+/* One interrupt line for all channels: up while any enabled status is set */
+static void update_irq(ViaAC97State *s)
+{
+    int level = 0;
+
+    for (int i = 0; i < VIA_AC97_SGD_CHANNELS; i++) {
+        ViaAC97SGDChannel *c = &s->sgd_ch[i];
+
+        if (c->stat & c->type & (STAT_EOL | STAT_FLAG)) {
+            level = 1;
+        }
+    }
+    via_isa_set_irq(&s->dev, 0, level);
+}
+
+static void set_active(ViaAC97State *s, int ch, bool on)
+{
+    if (ch == VIA_AC97_SGD_PLAY) {
+        audio_be_set_active_out(s->audio_be, s->vo, on);
+    } else if (ch == VIA_AC97_SGD_REC) {
+        audio_be_set_active_in(s->audio_be, s->vi, on);
+    }
+}
+
+/* A block of the SGD table is done: set its status and maybe interrupt */
+static void sgd_block_end(ViaAC97State *s, int ch)
+{
+    ViaAC97SGDChannel *c = &s->sgd_ch[ch];
+
+    c->curr += 8;
+    if (CLEN_IS_EOL(c)) {
+        c->stat |= STAT_EOL;
+        if (c->type & CNTL_START) {
+            c->curr = c->base;
+            c->stat |= STAT_PAUSED;
+        } else {
+            c->stat &= ~STAT_ACTIVE;
+            set_active(s, ch, false);
+        }
+    }
+    if (CLEN_IS_FLAG(c)) {
+        c->stat |= STAT_FLAG | STAT_PAUSED;
+    }
+    if (CLEN_IS_STOP(c)) {
+        c->stat |= STAT_STOP | STAT_PAUSED;
+    }
+    c->clen = 0;
+    update_irq(s);
+}
+
 static void out_cb(void *opaque, int avail)
 {
     ViaAC97State *s = opaque;
-    ViaAC97SGDChannel *c = &s->aur;
+    ViaAC97SGDChannel *c = &s->sgd_ch[VIA_AC97_SGD_PLAY];
     int temp, to_copy, copied;
     bool stop = false;
     QEMU_UNINITIALIZED uint8_t tmpbuf[4096];
@@ -200,46 +275,81 @@ static void out_cb(void *opaque, int avail)
             c->clen -= copied;
         }
         if (CLEN_LEN(c) == 0) {
-            c->curr += 8;
-            if (CLEN_IS_EOL(c)) {
-                c->stat |= STAT_EOL;
-                if (c->type & CNTL_START) {
-                    c->curr = c->base;
-                    c->stat |= STAT_PAUSED;
-                } else {
-                    c->stat &= ~STAT_ACTIVE;
-                    audio_be_set_active_out(s->audio_be, s->vo, 0);
-                }
-                if (c->type & STAT_EOL) {
-                    via_isa_set_irq(&s->dev, 0, 1);
-                }
-            }
-            if (CLEN_IS_FLAG(c)) {
-                c->stat |= STAT_FLAG;
-                c->stat |= STAT_PAUSED;
-                if (c->type & STAT_FLAG) {
-                    via_isa_set_irq(&s->dev, 0, 1);
-                }
-            }
-            if (CLEN_IS_STOP(c)) {
-                c->stat |= STAT_STOP;
-                c->stat |= STAT_PAUSED;
-            }
-            c->clen = 0;
+            sgd_block_end(s, VIA_AC97_SGD_PLAY);
             stop = true;
+        }
+    }
+}
+
+static void in_cb(void *opaque, int avail)
+{
+    ViaAC97State *s = opaque;
+    ViaAC97SGDChannel *c = &s->sgd_ch[VIA_AC97_SGD_REC];
+    QEMU_UNINITIALIZED uint8_t tmpbuf[4096];
+
+    if (c->stat & STAT_PAUSED) {
+        return;
+    }
+    c->stat |= STAT_ACTIVE;
+    while (avail) {
+        size_t to_copy, got;
+
+        if (!c->clen) {
+            fetch_sgd(c, &s->dev);
+            if (!CLEN_LEN(c)) {
+                sgd_block_end(s, VIA_AC97_SGD_REC);
+                break;
+            }
+        }
+        to_copy = MIN(MIN(CLEN_LEN(c), avail), sizeof(tmpbuf));
+        got = audio_be_read(s->audio_be, s->vi, tmpbuf, to_copy);
+        if (!got) {
+            break;
+        }
+        pci_dma_write(&s->dev, c->addr, tmpbuf, got);
+        avail -= got;
+        c->addr += got;
+        c->clen -= got;
+        if (CLEN_LEN(c) == 0) {
+            sgd_block_end(s, VIA_AC97_SGD_REC);
+            break;
         }
     }
 }
 
 static void open_voice_out(ViaAC97State *s)
 {
+    ViaAC97SGDChannel *c = &s->sgd_ch[VIA_AC97_SGD_PLAY];
     struct audsettings as = {
         .freq = CODEC_REG(s, AC97_PCM_Front_DAC_Rate),
-        .nchannels = s->aur.type & BIT(4) ? 2 : 1,
-        .fmt = s->aur.type & BIT(5) ? AUDIO_FORMAT_S16 : AUDIO_FORMAT_S8,
+        .nchannels = c->type & BIT(4) ? 2 : 1,
+        .fmt = c->type & BIT(5) ? AUDIO_FORMAT_S16 : AUDIO_FORMAT_S8,
         .big_endian = false,
     };
-    s->vo = audio_be_open_out(s->audio_be, s->vo, "via-ac97.out", s, out_cb, &as);
+    s->vo = audio_be_open_out(s->audio_be, s->vo, "via-ac97.out", s, out_cb,
+                              &as);
+}
+
+static void open_voice_in(ViaAC97State *s)
+{
+    ViaAC97SGDChannel *c = &s->sgd_ch[VIA_AC97_SGD_REC];
+    struct audsettings as = {
+        .freq = CODEC_REG(s, AC97_PCM_LR_ADC_Rate),
+        .nchannels = c->type & BIT(4) ? 2 : 1,
+        .fmt = c->type & BIT(5) ? AUDIO_FORMAT_S16 : AUDIO_FORMAT_S8,
+        .big_endian = false,
+    };
+    s->vi = audio_be_open_in(s->audio_be, s->vi, "via-ac97.in", s, in_cb,
+                             &as);
+}
+
+static void open_voice(ViaAC97State *s, int ch)
+{
+    if (ch == VIA_AC97_SGD_PLAY) {
+        open_voice_out(s);
+    } else if (ch == VIA_AC97_SGD_REC) {
+        open_voice_in(s);
+    }
 }
 
 static uint64_t sgd_read(void *opaque, hwaddr addr, unsigned size)
@@ -247,42 +357,65 @@ static uint64_t sgd_read(void *opaque, hwaddr addr, unsigned size)
     ViaAC97State *s = opaque;
     uint64_t val = 0;
 
-    switch (addr) {
-    case 0:
-        val = s->aur.stat;
-        if (s->aur.type & CNTL_START) {
-            val |= STAT_TRIG;
+    if (addr < 0x10 * VIA_AC97_SGD_CHANNELS) {
+        /* the registers of one channel: 0x00 playback, 0x10 capture, 0x20 FM */
+        ViaAC97SGDChannel *c = &s->sgd_ch[addr >> 4];
+
+        switch (addr & 0xf) {
+        case 0:
+            val = c->stat;
+            if (c->type & CNTL_START) {
+                val |= STAT_TRIG;
+            }
+            break;
+        case 1:
+            val = c->stat & STAT_PAUSED ? BIT(3) : 0;
+            break;
+        case 2:
+            val = c->type;
+            break;
+        case 4:
+            val = c->curr;
+            break;
+        case 0xc:
+            val = CLEN_LEN(c);
+            break;
+        default:
+            qemu_log_mask(LOG_UNIMP, "via-ac97: Unimplemented register read "
+                          "0x%" HWADDR_PRIx "\n", addr);
         }
-        break;
-    case 1:
-        val = s->aur.stat & STAT_PAUSED ? BIT(3) : 0;
-        break;
-    case 2:
-        val = s->aur.type;
-        break;
-    case 4:
-        val = s->aur.curr;
-        break;
-    case 0xc:
-        val = CLEN_LEN(&s->aur);
-        break;
-    case 0x10:
-        /* silence unimplemented log message that happens at every IRQ */
-        break;
+        trace_via_ac97_sgd_read(addr, size, val);
+        return val;
+    }
+
+    switch (addr) {
     case 0x80:
         val = s->ac97_cmd;
         break;
     case 0x84:
-        val = s->aur.stat & STAT_FLAG;
-        if (s->aur.stat & STAT_EOL) {
-            val |= BIT(4);
+        /* status shadow: bit n of each nibble is channel n */
+        for (int i = 0; i < VIA_AC97_SGD_CHANNELS; i++) {
+            ViaAC97SGDChannel *c = &s->sgd_ch[i];
+
+            if (c->stat & STAT_FLAG) {
+                val |= BIT(i);
+            }
+            if (c->stat & STAT_EOL) {
+                val |= BIT(4 + i);
+            }
+            if (c->stat & STAT_STOP) {
+                val |= BIT(8 + i);
+            }
+            if (c->stat & STAT_ACTIVE) {
+                val |= BIT(12 + i);
+            }
         }
-        if (s->aur.stat & STAT_STOP) {
-            val |= BIT(8);
-        }
-        if (s->aur.stat & STAT_ACTIVE) {
-            val |= BIT(12);
-        }
+        break;
+    case 0x88:
+        /* GPI status */
+        break;
+    case 0x8c:
+        val = s->gpi_intr;
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "via-ac97: Unimplemented register read 0x%"
@@ -292,62 +425,80 @@ static uint64_t sgd_read(void *opaque, hwaddr addr, unsigned size)
     return val;
 }
 
+static void sgd_ch_write(ViaAC97State *s, int ch, hwaddr reg, uint64_t val)
+{
+    ViaAC97SGDChannel *c = &s->sgd_ch[ch];
+
+    switch (reg) {
+    case 0:
+        if (val & STAT_STOP) {
+            c->stat &= ~(STAT_STOP | STAT_PAUSED);
+        }
+        if (val & STAT_EOL) {
+            c->stat &= ~(STAT_EOL | STAT_PAUSED);
+        }
+        if (val & STAT_FLAG) {
+            c->stat &= ~(STAT_FLAG | STAT_PAUSED);
+        }
+        update_irq(s);
+        break;
+    case 1:
+        if (val & CNTL_START) {
+            c->stat = STAT_ACTIVE;
+            c->clen = 0;
+            c->curr = c->base;
+            set_active(s, ch, true);
+        }
+        if (val & CNTL_TERM) {
+            set_active(s, ch, false);
+            c->stat &= ~(STAT_ACTIVE | STAT_PAUSED);
+            c->clen = 0;
+        }
+        if (val & CNTL_PAUSE) {
+            set_active(s, ch, false);
+            c->stat &= ~STAT_ACTIVE;
+            c->stat |= STAT_PAUSED;
+        } else if (c->stat & STAT_PAUSED) {
+            set_active(s, ch, true);
+            c->stat |= STAT_ACTIVE;
+            c->stat &= ~STAT_PAUSED;
+        }
+        update_irq(s);
+        break;
+    case 2:
+    {
+        uint32_t oldval = c->type;
+
+        c->type = val;
+        if ((oldval & 0x30) != (val & 0x30)) {
+            open_voice(s, ch);
+        }
+        update_irq(s);
+        break;
+    }
+    case 4:
+        c->base = val & ~1ULL;
+        c->curr = c->base;
+        break;
+    case 0xc:
+        /* Read only */
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "via-ac97: Unimplemented register write "
+                      "0x%" HWADDR_PRIx "\n", (hwaddr)ch * 0x10 + reg);
+    }
+}
+
 static void sgd_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
 {
     ViaAC97State *s = opaque;
 
     trace_via_ac97_sgd_write(addr, size, val);
-    switch (addr) {
-    case 0:
-        if (val & STAT_STOP) {
-            s->aur.stat &= ~STAT_PAUSED;
-        }
-        if (val & STAT_EOL) {
-            s->aur.stat &= ~(STAT_EOL | STAT_PAUSED);
-            if (s->aur.type & STAT_EOL) {
-                via_isa_set_irq(&s->dev, 0, 0);
-            }
-        }
-        if (val & STAT_FLAG) {
-            s->aur.stat &= ~(STAT_FLAG | STAT_PAUSED);
-            if (s->aur.type & STAT_FLAG) {
-                via_isa_set_irq(&s->dev, 0, 0);
-            }
-        }
-        break;
-    case 1:
-        if (val & CNTL_START) {
-            audio_be_set_active_out(s->audio_be, s->vo, 1);
-            s->aur.stat = STAT_ACTIVE;
-        }
-        if (val & CNTL_TERM) {
-            audio_be_set_active_out(s->audio_be, s->vo, 0);
-            s->aur.stat &= ~(STAT_ACTIVE | STAT_PAUSED);
-            s->aur.clen = 0;
-        }
-        if (val & CNTL_PAUSE) {
-            audio_be_set_active_out(s->audio_be, s->vo, 0);
-            s->aur.stat &= ~STAT_ACTIVE;
-            s->aur.stat |= STAT_PAUSED;
-        } else if (!(val & CNTL_PAUSE) && (s->aur.stat & STAT_PAUSED)) {
-            audio_be_set_active_out(s->audio_be, s->vo, 1);
-            s->aur.stat |= STAT_ACTIVE;
-            s->aur.stat &= ~STAT_PAUSED;
-        }
-        break;
-    case 2:
-    {
-        uint32_t oldval = s->aur.type;
-        s->aur.type = val;
-        if ((oldval & 0x30) != (val & 0x30)) {
-            open_voice_out(s);
-        }
-        break;
+    if (addr < 0x10 * VIA_AC97_SGD_CHANNELS) {
+        sgd_ch_write(s, addr >> 4, addr & 0xf, val);
+        return;
     }
-    case 4:
-        s->aur.base = val & ~1ULL;
-        s->aur.curr = s->aur.base;
-        break;
+    switch (addr) {
     case 0x80:
         if (val >> 30) {
             /* we only have primary codec */
@@ -362,9 +513,13 @@ static void sgd_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
             codec_write(s, (val >> 16) & 0x7f, val);
         }
         break;
-    case 0xc:
     case 0x84:
+    case 0x88:
         /* Read only */
+        break;
+    case 0x8c:
+        /* GPI interrupt enables; there are no GPI inputs */
+        s->gpi_intr = val;
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "via-ac97: Unimplemented register write 0x%"
@@ -419,6 +574,9 @@ static void via_ac97_reset(DeviceState *dev)
     ViaAC97State *s = VIA_AC97(dev);
 
     codec_reset(s);
+    memset(s->sgd_ch, 0, sizeof(s->sgd_ch));
+    s->gpi_intr = 0;
+    via_isa_set_irq(&s->dev, 0, 0);
 }
 
 static void via_ac97_realize(PCIDevice *pci_dev, Error **errp)
@@ -456,6 +614,7 @@ static void via_ac97_exit(PCIDevice *dev)
     ViaAC97State *s = VIA_AC97(dev);
 
     audio_be_close_out(s->audio_be, s->vo);
+    audio_be_close_in(s->audio_be, s->vi);
 }
 
 static const Property via_ac97_properties[] = {

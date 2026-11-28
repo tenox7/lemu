@@ -2,6 +2,7 @@
  * QEMU Eyetech AmigaOne/Mai Logic Teron emulation
  *
  * Copyright (c) 2023 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  *
@@ -51,6 +52,12 @@
  * -device VGA,romfile=VGABIOS-lgpl-latest.bin
  * from http://www.nongnu.org/vgabios/ instead.
  */
+/*
+ * Built from source by machines/amigaone/firmware/build.sh: the AmigaOne
+ * board of mainline U-Boot with the ACube AmigaOS boot code.
+ */
+#define AMIGAONE_FIRMWARE "u-boot-amigaone.bin"
+
 #define PROM_ADDR 0xfff00000
 #define PROM_SIZE (512 * KiB)
 
@@ -276,6 +283,7 @@ static void amigaone_init(MachineState *machine)
     uint8_t *spd_data;
     DriveInfo *di;
     hwaddr loadaddr;
+    const char *fwname;
     struct boot_info *bi = NULL;
 
     /* init CPU */
@@ -315,14 +323,22 @@ static void amigaone_init(MachineState *machine)
     rom = g_new(MemoryRegion, 1);
     memory_region_init_rom(rom, NULL, "rom", PROM_SIZE, &error_fatal);
     memory_region_add_subregion(get_system_memory(), PROM_ADDR, rom);
-    if (!machine->firmware) {
+    /*
+     * Without -bios boot our U-Boot, unless a kernel is booted directly:
+     * that only needs the routine AmigaOS calls in the ROM.
+     */
+    fwname = machine->firmware;
+    if (!fwname && !machine->kernel_filename) {
+        fwname = AMIGAONE_FIRMWARE;
+    }
+    if (!fwname) {
         rom_add_blob_fixed("dummy-fw", dummy_fw, sizeof(dummy_fw),
                            PROM_ADDR + PROM_SIZE - 0x80);
     } else {
         g_autofree char *filename = qemu_find_file(QEMU_FILE_TYPE_BIOS,
-                                                   machine->firmware);
+                                                   fwname);
         if (!filename) {
-            error_report("Could not find firmware '%s'", machine->firmware);
+            error_report("Could not find firmware '%s'", fwname);
             exit(1);
         }
         sz = load_image_targphys(filename, PROM_ADDR, PROM_SIZE, &error_fatal);
@@ -355,8 +371,13 @@ static void amigaone_init(MachineState *machine)
     pci_bus = PCI_BUS(qdev_get_child_bus(dev, "pci.0"));
 
     /* VIA VT82c686B South Bridge (multifunction PCI device) */
-    via = OBJECT(pci_create_simple_multifunction(pci_bus, PCI_DEVFN(7, 0),
-                                                 TYPE_VT82C686B_ISA));
+    via = OBJECT(pci_new_multifunction(PCI_DEVFN(7, 0), TYPE_VT82C686B_ISA));
+    if (machine->audiodev) {
+        qdev_prop_set_string(DEVICE(object_resolve_path_component(via,
+                                                                  "ac97")),
+                             "audiodev", machine->audiodev);
+    }
+    pci_realize_and_unref(PCI_DEVICE(via), pci_bus, &error_fatal);
     object_property_add_alias(OBJECT(machine), "rtc-time",
                               object_resolve_path_component(via, "rtc"),
                               "date");
@@ -369,6 +390,10 @@ static void amigaone_init(MachineState *machine)
     }
     pci_ide_create_devs(PCI_DEVICE(object_resolve_path_component(via, "ide")));
     pci_vga_init(pci_bus);
+
+    /* on board 3Com 3C920 Ethernet, in the slot routed for it */
+    pci_init_nic_in_slot(pci_bus, "3c905c", NULL, "06");
+    pci_init_nic_devices(pci_bus, MACHINE_GET_CLASS(machine)->default_nic);
 
     if (!machine->kernel_filename) {
         return;
@@ -425,6 +450,8 @@ static void amigaone_machine_init(MachineClass *mc)
     mc->default_display = "std";
     mc->default_ram_id = "ram";
     mc->default_ram_size = 512 * MiB;
+    mc->default_nic = "3c905c";
+    machine_add_audiodev_property(mc);
 }
 
 DEFINE_MACHINE("amigaone", amigaone_machine_init)

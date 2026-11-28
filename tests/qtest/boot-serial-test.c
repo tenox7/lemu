@@ -2,6 +2,7 @@
  * Test serial output of some machines.
  *
  * Copyright 2016 Thomas Huth, Red Hat Inc.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the terms of the GNU GPL, version 2
  * or later. See the COPYING file in the top-level directory.
@@ -168,6 +169,7 @@ static const testdef_t tests[] = {
     { "ppc", "g3beige", "", "PowerPC,750" },
     { "ppc", "mac99", "", "PowerPC,G4" },
     { "ppc", "sam460ex", "-m 256", "DRAM:  256 MiB" },
+    { "ppc", "sam440ep", "-m 256", "DRAM:  256 MiB" },
     { "ppc64", "ppce500", "", "U-Boot" },
     { "ppc64", "40p", "-m 192", "Memory: 192M" },
     { "ppc64", "mac99", "", "PowerPC,970FX" },

@@ -78,6 +78,7 @@ static void sdl2_2d_present(struct sdl2_console *scon)
 
     SDL_RenderClear(scon->real_renderer);
     SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
+    sdl2_draw_cursor(scon);
     SDL_RenderPresent(scon->real_renderer);
 }
 

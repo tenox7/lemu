@@ -2,6 +2,7 @@
  * "Universal" Interrupt Controller for PowerPPC 4xx embedded processors
  *
  * Copyright (c) 2007 Jocelyn Mayer
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +28,7 @@
 #include "hw/core/irq.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
+#include "trace.h"
 
 enum {
     DCR_UICSR  = 0x000,
@@ -191,6 +193,7 @@ static void dcr_write_uic(void *opaque, int dcrn, uint32_t val)
 
     dcrn -= uic->dcr_base;
     LOG_UIC("%s: dcr %d val 0x%x\n", __func__, dcrn, val);
+    trace_ppcuic_dcr_write(uic->dcr_base, dcrn, val);
     switch (dcrn) {
     case DCR_UICSR:
         uic->uicsr &= ~val;

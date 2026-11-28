@@ -6,6 +6,7 @@
  * Copyright (c) 2007 Jocelyn Mayer
  * Copyright (c) 2012 François Revol
  * Copyright (c) 2016-2018 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -31,6 +32,7 @@
 #include "qemu/module.h"
 #include "hw/i2c/ppc4xx_i2c.h"
 #include "hw/core/irq.h"
+#include "trace.h"
 
 #define PPC4xx_I2C_MEM_SIZE 18
 
@@ -180,6 +182,7 @@ static uint64_t ppc4xx_i2c_readb(void *opaque, hwaddr addr, unsigned int size)
         ret = 0;
         break;
     }
+    trace_ppc4xx_i2c_read(addr, ret);
     return ret;
 }
 
@@ -188,6 +191,7 @@ static void ppc4xx_i2c_writeb(void *opaque, hwaddr addr, uint64_t value,
 {
     PPC4xxI2CState *i2c = opaque;
 
+    trace_ppc4xx_i2c_write(addr, value);
     switch (addr) {
     case IIC_MDBUF:
         if (i2c->mdidx >= 3) {
@@ -222,10 +226,12 @@ static void ppc4xx_i2c_writeb(void *opaque, hwaddr addr, uint64_t value,
         } else if (value & IIC_CNTL_PT) {
             int recv = (value & IIC_CNTL_READ) >> 1;
             int tct = value >> 4 & 3;
+            bool byte_stop = false;
             int i;
 
             if (recv && (i2c->lmadr >> 1) >= 0x50 && (i2c->lmadr >> 1) < 0x58) {
                 /* smbus emulation does not like multi byte reads w/o restart */
+                byte_stop = true;
                 value |= IIC_CNTL_RPST;
             }
 
@@ -249,17 +255,25 @@ static void ppc4xx_i2c_writeb(void *opaque, hwaddr addr, uint64_t value,
                         break;
                     }
                 }
-                if (value & IIC_CNTL_RPST || !(value & IIC_CNTL_CHT)) {
+                /* a stop, or a repeated start next, after the last byte */
+                if (byte_stop || (i == tct && (value & IIC_CNTL_RPST ||
+                                               !(value & IIC_CNTL_CHT)))) {
                     i2c_end_transfer(i2c->bus);
                 }
             }
             i2c->xfrcnt = i;
-            i2c->mdidx = i - 1;
-            if (recv && i2c->mdidx >= 0) {
-                i2c->sts |= IIC_STS_MDBS;
-            }
-            if (recv && i2c->mdidx == 3) {
-                i2c->sts |= IIC_STS_MDBF;
+            if (recv) {
+                i2c->mdidx = i - 1;
+                if (i2c->mdidx >= 0) {
+                    i2c->sts |= IIC_STS_MDBS;
+                }
+                if (i2c->mdidx == 3) {
+                    i2c->sts |= IIC_STS_MDBF;
+                }
+            } else {
+                /* the bytes sent have left the buffer */
+                i2c->mdidx = -1;
+                i2c->sts &= ~(IIC_STS_MDBF | IIC_STS_MDBS);
             }
             if (i && i2c->mdcntl & IIC_MDCNTL_EINT &&
                 i2c->intrmsk & IIC_INTRMSK_EIMTC) {

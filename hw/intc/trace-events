@@ -1,5 +1,8 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# ppc-uic.c
+ppcuic_dcr_write(uint32_t base, int reg, uint32_t val) "uic 0x%x reg %d <- 0x%08x"
+
 # i8259.c
 i8259_update_irq(bool master, uint8_t imr, uint8_t irr, uint8_t padd) "master %d imr %"PRIu8" irr %"PRIu8" padd %"PRIu8
 i8259_set_irq(bool master, int irq, int level) "master %d irq %d level %d"

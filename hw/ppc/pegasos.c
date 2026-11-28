@@ -2,6 +2,7 @@
  * QEMU PowerPC CHRP (Genesi/bPlan Pegasos I/II) hardware System Emulator
  *
  * Copyright (c) 2018-2021 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  *
@@ -12,6 +13,7 @@
 #include "qapi/error.h"
 #include "hw/ppc/ppc.h"
 #include "hw/core/sysbus.h"
+#include "net/net.h"
 #include "hw/pci/pci_host.h"
 #include "hw/core/irq.h"
 #include "hw/core/or-irq.h"
@@ -41,8 +43,33 @@
 #include "system/device_tree.h"
 #include "hw/ppc/vof.h"
 #include "exec/cpu-common.h"
+#include "hw/block/flash.h"
+#include "system/block-backend.h"
+#include "system/blockdev.h"
 
 #include <libfdt.h>
+
+/*
+ * To reboot, MorphOS jumps to the firmware's reset vector at 0xfff00100.
+ * With VOF the ROM is empty, so put code there that resets the machine:
+ * it turns translation off and sends the reset command (0xfe) to the
+ * VT8231's keyboard controller at ISA port 0x64 (0xfe000064).
+ */
+static const uint8_t pegasos2_reset_stub[] = {
+    0x7c, 0x60, 0x00, 0xa6,     /* 0x100 mfmsr  r3 */
+    0x54, 0x63, 0x07, 0x32,     /*       rlwinm r3,r3,0,28,25 (IR, DR) */
+    0x7c, 0x7b, 0x03, 0xa6,     /*       mtsrr1 r3 */
+    0x3c, 0x80, 0xff, 0xf0,     /*       lis    r4,0xfff0 */
+    0x60, 0x84, 0x01, 0x20,     /*       ori    r4,r4,0x120 */
+    0x7c, 0x9a, 0x03, 0xa6,     /*       mtsrr0 r4 */
+    0x4c, 0x00, 0x00, 0x64,     /*       rfi */
+    0x48, 0x00, 0x00, 0x00,     /*       b      . */
+    0x3c, 0x60, 0xfe, 0x00,     /* 0x120 lis    r3,0xfe00 */
+    0x38, 0x80, 0x00, 0xfe,     /*       li     r4,0xfe */
+    0x98, 0x83, 0x00, 0x64,     /*       stb    r4,0x64(r3) */
+    0x7c, 0x00, 0x04, 0xac,     /*       sync */
+    0x48, 0x00, 0x00, 0x00,     /*       b      . */
+};
 
 #define PROM_FILENAME "vof.bin"
 #define PROM_ADDR     0xfff00000
@@ -114,7 +141,10 @@ static void pegasos2_pci_irq(void *opaque, int n, int level)
     qemu_set_irq(pm->via_pirq[n], level);
 }
 
-/* Set up PCI interrupt routing: lines from pci.0 and pci.1 are ORed */
+/*
+ * Set up PCI interrupt routing: lines from pci.0 and pci.1 are ORed, and
+ * with INTA the MV64361's Gigabit Ethernet interrupt
+ */
 static void pegasos2_setup_pci_irq(PegasosMachineState *pm)
 {
     for (int h = 0; h < 2; h++) {
@@ -132,7 +162,7 @@ static void pegasos2_setup_pci_irq(PegasosMachineState *pm)
                 object_initialize_child_with_props(OBJECT(pm), n,
                                                    ori, sizeof(*ori),
                                                    TYPE_OR_IRQ, &error_fatal,
-                                                   "num-lines", "2", NULL);
+                                                   "num-lines", "3", NULL);
                 qdev_realize(DEVICE(ori), NULL, &error_fatal);
                 qemu_init_irq(&pm->pci_irqs[i], pegasos2_pci_irq, pm, i);
                 qdev_connect_gpio_out(DEVICE(ori), 0, &pm->pci_irqs[i]);
@@ -144,11 +174,20 @@ static void pegasos2_setup_pci_irq(PegasosMachineState *pm)
     }
     qdev_connect_gpio_out_named(pm->sb, "intr", 0,
                                 qdev_get_gpio_in_named(pm->nb, "gpp", 31));
+    /*
+     * The MV64361's Gigabit Ethernet interrupt shares PCI INTA, and so
+     * IRQ 9 of the VT8231. The main interrupt masks are left alone by both
+     * the firmware and the guests: Linux takes the port on IRQ 9, and
+     * MorphOS's mv6436x_eth.device on the PCI interrupt.
+     */
+    qdev_connect_gpio_out_named(pm->nb, "gbe-intr", 0,
+                                qdev_get_gpio_in(DEVICE(&pm->orirq[0]), 2));
 }
 
 static void pegasos_init(MachineState *machine)
 {
     PegasosMachineState *pm = PEGASOS_MACHINE(machine);
+    MachineClass *mc = MACHINE_GET_CLASS(machine);
     CPUPPCState *env;
     MemoryRegion *rom = g_new(MemoryRegion, 1);
     PCIBus *pci_bus = NULL;
@@ -181,6 +220,24 @@ static void pegasos_init(MachineState *machine)
     }
     memory_region_add_subregion(get_system_memory(), 0, machine->ram);
 
+    /*
+     * The Pegasos II firmware is in an AMD Am29F040 flash, which also
+     * keeps SmartFirmware's NVRAM: with -drive if=pflash the flash is
+     * that image and the NVRAM is kept in it.
+     */
+    if (pm->type == PEGASOS2 && drive_get(IF_PFLASH, 0, 0)) {
+        if (machine->firmware) {
+            error_report("Give the firmware either as -bios or as the "
+                         "pflash drive, not both");
+            exit(1);
+        }
+        pflash_cfi02_register(PROM_ADDR, "pegasos2.flash", PROM_SIZE,
+                              blk_by_legacy_dinfo(drive_get(IF_PFLASH, 0, 0)),
+                              64 * KiB, 1, 1, 0x01, 0xa4, 0, 0,
+                              0x5555, 0x2aaa, 1);
+        goto north_bridge;
+    }
+
     /* allocate and load firmware */
     filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, fwname);
     if (!filename) {
@@ -209,8 +266,14 @@ static void pegasos_init(MachineState *machine)
     g_free(filename);
     if (pm->vof) {
         pm->vof->fw_size = sz;
+        if (pm->type == PEGASOS2) {
+            rom_add_blob_fixed("pegasos2-reset", pegasos2_reset_stub,
+                               sizeof(pegasos2_reset_stub),
+                               PROM_ADDR + 0x100);
+        }
     }
 
+north_bridge:
     /* north bridge */
     switch (pm->type) {
     case PEGASOS1:
@@ -233,8 +296,17 @@ static void pegasos_init(MachineState *machine)
     }
     case PEGASOS2:
         /* Marvell Discovery II system controller */
-        pm->nb = DEVICE(sysbus_create_simple(TYPE_MV64361, -1,
-                        qdev_get_gpio_in(DEVICE(pm->cpu), PPC6xx_INPUT_INT)));
+        pm->nb = qdev_new(TYPE_MV64361);
+        /*
+         * Its Gigabit Ethernet port 1 is the board's Gigabit port. It gets
+         * a -nic only with model=mv643xx_eth: the VIA Rhine stays the
+         * default network card.
+         */
+        qemu_configure_nic_device(pm->nb, false, "mv643xx_eth");
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(pm->nb), &error_fatal);
+        sysbus_connect_irq(SYS_BUS_DEVICE(pm->nb), 0,
+                           qdev_get_gpio_in(DEVICE(pm->cpu),
+                                            PPC6xx_INPUT_INT));
         pci_bus = mv64361_get_pci_bus(pm->nb, 1);
         break;
     }
@@ -263,8 +335,21 @@ static void pegasos_init(MachineState *machine)
     spd_data = spd_data_generate(DDR, machine->ram_size);
     smbus_eeprom_init_one(i2c_bus, 0x57, spd_data);
 
-    /* other PC hardware */
-    pci_vga_init(pci_bus);
+    /*
+     * The graphics card. On Pegasos II it goes in the AGP slot, which is on
+     * the 66 MHz PCI unit 0 of the MV64361 (/pci@c0000000): the chip has no
+     * AGP port or GART of its own, so the slot runs the card as a PCI one.
+     */
+    pci_vga_init(pm->type == PEGASOS2 ? mv64361_get_pci_bus(pm->nb, 0)
+                                      : pci_bus);
+
+    if (pm->type == PEGASOS2) {
+        /* on board VIA VT6102 Rhine-II Ethernet */
+        pci_init_nic_in_slot(pci_bus, "via-rhine", NULL, "0d");
+    }
+    if (mc->default_nic) {
+        pci_init_nic_devices(pci_bus, mc->default_nic);
+    }
 
     /* pci interrupt routing */
     switch (pm->type) {
@@ -496,6 +581,13 @@ static void pegasos2_chipset_reset(PegasosMachineState *pm)
 
     pegasos2_pci_config_write(pm, 1, (PCI_DEVFN(12, 6) << 8) |
                               PCI_INTERRUPT_LINE, 2, 0x309);
+
+    /* on board Ethernet */
+    pegasos2_pci_config_write(pm, 1, (PCI_DEVFN(13, 0) << 8) |
+                              PCI_INTERRUPT_LINE, 2, 0x109);
+    pegasos2_pci_config_write(pm, 1, (PCI_DEVFN(13, 0) << 8) |
+                              PCI_COMMAND, 2, PCI_COMMAND_IO |
+                              PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 }
 
 static void pegasos_machine_reset(MachineState *machine, ResetType type)
@@ -779,12 +871,20 @@ static void pegasos2_init(Object *obj)
     pm->bus_freq_hz = 133333333;
 }
 
+/* the Radeons of the Pegasos II are AGP cards */
+static GlobalProperty pegasos2_compat[] = {
+    { "ati-vga", "agp", "on" },
+};
+
 static void pegasos2_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
     mc->desc = "Genesi/bPlan Pegasos II";
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("7457_v1.2");
+    mc->default_nic = "via-rhine";
+    compat_props_add(mc->compat_props, pegasos2_compat,
+                     G_N_ELEMENTS(pegasos2_compat));
 }
 
 DEFINE_MACHINE_EXTENDED("pegasos", MACHINE, PegasosMachineState,

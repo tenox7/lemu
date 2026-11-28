@@ -2,6 +2,7 @@
  * QEMU SDL display driver
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -57,6 +58,8 @@ static int absolute_enabled;
 static bool guest_cursor;
 static int guest_x, guest_y;
 static SDL_Cursor *guest_sprite;
+static int guest_hot_x, guest_hot_y;
+static unsigned guest_sprite_gen;   /* counts the guest's cursor images */
 static Notifier mouse_mode_notifier;
 static QEMUBH *sdl_cursor_bh;
 
@@ -179,6 +182,8 @@ void sdl2_window_destroy(struct sdl2_console *scon)
         scon->winctx = NULL;
     }
     if (scon->real_renderer) {
+        /* its textures go with it */
+        scon->cursor_texture = NULL;
         SDL_DestroyRenderer(scon->real_renderer);
         scon->real_renderer = NULL;
     }
@@ -248,6 +253,51 @@ static void sdl_update_caption(struct sdl2_console *scon)
     }
 }
 
+/*
+ * A relative mouse (PS/2) in a grabbed 2D window: SDL's relative mode
+ * sends the guest the mouse's own motion, and the guest's cursor is drawn
+ * in the window. Showing the guest's cursor as the host pointer instead
+ * gives the guest motion the host has already accelerated, which the guest
+ * accelerates again, and keeps it inside the window.
+ */
+static bool sdl_draws_cursor(struct sdl2_console *scon)
+{
+    return !scon->opengl &&
+           !qemu_input_is_absolute(scon->dcl.con) && !absolute_enabled &&
+           !(scon->opts->has_show_cursor && scon->opts->show_cursor);
+}
+
+/* draws the guest's cursor over the screen, before it is presented */
+void sdl2_draw_cursor(struct sdl2_console *scon)
+{
+    SDL_Rect dst;
+
+    if (!gui_grab || !guest_cursor || !guest_sprite_surface ||
+        !sdl_draws_cursor(scon)) {
+        return;
+    }
+    if (scon->cursor_texture && scon->cursor_gen != guest_sprite_gen) {
+        SDL_DestroyTexture(scon->cursor_texture);
+        scon->cursor_texture = NULL;
+    }
+    if (!scon->cursor_texture) {
+        scon->cursor_texture =
+            SDL_CreateTextureFromSurface(scon->real_renderer,
+                                         guest_sprite_surface);
+        if (!scon->cursor_texture) {
+            return;
+        }
+        SDL_SetTextureBlendMode(scon->cursor_texture, SDL_BLENDMODE_BLEND);
+        scon->cursor_gen = guest_sprite_gen;
+    }
+    /* the renderer's logical size is the guest's screen */
+    dst.x = guest_x - guest_hot_x;
+    dst.y = guest_y - guest_hot_y;
+    dst.w = guest_sprite_surface->w;
+    dst.h = guest_sprite_surface->h;
+    SDL_RenderCopy(scon->real_renderer, scon->cursor_texture, NULL, &dst);
+}
+
 static void sdl_hide_cursor(struct sdl2_console *scon)
 {
     if (scon->opts->has_show_cursor && scon->opts->show_cursor) {
@@ -302,7 +352,7 @@ static void sdl_grab_start(struct sdl2_console *scon)
     if (!(SDL_GetWindowFlags(scon->real_window) & SDL_WINDOW_INPUT_FOCUS)) {
         return;
     }
-    if (guest_cursor) {
+    if (guest_cursor && !sdl_draws_cursor(scon)) {
         SDL_SetCursor(guest_sprite);
         if (!qemu_input_is_absolute(scon->dcl.con) && !absolute_enabled) {
             SDL_WarpMouseInWindow(scon->real_window, guest_x, guest_y);
@@ -312,16 +362,29 @@ static void sdl_grab_start(struct sdl2_console *scon)
     }
     SDL_SetWindowGrab(scon->real_window, SDL_TRUE);
     gui_grab = 1;
+    scon->updates++;    /* show the guest's cursor */
     timer_mod(sdl2_input_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
     sdl_update_caption(scon);
 }
 
 static void sdl_grab_end(struct sdl2_console *scon)
 {
+    bool drawn = guest_cursor && sdl_draws_cursor(scon);
+
     SDL_SetWindowGrab(scon->real_window, SDL_FALSE);
     gui_grab = 0;
     timer_del(sdl2_input_timer);
     sdl_show_cursor(scon);
+    if (drawn && scon->surface) {
+        int w, h;
+
+        /* the host pointer comes back where the guest's cursor was */
+        SDL_GetWindowSize(scon->real_window, &w, &h);
+        SDL_WarpMouseInWindow(scon->real_window,
+                              guest_x * w / surface_width(scon->surface),
+                              guest_y * h / surface_height(scon->surface));
+        scon->updates++;
+    }
     sdl_update_caption(scon);
 }
 
@@ -376,7 +439,7 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
         qemu_input_queue_abs(scon->dcl.con, INPUT_AXIS_Y,
                              y, 0, surface_height(scon->surface));
     } else {
-        if (guest_cursor) {
+        if (guest_cursor && !sdl_draws_cursor(scon)) {
             x -= guest_x;
             y -= guest_y;
             guest_x += x;
@@ -805,7 +868,12 @@ void sdl2_poll_events(struct sdl2_console *scon)
 static void sdl_mouse_warp_now(struct sdl2_console *scon,
                                int x, int y, bool on)
 {
-    if (on) {
+    if (gui_grab && sdl_draws_cursor(scon)) {
+        /* drawn in the window: the host pointer stays hidden and still */
+        if (guest_cursor != on || guest_x != x || guest_y != y) {
+            scon->updates++;
+        }
+    } else if (on) {
         if (!guest_cursor) {
             sdl_show_cursor(scon);
         }
@@ -840,13 +908,17 @@ static void sdl_mouse_define_now(struct sdl2_console *scon, QEMUCursor *c)
         fprintf(stderr, "Failed to make rgb surface from %p\n", c);
         return;
     }
+    guest_hot_x = c->hot_x;
+    guest_hot_y = c->hot_y;
+    guest_sprite_gen++;
+    scon->updates++;
     guest_sprite = SDL_CreateColorCursor(guest_sprite_surface,
                                          c->hot_x, c->hot_y);
     if (!guest_sprite) {
         fprintf(stderr, "Failed to make color cursor from %p\n", c);
         return;
     }
-    if (guest_cursor &&
+    if (guest_cursor && !(gui_grab && sdl_draws_cursor(scon)) &&
         (gui_grab || qemu_input_is_absolute(scon->dcl.con) ||
          absolute_enabled)) {
         SDL_SetCursor(guest_sprite);

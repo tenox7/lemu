@@ -1,3 +1,4 @@
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
 system_ss.add(when: 'CONFIG_DP8393X', if_true: files('dp8393x.c'))
 system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xen_nic.c'))
 system_ss.add(when: 'CONFIG_NE2000_COMMON', if_true: files('ne2000.c'))
@@ -14,6 +15,9 @@ system_ss.add(when: 'CONFIG_IGB_PCI_EXPRESS', if_true: files('net_tx_pkt.c', 'ne
 system_ss.add(when: 'CONFIG_IGB_PCI_EXPRESS', if_true: files('igb.c', 'igbvf.c', 'igb_core.c'))
 system_ss.add(when: 'CONFIG_RTL8139_PCI', if_true: files('rtl8139.c'))
 system_ss.add(when: 'CONFIG_TULIP', if_true: files('tulip.c'))
+system_ss.add(when: 'CONFIG_VIA_RHINE', if_true: files('via-rhine.c'))
+system_ss.add(when: 'CONFIG_MV643XX_ETH', if_true: files('mv643xx_eth.c'))
+system_ss.add(when: 'CONFIG_TC90X', if_true: files('3c90x.c'))
 system_ss.add(when: 'CONFIG_VMXNET3_PCI', if_true: files('net_tx_pkt.c', 'net_rx_pkt.c'))
 system_ss.add(when: 'CONFIG_VMXNET3_PCI', if_true: files('vmxnet3.c'))
 

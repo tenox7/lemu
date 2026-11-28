@@ -12,6 +12,7 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  *
  * Copyright IBM Corp. 2008
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Authors: Hollis Blanchard <hollisb@us.ibm.com>
  */
@@ -23,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/irq.h"
 #include "hw/pci-host/ppc4xx.h"
 #include "migration/vmstate.h"
@@ -61,6 +63,17 @@ struct PPC4xxPCIState {
 
     MemoryRegion container;
     MemoryRegion iomem;
+
+    /*
+     * With a PCI memory window, PCI memory is a space of its own and only
+     * the window is seen at the same address on the PLB. Without one PCI
+     * memory is the PLB itself, so legacy VGA memory at 0xa0000 lands on
+     * top of RAM.
+     */
+    uint32_t pci_mem_base;
+    uint32_t pci_mem_size;
+    MemoryRegion pci_mem;
+    MemoryRegion pci_mem_window;
 };
 
 #define PCIC0_CFGADDR       0x0
@@ -326,8 +339,18 @@ static void ppc4xx_pcihost_realize(DeviceState *dev, Error **errp)
         sysbus_init_irq(sbd, &s->irq[i]);
     }
 
+    if (s->pci_mem_size) {
+        memory_region_init(&s->pci_mem, OBJECT(s), "pci-mem", UINT64_MAX);
+        memory_region_init_alias(&s->pci_mem_window, OBJECT(s),
+                                 "pci-mem-window", &s->pci_mem,
+                                 s->pci_mem_base, s->pci_mem_size);
+        memory_region_add_subregion(get_system_memory(), s->pci_mem_base,
+                                    &s->pci_mem_window);
+    }
     b = pci_register_root_bus(dev, NULL, ppc4xx_pci_set_irq,
-                              ppc4xx_pci_map_irq, s->irq, get_system_memory(),
+                              ppc4xx_pci_map_irq, s->irq,
+                              s->pci_mem_size ? &s->pci_mem
+                                              : get_system_memory(),
                               get_system_io(), 0, ARRAY_SIZE(s->irq),
                               TYPE_PCI_BUS);
     h->bus = b;
@@ -376,11 +399,17 @@ static const TypeInfo ppc4xx_host_bridge_info = {
     },
 };
 
+static const Property ppc4xx_pcihost_properties[] = {
+    DEFINE_PROP_UINT32("pci-mem-base", PPC4xxPCIState, pci_mem_base, 0),
+    DEFINE_PROP_UINT32("pci-mem-size", PPC4xxPCIState, pci_mem_size, 0),
+};
+
 static void ppc4xx_pcihost_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = ppc4xx_pcihost_realize;
+    device_class_set_props(dc, ppc4xx_pcihost_properties);
     dc->vmsd = &vmstate_ppc4xx_pci;
 }
 

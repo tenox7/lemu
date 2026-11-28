@@ -9,6 +9,8 @@
  *
  * and linux/include/video/radeon.h
  *
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+ *
  * This work is licensed under the GNU GPL license version 2.
  */
 
@@ -167,6 +169,7 @@
 #define CAP0_TRIG_CNTL                          0x0950
 #define CAP1_TRIG_CNTL                          0x09c0
 #define SURFACE_CNTL                            0x0b00
+#define SURFACE0_LOWER_BOUND                    0x0b04
 
 #define RBBM_STATUS                             0x0e40
 
@@ -359,6 +362,8 @@
 /* Radeon: bits 20-22 of CRTC_GEN_CNTL are the cursor mode */
 #define CRTC_CUR_MODE_MASK                      0x00700000
 #define CRTC_CUR_MODE_24BPP_AND                 0x00100000
+#define CRTC_CUR_MODE_ARGB_PREMULT              0x00200000
+#define CRTC_CUR_MODE_ARGB                      0x00300000
 #define CRTC2_EXT_DISP_EN                       0x01000000
 #define CRTC2_EN                                0x02000000
 #define CRTC2_DISP_REQ_EN_B                     0x04000000
@@ -527,5 +532,49 @@
 
 /* used by ATI bug fix for hardware ROM */
 #define RAGE128_MPP_TB_CONFIG                   0x01c0
+
+
+/* Radeon command processor, memory controller and PCI GART */
+#define RADEON_CRTC2_VBLANK_STAT                BIT(9)
+#define RADEON_SW_INT_TEST                      BIT(25)
+#define RADEON_SW_INT_FIRE                      BIT(26)
+#define RADEON_RBBM_SOFT_RESET                  0x00f0
+#define RADEON_SOFT_RESET_CP                    BIT(0)
+#define RADEON_MC_FB_LOCATION                   0x0148
+#define RADEON_MC_AGP_LOCATION                  0x014c
+#define RADEON_AGP_BASE                         0x0170
+#define RADEON_AIC_CNTL                         0x01d0
+#define RADEON_AIC_STAT                         0x01d4
+#define RADEON_AIC_PT_BASE                      0x01d8
+#define RADEON_AIC_LO_ADDR                      0x01dc
+#define RADEON_AIC_HI_ADDR                      0x01e0
+#define RADEON_AIC_TLB_ADDR                     0x01e4
+#define RADEON_AIC_TLB_DATA                     0x01e8
+#define RADEON_CP_RB_BASE                       0x0700
+#define RADEON_CP_RB_CNTL                       0x0704
+#define RADEON_CP_RB_RPTR_ADDR                  0x070c
+#define RADEON_CP_RB_RPTR                       0x0710
+#define RADEON_CP_RB_WPTR                       0x0714
+#define RADEON_CP_IB_BASE                       0x0738
+#define RADEON_CP_IB_BUFSZ                      0x073c
+#define RADEON_CP_CSQ_CNTL                      0x0740
+#define RADEON_CP_CSQ_MODE                      0x0744
+#define RADEON_SCRATCH_UMSK                     0x0770
+#define RADEON_SCRATCH_ADDR                     0x0774
+#define RADEON_CP_STAT                          0x07c0
+#define RADEON_CP_ME_CNTL                       0x07d0
+#define RADEON_CP_ME_RAM_ADDR                   0x07d4
+#define RADEON_CP_ME_RAM_RADDR                  0x07d8
+#define RADEON_CP_ME_RAM_DATAH                  0x07dc
+#define RADEON_CP_ME_RAM_DATAL                  0x07e0
+#define RADEON_CP_CSQ_STAT                      0x07f8
+#define RADEON_CP_CSQ2_STAT                     0x07fc
+#define RADEON_CP_CSQ_APER_PRIMARY              0x1000
+#define RADEON_CP_CSQ_APER_INDIRECT             0x1300
+#define RADEON_SCRATCH_REG0                     0x15e0
+#define RADEON_SCRATCH_REG7                     0x15fc
+#define RADEON_ISYNC_CNTL                       0x1724
+#define RADEON_RB3D_DSTCACHE_CTLSTAT            0x325c
+#define RADEON_RB2D_DSTCACHE_CTLSTAT            0x342c
 
 #endif /* ATI_REGS_H */

@@ -3,6 +3,7 @@
  *
  *  Copyright (c) 2003-2007 Jocelyn Mayer
  *  Copyright (C) 2011 Freescale Semiconductor, Inc.
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -5121,6 +5122,7 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->has_bhrb = !!(env->flags & POWERPC_FLAG_BHRB);
 #endif
     ctx->lazy_tlb_flush = env->mmu_model == POWERPC_MMU_32B
+        || env->mmu_model == POWERPC_MMU_BOOKE
         || env->mmu_model & POWERPC_MMU_64;
 
     ctx->fpu_enabled = (hflags >> HFLAGS_FP) & 1;

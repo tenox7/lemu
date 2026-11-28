@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+
 config PSERIES
     bool
     default y
@@ -83,6 +85,23 @@ config SAM460EX
     select USB_OHCI_SYSBUS
     select FDT_PPC
 
+config SAM440EP
+    bool
+    default y
+    depends on PPC && FDT
+    imply ATI_VGA
+    select CS4281
+    select PFLASH_CFI01
+    select IDE_SII3112
+    select TC90X
+    select M41T80
+    select PPC440
+    select SERIAL_MM
+    select SMBUS_EEPROM
+    select PCI_BRIDGE
+    select USB_OHCI_PCI
+    select UNIMP
+
 config AMIGAONE
     bool
     default y
@@ -91,6 +110,7 @@ config AMIGAONE
     select ARTICIA
     select VT82C686
     select SMBUS_EEPROM
+    select TC90X
 
 config PEGASOS
     bool
@@ -101,6 +121,8 @@ config PEGASOS
     select VT82C686
     select SMBUS_EEPROM
     select VOF
+    select VIA_RHINE
+    select PFLASH_CFI02
 
 config PREP
     bool

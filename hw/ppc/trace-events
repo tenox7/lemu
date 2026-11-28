@@ -1,5 +1,13 @@
 # See docs/devel/tracing.rst for syntax documentation.
 
+# ppc4xx_emac.c
+ppc4xx_emac_read(uint64_t addr, uint32_t val) "0x%02"PRIx64" -> 0x%08x"
+ppc4xx_emac_write(uint64_t addr, uint64_t val) "0x%02"PRIx64" <- 0x%08"PRIx64
+ppc4xx_emac_mdio_read(int phy, int reg, uint32_t val) "phy %d reg %d -> 0x%04x"
+ppc4xx_emac_mdio_write(int phy, int reg, uint32_t val) "phy %d reg %d <- 0x%04x"
+ppc4xx_emac_tx(uint32_t chan, size_t len) "channel %u frame %zu bytes"
+ppc4xx_emac_rx(uint32_t chan, size_t len) "channel %u frame %zu bytes"
+
 # spapr_pci.c
 spapr_pci_msi(const char *msg, uint32_t ca) "%s (cfg=0x%x)"
 spapr_pci_msi_setup(const char *name, unsigned vector, uint64_t addr) "dev\"%s\" vector %u, addr=0x%"PRIx64

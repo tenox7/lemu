@@ -2,6 +2,7 @@
  * QEMU PowerPC 4xx emulation shared definitions
  *
  * Copyright (c) 2007 Jocelyn Mayer
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -66,9 +67,36 @@ struct Ppc4xxMalState {
     uint32_t *txctpr;
     uint32_t *rxctpr;
     uint32_t *rcbs;
+    uint32_t *txcur;        /* the descriptor each channel is at */
+    uint32_t *rxcur;
+    void (**rx_notify)(void *opaque);
+    void **rx_notify_opaque;
     uint8_t  txcnum;
     uint8_t  rxcnum;
+    uint8_t  rx_group;      /* receive channels per EMAC, 0: one */
 };
+
+/*
+ * The MAL moves frames between the descriptor tables in memory and the
+ * EMACs. A transmit channel sends each frame whose descriptors are ready
+ * through send(); a receive channel takes a frame into its empty
+ * descriptors. rx_notify is called when the driver gives a receive
+ * channel back, so the EMAC can deliver frames it held.
+ */
+void ppc4xx_mal_transmit(Ppc4xxMalState *mal, int chan,
+                         void (*send)(void *opaque, const uint8_t *buf,
+                                      size_t len),
+                         void *opaque);
+bool ppc4xx_mal_can_receive(Ppc4xxMalState *mal, int chan);
+bool ppc4xx_mal_receive(Ppc4xxMalState *mal, int chan, const uint8_t *buf,
+                        size_t len);
+void ppc4xx_mal_set_rx_notify(Ppc4xxMalState *mal, int chan,
+                              void (*notify)(void *opaque), void *opaque);
+
+/* the 10/100 EMAC (ppc4xx_emac.c) and the ZMII bridge in front of them */
+#define TYPE_PPC4XX_EMAC "ppc4xx-emac"
+#define TYPE_PPC4XX_ZMII "ppc4xx-zmii"
+#define TYPE_PPC4XX_RGMII "ppc4xx-rgmii"
 
 /* Peripheral local bus arbitrer */
 #define TYPE_PPC4xx_PLB "ppc4xx-plb"

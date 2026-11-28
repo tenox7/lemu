@@ -1,4 +1,6 @@
 # See docs/devel/tracing.rst for syntax documentation.
+#
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
 
 # allwinner-sun8i-emac.c
 allwinner_sun8i_emac_mii_write_reg(uint32_t reg, uint32_t value) "MII write: reg=0x%" PRIx32 " value=0x%" PRIx32
@@ -399,6 +401,29 @@ virtio_net_rss_attach_ebpf(void *nic, int prog_fd) "nic=%p prog-fd=%d"
 virtio_net_rss_disable(void *nic) "nic=%p"
 virtio_net_rss_error(void *nic, const char *msg, uint32_t value) "nic=%p msg=%s, value 0x%08x"
 virtio_net_rss_enable(void *nic, uint32_t p1, uint16_t p2, uint8_t p3) "nic=%p hashes 0x%x, table of %d, key of %d"
+
+# 3c90x.c
+tc90x_read(uint8_t window, uint64_t addr, unsigned size, uint64_t val) "window %u 0x%02"PRIx64" size %u -> 0x%"PRIx64
+tc90x_write(uint8_t window, uint64_t addr, unsigned size, uint64_t val) "window %u 0x%02"PRIx64" size %u <- 0x%"PRIx64
+tc90x_command(unsigned cmd, unsigned arg) "command %u argument 0x%x"
+tc90x_tx(uint32_t len, uint32_t desc) "frame %u bytes, DPD 0x%08x"
+tc90x_rx(uint32_t len, uint32_t desc) "frame %u bytes, UPD 0x%08x"
+
+# mv643xx_eth.c
+mv643xx_eth_read(uint64_t addr, uint32_t val) "0x%04"PRIx64" -> 0x%08"PRIx32
+mv643xx_eth_write(uint64_t addr, uint64_t val) "0x%04"PRIx64" <- 0x%08"PRIx64
+mv643xx_eth_irq(int line, int level) "line %d level %d"
+mv643xx_eth_smi(const char *op, int phy, int reg, uint16_t val) "%s phy %d reg %d 0x%04x"
+mv643xx_eth_tx(int port, int queue, int len) "port %d queue %d sent %d bytes"
+mv643xx_eth_rx(int port, int queue, size_t len) "port %d queue %d received %zu bytes"
+mv643xx_eth_rx_error(int port, int queue, size_t len) "port %d queue %d no descriptor for %zu bytes"
+
+# via-rhine.c
+via_rhine_read(uint64_t addr, unsigned size, uint64_t val) "0x%02"PRIx64" size %u -> 0x%"PRIx64
+via_rhine_write(uint64_t addr, unsigned size, uint64_t val) "0x%02"PRIx64" size %u <- 0x%"PRIx64
+via_rhine_rx(uint32_t len, uint32_t next) "frame %u bytes, next descriptor 0x%08x"
+via_rhine_rx_nobuf(uint32_t desc) "no receive buffer at 0x%08x"
+via_rhine_tx(uint32_t len, uint32_t desc) "frame %u bytes, descriptor 0x%08x"
 
 # tulip.c
 tulip_reg_write(uint64_t addr, const char *name, int size, uint64_t val) "addr 0x%02"PRIx64" (%s) size %d value 0x%08"PRIx64

@@ -1,3 +1,8 @@
+/*
+ * QEMU SDL display driver
+ *
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+ */
 #ifndef SDL2_H
 #define SDL2_H
 
@@ -53,6 +58,9 @@ struct sdl2_console {
     bool mouse_set_pending;
     int mouse_set_x, mouse_set_y;
     bool mouse_set_on;
+    /* the guest's cursor, drawn in the window, see sdl2_draw_cursor() */
+    SDL_Texture *cursor_texture;
+    unsigned cursor_gen;
 #ifdef CONFIG_OPENGL
     QemuGLShader *gls;
     egl_fb guest_fb;
@@ -70,6 +78,8 @@ void sdl2_poll_events(struct sdl2_console *scon);
 void sdl2_process_key(struct sdl2_console *scon,
                       SDL_KeyboardEvent *ev);
 void sdl2_release_modifiers(struct sdl2_console *scon);
+
+void sdl2_draw_cursor(struct sdl2_console *scon);
 
 /*
  * Note an area of the surface to copy to the window at the next refresh.

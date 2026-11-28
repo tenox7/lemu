@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+
 # See docs/devel/tracing.rst for syntax documentation.
 
 # jazz_led.c
@@ -147,6 +149,25 @@ sii9022_switch_mode(const char *mode) "mode: %s"
 # ati.c
 ati_mm_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s -> 0x%"PRIx64
 ati_mm_write(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 " %s <- 0x%"PRIx64
+
+# ati_2d.c
+ati_nonsurf_swap(int from, int to, bool vis, uint32_t lo, uint32_t hi, bool pin, bool be) "swap %d -> %d visible %d 0x%x-0x%x pinned %d display big endian %d"
+ati_2d_blt(uint32_t rop, int bpp, uint32_t offset, int x, int y, int w, int h, int cw, int ch) "rop 0x%02x bpp %d dst 0x%x (%d,%d) %dx%d clip %dx%d"
+ati_2d_blt_src(int source, int datatype, uint32_t offset, int x, int y, int pitch, int src_swap, int dst_swap) "source %d datatype %d src 0x%x (%d,%d) pitch %d swap src %d dst %d"
+ati_2d_host_blt(int rop, int source, int datatype, uint32_t offset, int x, int y, int w, int h, uint32_t fg, uint32_t bg) "rop 0x%02x source %d datatype %d dst 0x%x (%d,%d) %dx%d fg 0x%08x bg 0x%08x"
+
+# ati_3d.c
+ati_reg_store(uint32_t addr, uint32_t val) "0x%04x <- 0x%08x"
+ati_3d_draw(int prim, int count, uint32_t fmt, bool tex) "prim %d vertices %d format 0x%x texture %d"
+ati_3d_texture(int unit, uint32_t offset, uint32_t fmt, uint32_t filter, int xm) "unit %d offset 0x%08x format 0x%08x filter 0x%08x swap %d"
+ati_3d_tcl_vertex(int ir, int ig, int ib, int x, int y, int z, int w, int r, int g, int b) "colour in (%d,%d,%d)/1000 clip (%d,%d,%d,%d)/1000 rgb %d %d %d"
+ati_3d_vbuf(uint32_t vf, uint32_t fmt0, int naos, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) "vf 0x%08x format 0x%x arrays %d size/stride 0x%x 0x%x 0x%x 0x%x"
+ati_3d_vertex(int x, int y, uint32_t fmt, uint32_t vf, int r, int g, int b, int a) "(%d,%d) format 0x%x vf 0x%x rgba %d %d %d %d"
+
+# ati_cp.c
+ati_cp_ring(uint32_t rptr, uint32_t wptr) "rptr %u wptr %u"
+ati_cp_ib(uint32_t base, uint32_t size) "base 0x%08x size %u"
+ati_cp_packet3(uint32_t op, uint32_t count) "op 0x%02x count %u"
 
 # artist.c
 artist_reg_read(unsigned int size, uint64_t addr, const char *name, uint64_t val) "%u 0x%"PRIx64 "%s -> 0x%08"PRIx64

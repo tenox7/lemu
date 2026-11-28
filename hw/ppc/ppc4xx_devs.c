@@ -2,6 +2,7 @@
  * QEMU PowerPC 4xx embedded processors shared devices emulation
  *
  * Copyright (c) 2007 Jocelyn Mayer
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,6 +27,8 @@
 #include "target/ppc/cpu.h"
 #include "hw/ppc/ppc4xx.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "system/address-spaces.h"
 #include "qapi/error.h"
 
 /*****************************************************************************/
@@ -62,6 +65,186 @@ static void ppc4xx_mal_reset(DeviceState *dev)
     mal->txcasr = 0x00000000;
     mal->txdeir = 0x00000000;
     mal->txeobisr = 0x00000000;
+}
+
+/* descriptors: control and status, length, buffer address, big endian */
+#define MAL_DESC_SIZE       8
+#define MAL_TX_READY        0x8000
+#define MAL_RX_EMPTY        0x8000
+#define MAL_WRAP            0x4000
+#define MAL_LAST            0x1000
+#define MAL_RX_FIRST        0x0800
+#define MAL_INTR            0x0400
+#define MAL_CFG_EOPIE       0x00000004  /* EOB at the end of every packet */
+#define MAL_EMAC_BITS       0x03ff  /* EMAC control in, status out */
+#define MAL_IER_DE          0x00000010
+#define MAL_MAX_FRAME       16384
+#define MAL_MAX_DESCS       256
+
+static uint32_t mal_chan_bit(int chan)
+{
+    return 0x80000000u >> chan;
+}
+
+/*
+ * The 460EX's MAL gives each EMAC a group of receive channels (8 for EMAC1);
+ * the first channel of a group has the group's bit in RXCASR and the status
+ * registers.
+ */
+static uint32_t mal_rx_bit(Ppc4xxMalState *mal, int chan)
+{
+    if (mal->rx_group && !(chan % mal->rx_group)) {
+        return mal_chan_bit(chan / mal->rx_group);
+    }
+    return mal_chan_bit(chan);
+}
+
+/* irqs: TXEOB, RXEOB, TXDE, RXDE */
+static void ppc4xx_mal_update_irq(Ppc4xxMalState *mal)
+{
+    bool de = mal->ier & MAL_IER_DE;
+
+    qemu_set_irq(mal->irqs[0], !!mal->txeobisr);
+    qemu_set_irq(mal->irqs[1], !!mal->rxeobisr);
+    qemu_set_irq(mal->irqs[2], de && mal->txdeir);
+    qemu_set_irq(mal->irqs[3], de && mal->rxdeir);
+}
+
+static void mal_desc_read(uint32_t addr, uint16_t *ctrl, uint16_t *len,
+                          uint32_t *buf)
+{
+    uint8_t d[MAL_DESC_SIZE];
+
+    address_space_read(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                       d, sizeof(d));
+    *ctrl = lduw_be_p(d);
+    *len = lduw_be_p(d + 2);
+    *buf = ldl_be_p(d + 4);
+}
+
+static void mal_desc_write(uint32_t addr, uint16_t ctrl, uint16_t len)
+{
+    uint8_t d[4];
+
+    stw_be_p(d, ctrl);
+    stw_be_p(d + 2, len);
+    address_space_write(&address_space_memory, addr, MEMTXATTRS_UNSPECIFIED,
+                        d, sizeof(d));
+}
+
+static uint32_t mal_next(uint32_t desc, uint16_t ctrl, uint32_t base)
+{
+    return (ctrl & MAL_WRAP) ? base : desc + MAL_DESC_SIZE;
+}
+
+static void mal_rx_notify(Ppc4xxMalState *mal, int chan)
+{
+    if (chan < mal->rxcnum && mal->rx_notify[chan]) {
+        mal->rx_notify[chan](mal->rx_notify_opaque[chan]);
+    }
+}
+
+void ppc4xx_mal_set_rx_notify(Ppc4xxMalState *mal, int chan,
+                              void (*notify)(void *opaque), void *opaque)
+{
+    assert(chan < mal->rxcnum);
+    mal->rx_notify[chan] = notify;
+    mal->rx_notify_opaque[chan] = opaque;
+}
+
+void ppc4xx_mal_transmit(Ppc4xxMalState *mal, int chan,
+                         void (*send)(void *opaque, const uint8_t *buf,
+                                      size_t len),
+                         void *opaque)
+{
+    g_autofree uint8_t *frame = NULL;
+    size_t len = 0;
+    int n;
+
+    if (chan >= mal->txcnum || !(mal->txcasr & mal_chan_bit(chan))) {
+        return;
+    }
+    frame = g_malloc(MAL_MAX_FRAME);
+    for (n = 0; n < MAL_MAX_DESCS; n++) {
+        uint32_t desc = mal->txcur[chan], buf;
+        uint16_t ctrl, dlen;
+
+        mal_desc_read(desc, &ctrl, &dlen, &buf);
+        if (!(ctrl & MAL_TX_READY)) {
+            break;
+        }
+        dlen = MIN(dlen, MAL_MAX_FRAME - len);
+        address_space_read(&address_space_memory, buf,
+                           MEMTXATTRS_UNSPECIFIED, frame + len, dlen);
+        len += dlen;
+        if (ctrl & MAL_LAST) {
+            send(opaque, frame, len);
+            len = 0;
+        }
+        /* sent, and no errors in the EMAC status bits */
+        mal_desc_write(desc, ctrl & ~(MAL_TX_READY | MAL_EMAC_BITS), dlen);
+        if ((ctrl & MAL_INTR) ||
+            ((mal->cfg & MAL_CFG_EOPIE) && (ctrl & MAL_LAST))) {
+            mal->txeobisr |= mal_chan_bit(chan);
+        }
+        mal->txcur[chan] = mal_next(desc, ctrl, mal->txctpr[chan]);
+    }
+    ppc4xx_mal_update_irq(mal);
+}
+
+bool ppc4xx_mal_can_receive(Ppc4xxMalState *mal, int chan)
+{
+    uint32_t buf;
+    uint16_t ctrl, len;
+
+    if (chan >= mal->rxcnum || !(mal->rxcasr & mal_rx_bit(mal, chan)) ||
+        !mal->rcbs[chan]) {
+        return false;
+    }
+    mal_desc_read(mal->rxcur[chan], &ctrl, &len, &buf);
+    return ctrl & MAL_RX_EMPTY;
+}
+
+bool ppc4xx_mal_receive(Ppc4xxMalState *mal, int chan, const uint8_t *data,
+                        size_t size)
+{
+    uint32_t bufsize = mal->rcbs[chan] * 16;
+    size_t done = 0;
+    int n;
+
+    if (!ppc4xx_mal_can_receive(mal, chan)) {
+        return false;
+    }
+    for (n = 0; n < MAL_MAX_DESCS && done < size; n++) {
+        uint32_t desc = mal->rxcur[chan], buf;
+        uint16_t ctrl, len, chunk;
+
+        mal_desc_read(desc, &ctrl, &len, &buf);
+        if (!(ctrl & MAL_RX_EMPTY)) {
+            /* out of descriptors in the middle of a frame */
+            mal->rxdeir |= mal_rx_bit(mal, chan);
+            break;
+        }
+        chunk = MIN(bufsize, size - done);
+        address_space_write(&address_space_memory, buf,
+                            MEMTXATTRS_UNSPECIFIED, data + done, chunk);
+        ctrl &= ~(MAL_RX_EMPTY | MAL_RX_FIRST | MAL_LAST | MAL_EMAC_BITS);
+        if (!done) {
+            ctrl |= MAL_RX_FIRST;
+        }
+        done += chunk;
+        if (done >= size) {
+            ctrl |= MAL_LAST;
+        }
+        mal_desc_write(desc, ctrl, chunk);
+        if ((ctrl & MAL_INTR) ||
+            ((mal->cfg & MAL_CFG_EOPIE) && (ctrl & MAL_LAST))) {
+            mal->rxeobisr |= mal_rx_bit(mal, chan);
+        }
+        mal->rxcur[chan] = mal_next(desc, ctrl, mal->rxctpr[chan]);
+    }
+    ppc4xx_mal_update_irq(mal);
+    return true;
 }
 
 static uint32_t dcr_read_mal(void *opaque, int dcrn)
@@ -123,6 +306,7 @@ static uint32_t dcr_read_mal(void *opaque, int dcrn)
 static void dcr_write_mal(void *opaque, int dcrn, uint32_t val)
 {
     Ppc4xxMalState *mal = opaque;
+    int i;
 
     switch (dcrn) {
     case MAL0_CFG:
@@ -139,10 +323,16 @@ static void dcr_write_mal(void *opaque, int dcrn, uint32_t val)
         mal->ier = val & 0x0000001F;
         break;
     case MAL0_TXCASR:
-        mal->txcasr = val & 0xF0000000;
+        for (i = 0; i < mal->txcnum; i++) {
+            if (val & ~mal->txcasr & mal_chan_bit(i)) {
+                mal->txcur[i] = mal->txctpr[i];
+            }
+        }
+        mal->txcasr |= val & 0xF0000000;
         break;
     case MAL0_TXCARR:
-        mal->txcarr = val & 0xF0000000;
+        /* reset the channels: they stop until set active again */
+        mal->txcasr &= ~(val & 0xF0000000);
         break;
     case MAL0_TXEOBISR:
         /* Read/clear */
@@ -153,10 +343,20 @@ static void dcr_write_mal(void *opaque, int dcrn, uint32_t val)
         mal->txdeir &= ~val;
         break;
     case MAL0_RXCASR:
-        mal->rxcasr = val & 0xC0000000;
+        for (i = 0; i < mal->rxcnum; i++) {
+            if (val & ~mal->rxcasr & mal_rx_bit(mal, i)) {
+                mal->rxcur[i] = mal->rxctpr[i];
+            }
+        }
+        mal->rxcasr |= val & 0xC0000000;
+        for (i = 0; i < mal->rxcnum; i++) {
+            if (val & mal_rx_bit(mal, i)) {
+                mal_rx_notify(mal, i);
+            }
+        }
         break;
     case MAL0_RXCARR:
-        mal->rxcarr = val & 0xC0000000;
+        mal->rxcasr &= ~(val & 0xC0000000);
         break;
     case MAL0_RXEOBISR:
         /* Read/clear */
@@ -165,17 +365,26 @@ static void dcr_write_mal(void *opaque, int dcrn, uint32_t val)
     case MAL0_RXDEIR:
         /* Read/clear */
         mal->rxdeir &= ~val;
+        for (i = 0; i < mal->rxcnum; i++) {
+            if (val & mal_rx_bit(mal, i)) {
+                mal_rx_notify(mal, i);
+            }
+        }
         break;
     }
     if (dcrn >= MAL0_TXCTP0R && dcrn < MAL0_TXCTP0R + mal->txcnum) {
         mal->txctpr[dcrn - MAL0_TXCTP0R] = val;
+        mal->txcur[dcrn - MAL0_TXCTP0R] = val;
     }
     if (dcrn >= MAL0_RXCTP0R && dcrn < MAL0_RXCTP0R + mal->rxcnum) {
         mal->rxctpr[dcrn - MAL0_RXCTP0R] = val;
+        mal->rxcur[dcrn - MAL0_RXCTP0R] = val;
     }
     if (dcrn >= MAL0_RCBS0 && dcrn < MAL0_RCBS0 + mal->rxcnum) {
         mal->rcbs[dcrn - MAL0_RCBS0] = val & 0x000000FF;
+        mal_rx_notify(mal, dcrn - MAL0_RCBS0);
     }
+    ppc4xx_mal_update_irq(mal);
 }
 
 static void ppc4xx_mal_realize(DeviceState *dev, Error **errp)
@@ -192,6 +401,10 @@ static void ppc4xx_mal_realize(DeviceState *dev, Error **errp)
     mal->txctpr = g_new0(uint32_t, mal->txcnum);
     mal->rxctpr = g_new0(uint32_t, mal->rxcnum);
     mal->rcbs = g_new0(uint32_t, mal->rxcnum);
+    mal->txcur = g_new0(uint32_t, mal->txcnum);
+    mal->rxcur = g_new0(uint32_t, mal->rxcnum);
+    mal->rx_notify = g_new0(typeof(*mal->rx_notify), mal->rxcnum);
+    mal->rx_notify_opaque = g_new0(void *, mal->rxcnum);
 
     for (i = 0; i < ARRAY_SIZE(mal->irqs); i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(dev), &mal->irqs[i]);
@@ -227,6 +440,10 @@ static void ppc4xx_mal_finalize(Object *obj)
     Ppc4xxMalState *mal = PPC4xx_MAL(obj);
 
     g_free(mal->rcbs);
+    g_free(mal->txcur);
+    g_free(mal->rxcur);
+    g_free(mal->rx_notify);
+    g_free(mal->rx_notify_opaque);
     g_free(mal->rxctpr);
     g_free(mal->txctpr);
 }
@@ -234,6 +451,7 @@ static void ppc4xx_mal_finalize(Object *obj)
 static const Property ppc4xx_mal_properties[] = {
     DEFINE_PROP_UINT8("txc-num", Ppc4xxMalState, txcnum, 0),
     DEFINE_PROP_UINT8("rxc-num", Ppc4xxMalState, rxcnum, 0),
+    DEFINE_PROP_UINT8("rx-group", Ppc4xxMalState, rx_group, 0),
 };
 
 static void ppc4xx_mal_class_init(ObjectClass *oc, const void *data)

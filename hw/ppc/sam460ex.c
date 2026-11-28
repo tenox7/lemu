@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2012 François Revol
  * Copyright (c) 2016-2019 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This file is derived from hw/ppc440_bamboo.c,
  * the copyright for that material belongs to the original owners.
@@ -39,6 +40,8 @@
 #include "hw/ppc/fdt.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/intc/ppc-uic.h"
+#include "hw/ppc/ppc4xx.h"
+#include "net/net.h"
 
 #include <libfdt.h>
 
@@ -246,6 +249,9 @@ static void sam460ex_init(MachineState *machine)
 {
     MemoryRegion *l2cache_ram = g_new(MemoryRegion, 1);
     DeviceState *uic[4];
+    DeviceState *emac[2];
+    uint8_t *bootstrap;
+    Ppc4xxMalState *mal;
     int i;
     PCIBus *pci_bus;
     USBBus *usb_bus;
@@ -346,6 +352,13 @@ static void sam460ex_init(MachineState *machine)
     smbus_eeprom_init_one(i2c, 0x50, spd_data);
     /* RTC */
     i2c_slave_create_simple(i2c, "m41t80", 0x68);
+    /*
+     * The bootstrap EEPROM. MorphOS reads the MAC address of EMAC0 from
+     * offset 0x14; the board sets it to the first EMAC's address below.
+     */
+    bootstrap = g_malloc(256);
+    memset(bootstrap, 0xff, 256);
+    smbus_eeprom_init_one(i2c, 0x52, bootstrap);
 
     dev = sysbus_create_simple(TYPE_PPC4xx_I2C, 0x4ef600800,
                                qdev_get_gpio_in(uic[0], 3));
@@ -364,16 +377,65 @@ static void sam460ex_init(MachineState *machine)
     /* System DCRs */
     ppc4xx_sdr_init(env);
 
-    /* MAL */
+    /* MAL: each EMAC has a group of 8 receive channels */
     dev = qdev_new(TYPE_PPC4xx_MAL);
     qdev_prop_set_uint8(dev, "txc-num", 4);
     qdev_prop_set_uint8(dev, "rxc-num", 16);
+    qdev_prop_set_uint8(dev, "rx-group", 8);
     ppc4xx_dcr_realize(PPC4xx_DCR_DEVICE(dev), cpu, &error_fatal);
     object_unref(OBJECT(dev));
+    mal = PPC4xx_MAL(dev);
     sbdev = SYS_BUS_DEVICE(dev);
-    for (i = 0; i < ARRAY_SIZE(PPC4xx_MAL(dev)->irqs); i++) {
-        sysbus_connect_irq(sbdev, i, qdev_get_gpio_in(uic[2], 3 + i));
+    /* TXEOB, RXEOB, TXDE, RXDE; SERR (UIC2 3) is not raised */
+    sysbus_connect_irq(sbdev, 0, qdev_get_gpio_in(uic[2], 6));
+    sysbus_connect_irq(sbdev, 1, qdev_get_gpio_in(uic[2], 7));
+    sysbus_connect_irq(sbdev, 2, qdev_get_gpio_in(uic[2], 4));
+    sysbus_connect_irq(sbdev, 3, qdev_get_gpio_in(uic[2], 5));
+
+    /*
+     * The two gigabit EMAC4s behind the RGMII bridge. EMAC0 sends on MAL
+     * channel 0 and receives on 0, EMAC1 on 1 and 8. Their PHYs are at 0
+     * and 1, both on the MDIO bus of EMAC0.
+     */
+    sysbus_create_simple(TYPE_PPC4XX_RGMII, 0x4ef601500, NULL);
+    for (i = 0; i < 2; i++) {
+        NICInfo *nd = qemu_find_nic_info(TYPE_PPC4XX_EMAC, true, NULL);
+        MACAddr mac;
+
+        emac[i] = qdev_new(TYPE_PPC4XX_EMAC);
+        /* in the tree now: the links between the two need their paths */
+        object_property_add_child(OBJECT(machine), i ? "emac1" : "emac0",
+                                  OBJECT(emac[i]));
+        object_property_set_link(OBJECT(emac[i]), "mal", OBJECT(mal),
+                                 &error_abort);
+        qdev_prop_set_bit(emac[i], "emac4", true);
+        qdev_prop_set_uint32(emac[i], "tx-channel", i);
+        qdev_prop_set_uint32(emac[i], "rx-channel", i * 8);
+        qdev_prop_set_uint32(emac[i], "phy-addr", i);
+        if (nd) {
+            qdev_set_nic_properties(emac[i], nd);
+            mac = nd->macaddr;
+        } else {
+            qemu_macaddr_default_if_unset(&mac);
+            qdev_prop_set_macaddr(emac[i], "mac", mac.a);
+        }
+        if (i == 0) {
+            memcpy(bootstrap + 0x14, mac.a, sizeof(mac.a));
+        }
     }
+    object_property_set_link(OBJECT(emac[0]), "mdio-peer", OBJECT(emac[1]),
+                             &error_abort);
+    object_property_set_link(OBJECT(emac[1]), "mdio-peer", OBJECT(emac[0]),
+                             &error_abort);
+    for (i = 0; i < 2; i++) {
+        sbdev = SYS_BUS_DEVICE(emac[i]);
+        sysbus_realize_and_unref(sbdev, &error_fatal);
+        sysbus_mmio_map(sbdev, 0, 0x4ef600e00 + i * 0x100);
+        sysbus_connect_irq(sbdev, 0, qdev_get_gpio_in(uic[2], 16 + i));
+    }
+    /* the PHY's interrupt: UIC0 input 9, level, low, as MorphOS sets it */
+    qdev_connect_gpio_out_named(emac[0], "phy-irq", 0,
+                                qdev_get_gpio_in(uic[0], 9));
 
     /* DMA */
     ppc4xx_dma_init(env, 0x200);
@@ -398,8 +460,17 @@ static void sam460ex_init(MachineState *machine)
     sysbus_connect_irq(sbdev, 0, qdev_get_gpio_in(uic[2], 30));
     usb_bus = USB_BUS(object_resolve_type_unambiguous(TYPE_USB_BUS,
                                                       &error_abort));
-    usb_create_simple(usb_bus, "usb-kbd");
-    usb_create_simple(usb_bus, "usb-mouse");
+    /*
+     * A keyboard and a mouse are full speed devices on the OHCI companion,
+     * as on the real board. As high speed devices on the EHCI MorphOS polls
+     * the keyboard every few hundred milliseconds and drops keys.
+     */
+    for (i = 0; i < 2; i++) {
+        USBDevice *ud = USB_DEVICE(qdev_new(i ? "usb-mouse" : "usb-kbd"));
+
+        qdev_prop_set_uint32(DEVICE(ud), "usb_version", 1);
+        usb_realize_and_unref(ud, usb_bus, &error_fatal);
+    }
 
     /* PCIe buses */
     dev = qdev_new(TYPE_PPC460EX_PCIE_HOST);
@@ -517,6 +588,7 @@ static void sam460ex_machine_init(MachineClass *mc)
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("460exb");
     mc->default_ram_size = 512 * MiB;
     mc->default_ram_id = "ppc4xx.sdram";
+    mc->default_nic = TYPE_PPC4XX_EMAC;
 }
 
 DEFINE_MACHINE("sam460ex", sam460ex_machine_init)

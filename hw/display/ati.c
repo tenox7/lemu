@@ -2,6 +2,7 @@
  * QEMU ATI SVGA emulation
  *
  * Copyright (c) 2019 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  */
@@ -46,6 +47,8 @@ static const struct {
     { "rv100", PCI_DEVICE_ID_ATI_RADEON_QY },
     { "rv200", PCI_DEVICE_ID_ATI_RADEON_QW },
     { "es1000", PCI_DEVICE_ID_ATI_RADEON_ES1000 },
+    { "rv250", PCI_DEVICE_ID_ATI_RADEON_LF },
+    { "rv280", PCI_DEVICE_ID_ATI_RADEON_9250 },
 };
 
 enum { VGA_MODE, EXT_MODE };
@@ -63,18 +66,371 @@ static void ati_vga_set_offset(VGACommonState *vga, uint32_t offs)
     vga->vbe_start_addr = offs / 4;
 }
 
+static int ati_nonsurf_xm(ATIVGAState *s);
+
+/* the display reads the visible buffer in the order it is kept in */
 static bool ati_big_endian_fb(ATIVGAState *s)
 {
-    /* Radeon has the frame buffer aperture swap controls in SURFACE_CNTL */
-    return s->regs.config_cntl & (APER_0_ENDIAN | APER_1_ENDIAN) ||
-           s->regs.surface_cntl & (NONSURF_AP0_SWP_16BPP |
-                                   NONSURF_AP0_SWP_32BPP |
-                                   NONSURF_AP1_SWP_16BPP |
-                                   NONSURF_AP1_SWP_32BPP);
+    if (!ati_is_r100_r200(s)) {
+        /* the Radeon has the aperture swap controls in SURFACE_CNTL */
+        return s->regs.config_cntl & (APER_0_ENDIAN | APER_1_ENDIAN) ||
+               s->regs.surface_cntl & (NONSURF_AP0_SWP_16BPP |
+                                       NONSURF_AP0_SWP_32BPP |
+                                       NONSURF_AP1_SWP_16BPP |
+                                       NONSURF_AP1_SWP_32BPP);
+    }
+    return (s->vis_pin ? s->vis_xm : ati_nonsurf_xm(s)) != 0;
+}
+
+/*
+ * Byte swapping of the frame buffer apertures. QEMU keeps the video memory
+ * as the CPU sees it through the apertures, while the engines see it little
+ * endian; the swap is a byte address mask within each dword: 1 swaps the
+ * bytes of each 16 bit word, 3 those of each 32 bit word. The swap of
+ * aperture 0 counts, or that of aperture 1 if 0 does not swap.
+ */
+static int ati_swp_xm(uint32_t v)
+{
+    if (v & (NONSURF_AP0_SWP_32BPP | NONSURF_AP0_SWP_16BPP)) {
+        return v & NONSURF_AP0_SWP_32BPP ? 3 : 1;
+    }
+    if (v & (NONSURF_AP1_SWP_32BPP | NONSURF_AP1_SWP_16BPP)) {
+        return v & NONSURF_AP1_SWP_32BPP ? 3 : 1;
+    }
+    return 0;
+}
+
+/* the swap outside the surfaces */
+static int ati_nonsurf_xm(ATIVGAState *s)
+{
+    int xm = ati_swp_xm(s->regs.surface_cntl);
+    int ap;
+
+    for (ap = 0; !xm && ap < 2; ap++) {
+        switch ((s->regs.config_cntl >> (ap * 2)) & 3) {
+        case 1:
+            xm = 1;
+            break;
+        case 2:
+            xm = 3;
+            break;
+        }
+    }
+    return xm;
+}
+
+/*
+ * Surface n covers [*lo, *hi] of the video memory with its own swap
+ * (SURFACE_INFO uses the bits of SURFACE_CNTL). The bounds are offsets in
+ * the video memory, in bits 26 to 10, so in 1 KB steps: AmigaOS 4.0 gives
+ * GPU addresses, whose top bits the surface does not look at, and AmigaOS
+ * 4.1 Final Edition offsets with an upper bound of 0xffffffff. A surface
+ * with its upper bound below its lower one is off.
+ */
+static bool ati_surface(ATIVGAState *s, int n, uint32_t *lo, uint32_t *hi,
+                        int *xm)
+{
+    uint32_t base = SURFACE0_LOWER_BOUND + n * 0x10;
+    uint32_t lower = s->mmregs[base / 4] & 0x07fffc00;
+    uint32_t upper = s->mmregs[(base + 4) / 4] | 0x3ff;
+
+    upper &= 0x07ffffff;
+    if (!s->mmregs[(base + 4) / 4] || upper <= lower ||
+        lower >= s->vga.vram_size) {
+        return false;
+    }
+    *lo = lower;
+    *hi = MIN(upper, s->vga.vram_size - 1);
+    *xm = ati_swp_xm(s->mmregs[(base + 8) / 4]);
+    return true;
+}
+
+int ati_vram_xm(ATIVGAState *s, uint32_t off)
+{
+    uint32_t lo, hi;
+    int n, xm;
+
+    if (!ati_is_r100_r200(s)) {
+        /* all of the memory is kept in the byte order of the display */
+        return s->vga.big_endian_fb ? 3 : 0;
+    }
+    for (n = 0; n < ATI_SURFACES; n++) {
+        if (ati_surface(s, n, &lo, &hi, &xm) && off >= lo && off <= hi) {
+            return xm;
+        }
+    }
+    if (s->vis_pin && off >= s->vis_lo && off <= s->vis_hi) {
+        return s->vis_xm;
+    }
+    return ati_nonsurf_xm(s);
+}
+
+/* reorders the bytes of the dwords in [lo, hi] by the byte address mask */
+static void ati_vram_permute(ATIVGAState *s, uint32_t lo, uint32_t hi,
+                             int mask)
+{
+    uint32_t *p, *end, v;
+
+    lo &= ~3;
+    if (!mask || lo >= s->vga.vram_size || hi < lo) {
+        return;
+    }
+    hi = MIN(hi | 3, s->vga.vram_size - 1);
+    p = (uint32_t *)(s->vga.vram_ptr + lo);
+    end = (uint32_t *)(s->vga.vram_ptr + hi + 1);
+    /* the same on hosts of either byte order */
+    switch (mask) {
+    case 1: /* the bytes of each 16 bit word */
+        for (; p < end; p++) {
+            v = *p;
+            *p = ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu);
+        }
+        break;
+    case 2: /* the 16 bit words */
+        for (; p < end; p++) {
+            v = *p;
+            *p = (v << 16) | (v >> 16);
+        }
+        break;
+    default: /* all four bytes */
+        for (; p < end; p++) {
+            *p = bswap32(*p);
+        }
+        break;
+    }
+}
+
+/*
+ * The CPU sees [lo, hi] with another swap: reorder the bytes of its dwords
+ * from the order of swap 'from' to that of swap 'to'.
+ */
+static void ati_vram_reswap(ATIVGAState *s, uint32_t lo, uint32_t hi,
+                            int from, int to)
+{
+    if (from == to || lo >= s->vga.vram_size) {
+        return;
+    }
+    ati_vram_permute(s, lo, hi, from ^ to);
+    hi = MIN(hi | 3, s->vga.vram_size - 1);
+    memory_region_set_dirty(&s->vga.vram, lo & ~3, hi + 1 - (lo & ~3));
+}
+
+/* the part of the video memory that the display shows */
+static bool ati_visible(ATIVGAState *s, uint32_t *lo, uint32_t *hi, int *bpp)
+{
+    VGACommonState *vga = &s->vga;
+    uint32_t len;
+
+    if (s->mode != EXT_MODE ||
+        !(vga->vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED)) {
+        return false;
+    }
+    *bpp = vga->vbe_regs[VBE_DISPI_INDEX_BPP];
+    *lo = vga->vbe_start_addr * 4;
+    len = vga->vbe_line_offset * vga->vbe_regs[VBE_DISPI_INDEX_YRES];
+    if (!len || *lo >= vga->vram_size) {
+        return false;
+    }
+    *hi = MIN(*lo + len, vga->vram_size) - 1;
+    return true;
+}
+
+/* whether the display can show pixels of bpp bits kept with swap xm */
+static bool ati_xm_displayable(int xm, int bpp)
+{
+    switch (bpp) {
+    case 32:
+        return xm == 0 || xm == 3;
+    case 15:
+    case 16:
+        return xm == 0 || xm == 1;
+    default:
+        return true;
+    }
+}
+
+/* the swap whose width is that of the pixels: 32 or 16 bit */
+static int ati_xm_of_depth(int bpp)
+{
+    switch (bpp) {
+    case 32:
+        return 3;
+    case 15:
+    case 16:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/*
+ * The visible buffer goes back to the order of the memory around it, as
+ * the display is about to show another one.
+ */
+static void ati_vis_unpin(ATIVGAState *s)
+{
+    if (s->vis_pin) {
+        s->vis_pin = false;
+        ati_vram_reswap(s, s->vis_lo, s->vis_hi, s->vis_xm,
+                        ati_nonsurf_xm(s));
+    }
+}
+
+/*
+ * The swap outside the surfaces changes: the memory that no surface
+ * covers is reordered to what the CPU now sees, so that the CPU and the
+ * engines agree whichever swap was on when it was written. Drivers flip it
+ * between bitmaps: AmigaOS writes 16 bit bitmaps with the 16 bit swap and
+ * 32 bit ones with the 32 bit swap, and turns it off for 8 bit ones, many
+ * times for each window it opens.
+ * The visible buffer only follows into the swap of its pixels' width (the
+ * 32 bit one for 32 bit pixels, the 16 bit one for 16 bit ones), and out
+ * of an order the display cannot show (32 bit pixels with the 16 bit swap,
+ * 16 bit ones with the 32 bit swap) into one it can; otherwise it keeps
+ * its order. AmigaOS 4.1 still draws its 32 bit screen as with the 32 bit
+ * swap while it is off: following it there turned the screen's red and
+ * blue around for a moment now and then, and drew checkboxes wrongly.
+ */
+static void ati_nonsurf_reswap(ATIVGAState *s, int from, int to)
+{
+    uint32_t lo[ATI_SURFACES + 1], hi[ATI_SURFACES + 1];
+    uint32_t start = 0, end, vlo = 0, vhi = 0;
+    int n, i, k = 0, xm, bpp = 0, cur, target;
+    bool vis;
+
+    if (from == to || !ati_is_r100_r200(s)) {
+        return;
+    }
+    for (n = 0; n < ATI_SURFACES; n++) {
+        if (ati_surface(s, n, &lo[k], &hi[k], &xm)) {
+            k++;
+        }
+    }
+    vis = ati_visible(s, &vlo, &vhi, &bpp);
+    if (s->vis_pin && (!vis || vlo != s->vis_lo || vhi != s->vis_hi)) {
+        /* should not happen: the pin goes when the display changes */
+        ati_vram_reswap(s, s->vis_lo, s->vis_hi, s->vis_xm, from);
+        s->vis_pin = false;
+    }
+    if (vis) {
+        lo[k] = vlo;
+        hi[k] = vhi;
+        k++;
+    }
+    while (start < s->vga.vram_size) {
+        /* skip the surfaces (and the visible buffer) that cover start */
+        for (i = 0; i < k; i++) {
+            if ((lo[i] & ~3) <= start && hi[i] >= start) {
+                start = (hi[i] | 3) + 1;
+                i = -1;
+            }
+        }
+        if (start >= s->vga.vram_size) {
+            break;
+        }
+        /* reorder up to the next one */
+        end = s->vga.vram_size;
+        for (i = 0; i < k; i++) {
+            if ((lo[i] & ~3) > start) {
+                end = MIN(end, lo[i] & ~3);
+            }
+        }
+        ati_vram_permute(s, start, end - 1, from ^ to);
+        start = end;
+    }
+    if (vis) {
+        cur = s->vis_pin ? s->vis_xm : from;
+        if (to == ati_xm_of_depth(bpp) ||
+            (!ati_xm_displayable(cur, bpp) && ati_xm_displayable(to, bpp))) {
+            target = to;
+        } else {
+            target = cur;
+        }
+        ati_vram_reswap(s, vlo, vhi, cur, target);
+        s->vis_pin = target != to;
+        s->vis_lo = vlo;
+        s->vis_hi = vhi;
+        s->vis_xm = target;
+        s->vga.big_endian_fb = target != 0;
+    }
+    trace_ati_nonsurf_swap(from, to, vis, vlo, vhi, s->vis_pin,
+                           s->vga.big_endian_fb);
+}
+
+static inline void ati_reg_write_offs(uint32_t *reg, int offs,
+                                      uint64_t data, unsigned int size);
+
+/*
+ * The R200 still takes the R100 registers of texture units 0 to 2 (filter,
+ * format, offset, size and pitch of non power of two textures), as the
+ * MorphOS Radeon driver sets them; they write the R200 ones. PP_CNTL and
+ * the viewport have second addresses.
+ */
+static uint32_t ati_r200_alias(uint32_t addr)
+{
+    int n;
+
+    /* PP_CNTL, also written at 0x2cc0 by AmigaOS 4.1 and TinyGL */
+    if (addr == 0x1c38) {
+        return 0x2cc0;
+    }
+    if (addr == 0x2cc0) {
+        return 0x1c38;
+    }
+    /*
+     * SE_VPORT_XSCALE to _ZOFFSET: Mesa writes them at 0x1d98, TinyGL at
+     * 0x2098
+     */
+    if (addr >= 0x1d98 && addr <= 0x1dac) {
+        return addr + 0x300;
+    }
+    if (addr >= 0x2098 && addr <= 0x20ac) {
+        return addr - 0x300;
+    }
+    if (addr >= 0x1c54 && addr < 0x1c54 + 3 * 0x18) {
+        n = (addr - 0x1c54) / 0x18;
+        switch ((addr - 0x1c54) % 0x18) {
+        case 0: /* PP_TXFILTER */
+            return 0x2c00 + n * 0x20;
+        case 4: /* PP_TXFORMAT */
+            return 0x2c04 + n * 0x20;
+        case 8: /* PP_TXOFFSET */
+            return 0x2d00 + n * 0x18;
+        }
+        return 0;
+    }
+    if (addr >= 0x1d04 && addr < 0x1d04 + 3 * 8) {
+        n = (addr - 0x1d04) / 8;
+        /* PP_TEX_SIZE and PP_TEX_PITCH */
+        return (addr & 4 ? 0x2c0c : 0x2c10) + n * 0x20;
+    }
+    return 0;
+}
+
+/*
+ * A surface register changes: the old surface's memory goes back to the
+ * swap outside the surfaces, the new one's takes its own swap.
+ */
+static void ati_surface_write(ATIVGAState *s, hwaddr addr, uint64_t data,
+                              unsigned int size)
+{
+    int n = (addr - SURFACE0_LOWER_BOUND) / 0x10;
+    int nxm = ati_nonsurf_xm(s);
+    uint32_t lo, hi;
+    int xm;
+
+    if (ati_surface(s, n, &lo, &hi, &xm)) {
+        ati_vram_reswap(s, lo, hi, xm, nxm);
+    }
+    ati_reg_write_offs(&s->mmregs[addr / 4], addr & 3, data, size);
+    if (ati_surface(s, n, &lo, &hi, &xm)) {
+        ati_vram_reswap(s, lo, hi, nxm, xm);
+    }
 }
 
 static void ati_vga_switch_mode(ATIVGAState *s)
 {
+    ati_vis_unpin(s);
     DPRINTF("%d -> %d\n",
             s->mode, !!(s->regs.crtc_gen_cntl & CRTC2_EXT_DISP_EN));
     if (s->regs.crtc_gen_cntl & CRTC2_EXT_DISP_EN) {
@@ -148,24 +504,90 @@ static void ati_vga_switch_mode(ATIVGAState *s)
 }
 
 /*
- * Radeon cursor mode 1, which AIX uses on the ES1000: 64x64 pixels of 32
- * bits in the byte order of the frame buffer. The low 24 bits are a
- * colour and the top 8 an AND mask, as in the mono mode: a mask of 0
- * shows the colour, a mask of 0xff XORs it into the screen. The cursors
- * of AIX 5.3 only have opaque pixels and 0xff000000, which is clear.
+ * Radeon cursor modes other than mono: 64x64 pixels of 32 bits.
+ * Mode 1, which AIX uses on the ES1000: the low 24 bits are a colour and
+ * the top 8 an AND mask, as in the mono mode: a mask of 0 shows the
+ * colour, a mask of 0xff XORs it into the screen. The cursors of AIX 5.3
+ * only have opaque pixels and 0xff000000, which is clear.
+ * Modes 2 and 3 are ARGB, blended into the screen by their alpha: 2 with
+ * the colour already multiplied by it (X.org's cursors), 3 without
+ * (AmigaOS 4.1 and MorphOS, whose clear pixels are white with alpha 0).
  */
-static bool ati_cursor_24bpp(ATIVGAState *s)
+static uint32_t ati_cursor_mode(ATIVGAState *s)
 {
-    return s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF &&
-           (s->regs.crtc_gen_cntl & CRTC_CUR_MODE_MASK) ==
-           CRTC_CUR_MODE_24BPP_AND;
+    uint32_t mode = s->regs.crtc_gen_cntl & CRTC_CUR_MODE_MASK;
+
+    if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+        return 0;
+    }
+    /* the ARGB modes only on the R100 and R200, the others show mono */
+    if (!ati_is_r100_r200(s) && mode != CRTC_CUR_MODE_24BPP_AND) {
+        return 0;
+    }
+    return mode;
 }
 
+static bool ati_cursor_24bpp(ATIVGAState *s)
+{
+    return ati_cursor_mode(s) == CRTC_CUR_MODE_24BPP_AND;
+}
+
+static bool ati_cursor_argb(ATIVGAState *s)
+{
+    uint32_t mode = ati_cursor_mode(s);
+
+    return mode == CRTC_CUR_MODE_ARGB_PREMULT || mode == CRTC_CUR_MODE_ARGB;
+}
+
+static bool ati_cursor_32bpp(ATIVGAState *s)
+{
+    return ati_cursor_24bpp(s) || ati_cursor_argb(s);
+}
+
+/* a pixel as the display reads it, through the swap of its memory */
 static uint32_t ati_cursor_pixel(ATIVGAState *s, uint32_t off)
 {
-    const uint8_t *p = &s->vga.vram_ptr[off];
+    const uint8_t *p = s->vga.vram_ptr;
+    int xm = ati_vram_xm(s, off);
+    uint32_t v = 0;
 
-    return s->vga.big_endian_fb ? ldl_be_p(p) : ldl_le_p(p);
+    for (int i = 0; i < 4; i++) {
+        v |= (uint32_t)p[(off + i) ^ xm] << (i * 8);
+    }
+    return v;
+}
+
+/* an ARGB cursor pixel without the alpha multiplied in, as the UIs take */
+static uint32_t ati_cursor_argb_pixel(ATIVGAState *s, uint32_t px)
+{
+    uint32_t a = px >> 24, v = a << 24;
+
+    if (!a) {
+        return 0;
+    }
+    if (ati_cursor_mode(s) == CRTC_CUR_MODE_ARGB) {
+        return px;
+    }
+    for (int sh = 0; sh < 24; sh += 8) {
+        v |= MIN(((px >> sh) & 0xff) * 255 / a, 255) << sh;
+    }
+    return v;
+}
+
+/* blends an ARGB cursor pixel into a screen pixel */
+static uint32_t ati_cursor_blend(ATIVGAState *s, uint32_t px, uint32_t dst)
+{
+    uint32_t a = px >> 24, v = 0xff000000;
+    bool premult = ati_cursor_mode(s) == CRTC_CUR_MODE_ARGB_PREMULT;
+
+    for (int sh = 0; sh < 24; sh += 8) {
+        uint32_t c = (px >> sh) & 0xff, d = (dst >> sh) & 0xff;
+
+        c = premult ? c + d * (255 - a) / 255 :
+                      (c * a + d * (255 - a)) / 255;
+        v |= MIN(c, 255) << sh;
+    }
+    return v;
 }
 
 /*
@@ -183,6 +605,23 @@ static int ati_cursor_xoff(uint32_t hv_offs)
 static int ati_cursor_lines(uint32_t hv_offs)
 {
     return 64 - (hv_offs & 0x3f);
+}
+
+/* what the host cursor is made from: its image, mode, colours and offsets */
+static uint32_t ati_cursor_hash(ATIVGAState *s)
+{
+    uint32_t img = s->regs.cur_offset & 0x07fffff0;
+    uint32_t len = ati_cursor_32bpp(s) ? 64 * 64 * 4 : 64 * 16;
+    uint32_t regs[] = {
+        ati_cursor_mode(s), s->regs.cur_color0, s->regs.cur_color1,
+        s->regs.cur_hv_offs, ati_vram_xm(s, img),
+    };
+    uint32_t h = qemu_cursor_shape(0, regs, sizeof(regs));
+
+    if (img + len <= s->vga.vram_size) {
+        h = qemu_cursor_shape(h, s->vga.vram_ptr + img, len);
+    }
+    return h;
 }
 
 /*
@@ -206,10 +645,14 @@ static unsigned ati_fb_swap_xor(ATIVGAState *s)
     return 1;
 }
 
-/* One line of a mono cursor plane: 64 pixels, the leftmost in the top bit */
+/*
+ * One line of a mono cursor plane: 64 pixels, the leftmost in the top bit.
+ * The R100 and R200 keep the frame buffer in their own swap model and read
+ * the mono planes as they are stored, as they did before.
+ */
 static uint64_t ati_cursor_bits(ATIVGAState *s, uint32_t off)
 {
-    unsigned x = ati_fb_swap_xor(s);
+    unsigned x = ati_is_r100_r200(s) ? 0 : ati_fb_swap_xor(s);
     uint64_t v = 0;
 
     for (int i = 0; i < 8; i++) {
@@ -235,21 +678,26 @@ static void ati_cursor_define(ATIVGAState *s)
     if ((s->regs.cur_offset & BIT(31)) || s->cursor_guest_mode) {
         return; /* Do not update cursor if locked or rendered by guest */
     }
+    s->cursor_hash = ati_cursor_hash(s);
     srcoff = s->regs.cur_offset & 0x07fffff0;
-    if (ati_cursor_24bpp(s)) {
+    if (ati_cursor_32bpp(s)) {
+        bool argb = ati_cursor_argb(s);
+
         if (srcoff > s->vga.vram_size - 64 * 64 * 4) {
             return;
         }
         c = cursor_alloc(64, 64);
         for (int i = 0; i < 64; i++) {
             for (int j = 0; j < 64; j++) {
-                uint32_t px = 0xff000000; /* clear */
+                uint32_t px = argb ? 0 : 0xff000000; /* clear */
 
                 if (i < lines && j < 64 - xoff) {
                     px = ati_cursor_pixel(s, srcoff + i * 64 * 4 +
                                              (j + xoff) * 4);
                 }
-                if (!(px & 0xff000000)) {
+                if (argb) {
+                    c->data[i * 64 + j] = ati_cursor_argb_pixel(s, px);
+                } else if (!(px & 0xff000000)) {
                     c->data[i * 64 + j] = px | 0xff000000;
                 } else if (px & 0xffffff) {
                     /* the host cursor cannot XOR, show it black */
@@ -293,7 +741,7 @@ static bool ati_cursor_state(VGACommonState *vga, QemuCursorState *cs)
     ATIVGAState *s = container_of(vga, ATIVGAState, vga);
     uint32_t offs = s->regs.cur_hv_offs;
     uint32_t img = s->regs.cur_offset & 0x07fffff0;
-    uint32_t len = ati_cursor_24bpp(s) ? 64 * 64 * 4 : 64 * 16;
+    uint32_t len = ati_cursor_32bpp(s) ? 64 * 64 * 4 : 64 * 16;
 
     cs->visible = s->regs.crtc_gen_cntl & CRTC2_CUR_EN;
     /* less the part hidden beyond the left and top edges */
@@ -351,7 +799,9 @@ static void ati_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
     }
     dp = &dp[vga->hw_cursor_x];
     h = ((s->regs.crtc_h_total_disp >> 16) + 1) * 8;
-    if (ati_cursor_24bpp(s)) {
+    if (ati_cursor_32bpp(s)) {
+        bool argb = ati_cursor_argb(s);
+
         srcoff = s->cursor_offset + (scr_y - vga->hw_cursor_y) * 64 * 4;
         if (srcoff > s->vga.vram_size - 64 * 4) {
             return;
@@ -363,7 +813,9 @@ static void ati_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
             if (vga->hw_cursor_x + i >= h) {
                 return; /* end of screen, don't span to next line */
             }
-            if (px & 0xff000000) {
+            if (argb) {
+                dp[i] = ati_cursor_blend(s, px, dp[i]);
+            } else if (px & 0xff000000) {
                 dp[i] ^= px & 0xffffff;
             } else {
                 dp[i] = px | 0xff000000;
@@ -425,8 +877,29 @@ static void ati_vga_vblank_irq(void *opaque)
 
     timer_mod(&s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
               NANOSECONDS_PER_SECOND / 60);
-    s->regs.gen_int_status |= CRTC_VBLANK_INT;
+    /*
+     * On the R100 and R200 the status bits are set every frame, enabled or
+     * not: drivers poll them to wait for the vertical retrace (AmigaOS
+     * waits for VSYNC). The others only run the timer while the VBLANK
+     * interrupt is on.
+     */
+    if (!ati_is_r100_r200(s)) {
+        s->regs.gen_int_status |= CRTC_VBLANK_INT;
+        ati_vga_update_irq(s);
+        return;
+    }
+    s->regs.gen_int_status |= CRTC_VBLANK_INT | CRTC_VSYNC_INT |
+                              RADEON_CRTC2_VBLANK_STAT;
     ati_vga_update_irq(s);
+    /*
+     * Guests also change the cursor's image in place, without writing a
+     * cursor register (busy pointers): the host's copy follows it.
+     */
+    if (!s->cursor_guest_mode && (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) &&
+        !(s->regs.cur_offset & BIT(31)) &&
+        ati_cursor_hash(s) != s->cursor_hash) {
+        ati_cursor_define(s);
+    }
 }
 
 static inline uint32_t ati_reg_read_offs(uint32_t reg, int offs,
@@ -732,6 +1205,14 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
                       "Read from write-only register 0x%x\n", (unsigned)addr);
         break;
     default:
+        /*
+         * On the R100 and R200, registers we do not model read back what
+         * was written; on the others they read 0.
+         */
+        if (ati_is_r100_r200(s) && !ati_cp_mm_read(s, addr, size, &val) &&
+            addr < memory_region_size(&s->mm)) {
+            val = ati_reg_read_offs(s->mmregs[addr / 4], addr & 3, size);
+        }
         break;
     }
     if (addr < CUR_OFFSET || addr > CUR_CLR1 || ATI_DEBUG_HW_CURSOR) {
@@ -767,8 +1248,7 @@ static void ati_update_default_pitch_offset(ATIVGAState *s)
     }
 }
 
-static void ati_mm_write(void *opaque, hwaddr addr,
-                           uint64_t data, unsigned int size)
+void ati_mm_write(void *opaque, hwaddr addr, uint64_t data, unsigned int size)
 {
     ATIVGAState *s = opaque;
 
@@ -827,7 +1307,10 @@ static void ati_mm_write(void *opaque, hwaddr addr,
     }
     case GEN_INT_CNTL:
         s->regs.gen_int_cntl = data;
-        if (data & CRTC_VBLANK_INT) {
+        if (ati_is_r100_r200(s)) {
+            /* the frame timer always runs, see ati_vga_vblank_irq() */
+            ati_vga_update_irq(s);
+        } else if (data & CRTC_VBLANK_INT) {
             ati_vga_vblank_irq(s);
         } else {
             timer_del(&s->vblank_timer);
@@ -835,9 +1318,21 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         }
         break;
     case GEN_INT_STATUS:
-        data &= (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
-                 0x000f040fUL : 0xfc080effUL);
-        s->regs.gen_int_status &= ~data;
+        if (ati_is_r100_r200(s)) {
+            bool fire = data & RADEON_SW_INT_FIRE;
+
+            /* SW_INT_TEST is acked by writing it, as the other bits */
+            data &= (0xfc080effUL | RADEON_SW_INT_TEST) & ~RADEON_SW_INT_FIRE;
+            s->regs.gen_int_status &= ~data;
+            if (fire) {
+                /* the CP writes this to raise an interrupt (fences) */
+                s->regs.gen_int_status |= RADEON_SW_INT_TEST;
+            }
+        } else {
+            data &= (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
+                     0x000f040fUL : 0xfc080effUL);
+            s->regs.gen_int_status &= ~data;
+        }
         ati_vga_update_irq(s);
         break;
     case CRTC_GEN_CNTL ... CRTC_GEN_CNTL + 3:
@@ -868,8 +1363,10 @@ static void ati_mm_write(void *opaque, hwaddr addr,
                                        (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) != 0);
             }
         }
-        if ((val & (CRTC2_EXT_DISP_EN | CRTC2_EN)) !=
-            (s->regs.crtc_gen_cntl & (CRTC2_EXT_DISP_EN | CRTC2_EN))) {
+        if ((val ^ s->regs.crtc_gen_cntl) &
+            (CRTC2_EXT_DISP_EN | CRTC2_EN |
+             (ati_is_r100_r200(s) ? CRTC_PIX_WIDTH_MASK : 0))) {
+            /* MorphOS changes the depth while the CRTC stays on */
             ati_vga_switch_mode(s);
         }
         break;
@@ -959,32 +1456,61 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         vga_ioport_write(&s->vga, VGA_PEL_D, (data >> 12) & 0xff);
         vga_ioport_write(&s->vga, VGA_PEL_D, (data >> 2) & 0xff);
         break;
-    case CNFG_CNTL:
+    case CNFG_CNTL: {
+        int xm = ati_nonsurf_xm(s);
+
         s->regs.config_cntl = data;
+        ati_nonsurf_reswap(s, xm, ati_nonsurf_xm(s));
+        break;
+    }
+    case 0x2200 ... 0x220f: /* SE_TCL_VECTOR/SCALAR_INDX/DATA_REG */
+        if (ati_is_r100_r200(s) && size == 4 && !(addr & 3)) {
+            s->mmregs[addr / 4] = data;
+            trace_ati_reg_store(addr, data);
+            ati_tcl_write(s, addr, data);
+        }
         break;
     case SURFACE_CNTL:
         if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            int xm = ati_nonsurf_xm(s);
+
+            trace_ati_reg_store(addr, data);
             s->regs.surface_cntl = data;
+            ati_nonsurf_reswap(s, xm, ati_nonsurf_xm(s));
             if (s->mode == EXT_MODE) {
                 s->vga.big_endian_fb = ati_big_endian_fb(s);
             }
         }
         break;
     case CRTC_H_TOTAL_DISP:
-        s->regs.crtc_h_total_disp = data & 0x07ff07ff;
+        if (s->regs.crtc_h_total_disp != (data & 0x07ff07ff)) {
+            s->regs.crtc_h_total_disp = data & 0x07ff07ff;
+            if (ati_is_r100_r200(s) && s->mode == EXT_MODE) {
+                ati_vga_switch_mode(s);
+            }
+        }
         break;
     case CRTC_H_SYNC_STRT_WID:
         s->regs.crtc_h_sync_strt_wid = data & 0x17bf1fff;
         break;
     case CRTC_V_TOTAL_DISP:
-        s->regs.crtc_v_total_disp = data & 0x0fff0fff;
+        if (s->regs.crtc_v_total_disp != (data & 0x0fff0fff)) {
+            s->regs.crtc_v_total_disp = data & 0x0fff0fff;
+            if (ati_is_r100_r200(s) && s->mode == EXT_MODE) {
+                ati_vga_switch_mode(s);
+            }
+        }
         break;
     case CRTC_V_SYNC_STRT_WID:
         s->regs.crtc_v_sync_strt_wid = data & 0x9f0fff;
         break;
     case CRTC_OFFSET:
+        ati_vis_unpin(s);
         s->regs.crtc_offset = data & 0x87fffff8;
         ati_vga_set_offset(&s->vga, s->regs.crtc_offset & 0x07ffffff);
+        if (ati_is_r100_r200(s) && s->mode == EXT_MODE) {
+            s->vga.big_endian_fb = ati_big_endian_fb(s);
+        }
         break;
     case CRTC_OFFSET_CNTL:
         s->regs.crtc_offset_cntl = data; /* FIXME */
@@ -1324,7 +1850,25 @@ static void ati_mm_write(void *opaque, hwaddr addr,
             s->host_data.next = 0;
         }
         break;
+    case SURFACE0_LOWER_BOUND ... SURFACE0_LOWER_BOUND + ATI_SURFACES * 0x10 - 1:
+        if ((addr & 0xf) && ati_is_r100_r200(s)) {
+            ati_surface_write(s, addr, data, size);
+            break;
+        }
+        /* fall through */
     default:
+        /* only the R100 and R200 keep what is written to other registers */
+        if (ati_is_r100_r200(s) && !ati_cp_mm_write(s, addr, data, size) &&
+            addr < memory_region_size(&s->mm)) {
+            uint32_t alias;
+
+            ati_reg_write_offs(&s->mmregs[addr / 4], addr & 3, data, size);
+            trace_ati_reg_store(addr, s->mmregs[addr / 4]);
+            alias = ati_is_r200(s) ? ati_r200_alias(addr) : 0;
+            if (alias) {
+                s->mmregs[alias / 4] = s->mmregs[addr / 4];
+            }
+        }
         break;
     }
 }
@@ -1332,13 +1876,31 @@ static void ati_mm_write(void *opaque, hwaddr addr,
 /*
  * With APER_REG_ENDIAN set the register aperture swaps the bytes of each
  * 32-bit word, so a big endian host can use plain loads and stores (the
- * AIX X server does).
+ * AIX X server does). The command queue apertures are not swapped: their
+ * data goes to the CP as it is, in the little endian order of a ring
+ * buffer in memory, which is how the AmigaOS 4.1 Radeon driver writes its
+ * PIO packets there.
  */
+static bool ati_mm_aper_swapped(ATIVGAState *s, hwaddr addr)
+{
+    if (!(s->regs.config_cntl & APER_REG_ENDIAN)) {
+        return false;
+    }
+    if (ati_is_r100_r200(s) &&
+        ((addr >= RADEON_CP_CSQ_APER_PRIMARY &&
+          addr < RADEON_CP_CSQ_APER_PRIMARY + 0x200) ||
+         (addr >= RADEON_CP_CSQ_APER_INDIRECT &&
+          addr < RADEON_CP_CSQ_APER_INDIRECT + 0x100))) {
+        return false;
+    }
+    return true;
+}
+
 static uint64_t ati_mm_aper_read(void *opaque, hwaddr addr, unsigned int size)
 {
     ATIVGAState *s = opaque;
 
-    if (!(s->regs.config_cntl & APER_REG_ENDIAN)) {
+    if (!ati_mm_aper_swapped(s, addr)) {
         return ati_mm_read(s, addr, size);
     }
     switch (size) {
@@ -1356,7 +1918,7 @@ static void ati_mm_aper_write(void *opaque, hwaddr addr,
 {
     ATIVGAState *s = opaque;
 
-    if (!(s->regs.config_cntl & APER_REG_ENDIAN)) {
+    if (!ati_mm_aper_swapped(s, addr)) {
         ati_mm_write(s, addr, data, size);
         return;
     }
@@ -1407,9 +1969,11 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF &&
         s->dev_id != PCI_DEVICE_ID_ATI_RADEON_QY &&
         s->dev_id != PCI_DEVICE_ID_ATI_RADEON_QW &&
-        s->dev_id != PCI_DEVICE_ID_ATI_RADEON_ES1000) {
-        error_setg(errp, "Unknown ATI VGA device id, "
-                   "only 0x5046, 0x5159, 0x5157 and 0x515e are supported");
+        s->dev_id != PCI_DEVICE_ID_ATI_RADEON_ES1000 &&
+        s->dev_id != PCI_DEVICE_ID_ATI_RADEON_LF &&
+        s->dev_id != PCI_DEVICE_ID_ATI_RADEON_9250) {
+        error_setg(errp, "Unknown ATI VGA device id, only 0x5046, 0x5159, "
+                   "0x5157, 0x515e, 0x4c66 and 0x5960 are supported");
         return;
     }
     pci_set_word(dev->config + PCI_DEVICE_ID, s->dev_id);
@@ -1448,6 +2012,8 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     memory_region_init_io(&s->mm, OBJECT(s), &ati_mm_ops, s, "ati.mmregs",
                           s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
                           ATI_RAGE128_MMIO_SIZE : ATI_R100_MMIO_SIZE);
+    s->mmregs = g_new0(uint32_t, memory_region_size(&s->mm) / 4);
+    ati_cp_init(s);
     /* io space is alias to beginning of mmregs */
     memory_region_init_alias(&s->io, OBJECT(s), "ati.io", &s->mm, 0, 0x100);
 
@@ -1479,6 +2045,29 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mm);
 
+    /*
+     * The AGP capability of an AGP card: version 2.0, 1x, 2x and 4x, side
+     * band addressing, a request queue of 48. There is no AGP transfer
+     * mode behind it: the card still does PCI cycles, as it does in a slot
+     * where the host has no GART.
+     */
+    if (s->agp) {
+        int cap = pci_add_capability(dev, PCI_CAP_ID_AGP, 0x58,
+                                     PCI_AGP_SIZEOF, errp);
+        if (cap < 0) {
+            return;
+        }
+        pci_set_byte(dev->config + cap + PCI_AGP_VERSION, 0x20);
+        pci_set_long(dev->config + cap + PCI_AGP_STATUS,
+                     (47u << 24) | PCI_AGP_STATUS_SBA | PCI_AGP_STATUS_RATE4 |
+                     PCI_AGP_STATUS_RATE2 | PCI_AGP_STATUS_RATE1);
+        pci_set_long(dev->wmask + cap + PCI_AGP_COMMAND,
+                     PCI_AGP_COMMAND_RQ_MASK | PCI_AGP_COMMAND_SBA |
+                     PCI_AGP_COMMAND_AGP | PCI_AGP_COMMAND_64BIT |
+                     PCI_AGP_COMMAND_FW | PCI_AGP_COMMAND_RATE4 |
+                     PCI_AGP_COMMAND_RATE2 | PCI_AGP_COMMAND_RATE1);
+    }
+
     /* most interrupts are not yet emulated but MacOS needs at least VBlank */
     dev->config[PCI_INTERRUPT_PIN] = 1;
     timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, ati_vga_vblank_irq, s);
@@ -1488,7 +2077,15 @@ static void ati_vga_reset(DeviceState *dev)
 {
     ATIVGAState *s = ATI_VGA(dev);
 
-    timer_del(&s->vblank_timer);
+    if (ati_is_r100_r200(s)) {
+        /* the frame timer runs all the time, see ati_vga_vblank_irq() */
+        timer_mod(&s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / 60);
+        s->regs.gen_int_cntl = 0;
+        s->regs.gen_int_status = 0;
+    } else {
+        timer_del(&s->vblank_timer);
+    }
     ati_vga_update_irq(s);
 
     /* reset vga */
@@ -1502,6 +2099,9 @@ static void ati_vga_reset(DeviceState *dev)
     s->regs.rbbm_guicntl = 0;
     s->regs.config_cntl = 0;
     s->regs.surface_cntl = 0;
+    ati_cp_reset(s);
+    memset(&s->tcl, 0, sizeof(s->tcl));
+    s->vis_pin = false;
     /*
      * PLL registers (CLOCK_CNTL_INDEX/DATA): only stored. The dividers are
      * a 27 MHz reference / 12, as on many Radeons, so drivers that work
@@ -1521,6 +2121,8 @@ static void ati_vga_exit(PCIDevice *dev)
 
     timer_del(&s->vblank_timer);
     qemu_graphic_console_close(s->vga.con);
+    ati_cp_exit(s);
+    g_free(s->mmregs);
 }
 
 static const Property ati_vga_properties[] = {
@@ -1529,6 +2131,7 @@ static const Property ati_vga_properties[] = {
     DEFINE_PROP_UINT16("x-device-id", ATIVGAState, dev_id,
                        PCI_DEVICE_ID_ATI_RAGE128_PF),
     DEFINE_PROP_BOOL("guest_hwcursor", ATIVGAState, cursor_guest_mode, false),
+    DEFINE_PROP_BOOL("agp", ATIVGAState, agp, false),
     /* this is a debug option, prefer PROP_UINT over PROP_BIT for simplicity */
     DEFINE_PROP_UINT8("x-pixman", ATIVGAState, use_pixman, DEFAULT_X_PIXMAN),
     DEFINE_PROP_UINT64("x-linear-aper-size", ATIVGAState, linear_aper_sz, 0),

@@ -3,6 +3,7 @@
  * Copyright (c) 2004 Gianni Tedesco
  * Copyright (c) 2006 CodeSourcery
  * Copyright (c) 2006 Openedhand Ltd.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -172,10 +173,29 @@ static const TypeInfo ohci_nec_pci_info = {
     .class_init    = ohci_nec_pci_class_init,
 };
 
+/* The OHCI function of the Philips ISP1561 on the ACube Sam440ep */
+static void ohci_isp1561_pci_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->vendor_id = 0x1131;              /* Philips */
+    k->device_id = 0x1561;
+    k->revision = 0x11;
+    dc->desc = "Philips ISP1561 USB OHCI Controller";
+}
+
+static const TypeInfo ohci_isp1561_pci_info = {
+    .name          = "isp1561-ohci",
+    .parent        = TYPE_PCI_OHCI,
+    .class_init    = ohci_isp1561_pci_class_init,
+};
+
 static void ohci_pci_register_types(void)
 {
     type_register_static(&ohci_pci_info);
     type_register_static(&ohci_nec_pci_info);
+    type_register_static(&ohci_isp1561_pci_info);
 }
 
 type_init(ohci_pci_register_types)

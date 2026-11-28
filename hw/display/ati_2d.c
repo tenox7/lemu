@@ -3,6 +3,7 @@
  * 2D engine functions
  *
  * Copyright (c) 2019 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  */
@@ -14,6 +15,7 @@
 #include "ui/pixel_ops.h"
 #include "ui/console.h"
 #include "ui/rect.h"
+#include "trace.h"
 
 /*
  * NOTE:
@@ -109,7 +111,6 @@ static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
     ctx->host_data_active = s->host_data.active;
     ctx->left_to_right = s->regs.dp_cntl & DST_X_LEFT_TO_RIGHT;
     ctx->top_to_bottom = s->regs.dp_cntl & DST_Y_TOP_TO_BOTTOM;
-    ctx->need_swap = (HOST_BIG_ENDIAN != s->vga.big_endian_fb);
     ctx->frgd_clr = s->regs.dp_brush_frgd_clr;
     ctx->bkgd_clr = s->regs.dp_brush_bkgd_clr;
     ctx->brush_type = s->regs.dp_datatype & DP_BRUSH_DATATYPE;
@@ -117,7 +118,9 @@ static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
     ctx->brush[1] = s->regs.brush_data[1];
     ctx->lsb_first = s->regs.dp_datatype & DP_BYTE_PIX_ORDER;
     ctx->write_mask = s->regs.dp_write_mask;
-    ctx->dst_offset = s->regs.dst_offset;
+    ctx->dst_offset = ati_fb_offset(s, s->regs.dst_offset);
+    /* pixels are kept in the order of the swap at their address */
+    ctx->need_swap = HOST_BIG_ENDIAN != (ati_vram_xm(s, ctx->dst_offset) != 0);
 
     ctx->scissor.width = s->regs.sc_right - s->regs.sc_left + 1;
     ctx->scissor.height = s->regs.sc_bottom - s->regs.sc_top + 1;
@@ -131,7 +134,7 @@ static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
     ctx->dst.y = (ctx->top_to_bottom ?
                  s->regs.dst_y : s->regs.dst_y + 1 - ctx->dst.height);
     ctx->dst_stride = s->regs.dst_pitch;
-    ctx->dst_bits = s->vga.vram_ptr + s->regs.dst_offset;
+    ctx->dst_bits = s->vga.vram_ptr + ctx->dst_offset;
     if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
         ctx->dst_stride *= ctx->bpp;
     }
@@ -141,7 +144,7 @@ static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
     ctx->src.y = (ctx->top_to_bottom ?
                  s->regs.src_y : s->regs.src_y + 1 - ctx->dst.height);
     ctx->src_stride = s->regs.src_pitch;
-    ctx->src_bits = s->vga.vram_ptr + s->regs.src_offset;
+    ctx->src_bits = s->vga.vram_ptr + ati_fb_offset(s, s->regs.src_offset);
     ctx->src_mask = NULL;
     if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
         ctx->src_stride *= ctx->bpp;
@@ -295,7 +298,11 @@ static bool ati_2d_do_blt(const ATI2DCtx *ctx, uint8_t use_pixman)
     if (ctx->dst.x > 0x3fff || ctx->dst.y > 0x3fff ||
         ctx->dst_bits >= vram_end - bypp || ctx->dst_bits + ctx->dst.x * bypp +
         (ctx->dst.y + ctx->dst.height) * ctx->dst_stride >= vram_end - bypp) {
-        qemu_log_mask(LOG_UNIMP, "blt outside vram not implemented\n");
+        qemu_log_mask(LOG_UNIMP, "blt outside vram not implemented: dst "
+                      "offset 0x%x (%d,%d) %dx%d pitch %d\n",
+                      (unsigned)(ctx->dst_bits - ctx->vga->vram_ptr),
+                      ctx->dst.x, ctx->dst.y, ctx->dst.width,
+                      ctx->dst.height, ctx->dst_stride);
         return false;
     }
     qemu_rect_intersect(&ctx->dst, &ctx->scissor, &vis_dst);
@@ -331,7 +338,10 @@ static bool ati_2d_do_blt(const ATI2DCtx *ctx, uint8_t use_pixman)
             ctx->src_bits >= vram_end - bypp ||
             ctx->src_bits + vis_src.x * bypp + (vis_src.y + vis_dst.height) *
             ctx->src_stride >= vram_end - bypp)) {
-            qemu_log_mask(LOG_UNIMP, "blt outside vram not implemented\n");
+            qemu_log_mask(LOG_UNIMP, "blt outside vram not implemented: src "
+                          "offset 0x%x (%d,%d) pitch %d\n",
+                          (unsigned)(ctx->src_bits - ctx->vga->vram_ptr),
+                          vis_src.x, vis_src.y, ctx->src_stride);
             return false;
         }
     }
@@ -479,14 +489,32 @@ void ati_2d_blt(ATIVGAState *s)
     ati_host_data_finish(s);
 
     if (src_source == DP_SRC_HOST || src_source == DP_SRC_HOST_BYTEALIGN) {
+        trace_ati_2d_host_blt((s->regs.dp_mix & GMC_ROP3_MASK) >> 16,
+                              src_source >> 8,
+                              (s->regs.dp_datatype & DP_SRC_DATATYPE) >> 16,
+                              ati_fb_offset(s, s->regs.dst_offset),
+                              s->regs.dst_x, s->regs.dst_y,
+                              s->regs.dst_width, s->regs.dst_height,
+                              s->regs.dp_src_frgd_clr,
+                              s->regs.dp_src_bkgd_clr);
         /* Begin a HOST_DATA blit */
         s->host_data.active = true;
+        s->host_data.src_source = src_source;
         s->host_data.next = 0;
         s->host_data.col = 0;
         s->host_data.row = 0;
         return;
     }
     setup_2d_blt_ctx(s, &ctx);
+    trace_ati_2d_blt(ctx.rop3 >> 16, ctx.bpp, ctx.dst_offset, ctx.dst.x,
+                     ctx.dst.y, ctx.dst.width, ctx.dst.height,
+                     ctx.scissor.width, ctx.scissor.height);
+    trace_ati_2d_blt_src(src_source >> 8,
+                         (s->regs.dp_datatype & DP_SRC_DATATYPE) >> 16,
+                         ati_fb_offset(s, s->regs.src_offset), ctx.src.x,
+                         ctx.src.y, ctx.src_stride,
+                         ati_vram_xm(s, ati_fb_offset(s, s->regs.src_offset)),
+                         ati_vram_xm(s, ctx.dst_offset));
     if (ati_2d_do_blt(&ctx, s->use_pixman)) {
         ati_set_dirty(&ctx);
     }
@@ -550,13 +578,20 @@ bool ati_host_data_flush(ATIVGAState *s)
     unsigned bypp, pix_count, row, col, idx;
     uint8_t pix_buf[ATI_HOST_DATA_ACC_BITS * sizeof(uint32_t)];
     uint8_t fg_mask[ATI_HOST_DATA_ACC_BITS];
-    uint32_t src_source = s->regs.dp_mix & DP_SRC_SOURCE;
+    /*
+     * On the R100 and R200: the source of the blit that started this, not
+     * of later ones, and HOST_BYTEALIGN too
+     */
+    bool r1r2 = ati_is_r100_r200(s);
+    uint32_t src_source = r1r2 ? s->host_data.src_source :
+                          s->regs.dp_mix & DP_SRC_SOURCE;
     uint32_t src_datatype = s->regs.dp_datatype & DP_SRC_DATATYPE;
 
     if (!s->host_data.active) {
         return false;
     }
-    if (src_source != DP_SRC_HOST) {
+    if (src_source != DP_SRC_HOST &&
+        !(r1r2 && src_source == DP_SRC_HOST_BYTEALIGN)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "host_data_blt: unsupported src_source %x\n", src_source);
         return false;
@@ -621,15 +656,41 @@ bool ati_host_data_flush(ATIVGAState *s)
             bswap32s(&fg);
             bswap32s(&bg);
         }
+        /*
+         * On the R100 and R200 the pixels stop at the end of the blit, and
+         * with HOST_BYTEALIGN every scanline starts on a byte: the bits
+         * left in the byte that ends a scanline are padding.
+         */
+        bool byte_align = src_source == DP_SRC_HOST_BYTEALIGN;
+        unsigned c = s->host_data.col, r = s->host_data.row;
+
         idx = 0;
+        if (r1r2) {
+            pix_count = 0;
+        }
         for (int word = 0; word < 4; word++) {
             for (int byte = 0; byte < 4; byte++) {
                 uint8_t byte_val = s->host_data.acc[word] >> (byte * 8);
                 for (int i = 0; i < 8; i++) {
                     bool is_fg = byte_val & BIT(byte_pix_order ? i : 7 - i);
+
+                    if (r1r2 && r >= ctx.dst.height) {
+                        break;
+                    }
                     stn_he_p(&pix_buf[idx], bypp, is_fg ? fg : bg);
                     fg_mask[idx / bypp] = is_fg;
                     idx += bypp;
+                    if (!r1r2) {
+                        continue;
+                    }
+                    pix_count++;
+                    if (++c >= ctx.dst.width) {
+                        c = 0;
+                        r++;
+                        if (byte_align) {
+                            break;
+                        }
+                    }
                 }
             }
         }

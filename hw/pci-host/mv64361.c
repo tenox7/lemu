@@ -3,6 +3,7 @@
  * QEMU PowerPC CHRP (Genesi/bPlan Pegasos II) hardware System Emulator
  *
  * Copyright (c) 2018-2020 BALATON Zoltan
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  *
@@ -22,6 +23,7 @@
 #include "qemu/error-report.h"
 #include "trace.h"
 #include "hw/pci-host/mv64361.h"
+#include "hw/net/mv643xx_eth.h"
 #include "mv643xx.h"
 
 #define TYPE_MV64361_PCI_BRIDGE "mv64361-pcibridge"
@@ -134,7 +136,11 @@ struct MV64361State {
     MemoryRegion regs;
     MV64361PCIState pci[2];
     MemoryRegion cpu_win[19];
+    MemoryRegion sram;
+    MV643xxEthState eth;
     qemu_irq cpu_irq;
+    qemu_irq gbe_intr;
+    uint32_t gbe_intr_level;
 
     /* registers state */
     uint32_t cpu_conf;
@@ -142,6 +148,11 @@ struct MV64361State {
     uint32_t base_addr_enable;
     uint64_t main_int_cr;
     uint64_t cpu0_int_mask;
+    uint64_t cpu1_int_mask;
+    uint64_t int0_mask;
+    uint64_t int1_mask;
+    uint32_t sram_base;
+    uint32_t sram_conf;
     uint32_t gpp_io;
     uint32_t gpp_level;
     uint32_t gpp_value;
@@ -337,10 +348,27 @@ static void set_mem_windows(MV64361State *s, uint32_t val)
                                    p->remap[3], (p->mem_size[3] + 1) << 16,
                                    (p->mem_base[3] & 0xfffff) << 16);
                 }
-            /* 19 is integrated SRAM */
+            } else if (i == 19) {
+                /* the integrated SRAM, 256 KiB */
+                mr = &s->sram;
+                if (memory_region_is_mapped(mr)) {
+                    memory_region_del_subregion(get_system_memory(), mr);
+                }
+                if (!(val & mask)) {
+                    memory_region_add_subregion(get_system_memory(),
+                        (s->sram_base & 0xfffff) << 16, mr);
+                }
             } else if (i == 20) {
+                /*
+                 * The registers are the device's own region, not an alias
+                 * made for the window: only take it out of the address
+                 * space. Unparenting it would free it, and the window
+                 * would never come back, as after a reset.
+                 */
                 mr = &s->regs;
-                unmap_region(mr);
+                if (memory_region_is_mapped(mr)) {
+                    memory_region_del_subregion(get_system_memory(), mr);
+                }
                 if (!(val & mask)) {
                     memory_region_add_subregion(get_system_memory(),
                         (s->regs_base & 0xfffff) << 16, mr);
@@ -351,20 +379,43 @@ static void set_mem_windows(MV64361State *s, uint32_t val)
     s->base_addr_enable = val;
 }
 
+static void mv64361_update_cpu_irq(MV64361State *s)
+{
+    qemu_set_irq(s->cpu_irq, !!(s->main_int_cr & s->cpu0_int_mask));
+}
+
 static void mv64361_update_irq(void *opaque, int n, int level)
 {
     MV64361State *s = opaque;
-    uint64_t val = s->main_int_cr;
 
     if (level) {
-        val |= BIT_ULL(n);
+        s->main_int_cr |= BIT_ULL(n);
     } else {
-        val &= ~BIT_ULL(n);
+        s->main_int_cr &= ~BIT_ULL(n);
     }
-    if ((s->main_int_cr & s->cpu0_int_mask) != (val & s->cpu0_int_mask)) {
-        qemu_set_irq(s->cpu_irq, level);
+    mv64361_update_cpu_irq(s);
+}
+
+/* The Gigabit Ethernet unit's lines in the main interrupt cause register */
+static void mv64361_gbe_irq(void *opaque, int n, int level)
+{
+    MV64361State *s = opaque;
+    int irq;
+
+    if (n == MV643XX_ETH_IRQ_UNIT) {
+        irq = MV64361_IRQ_GBEERR;
+    } else {
+        int port = (n - MV643XX_ETH_IRQ_PORT0) / 4;
+        int line = (n - MV643XX_ETH_IRQ_PORT0) % 4;
+
+        irq = line == MV643XX_ETH_IRQ_SUM ? MV64361_IRQ_GBE0 + port :
+              MV64361_IRQ_G0RX + port * 3 + line - MV643XX_ETH_IRQ_RX;
     }
-    s->main_int_cr = val;
+    mv64361_update_irq(opaque, irq, level);
+    if (irq == MV64361_IRQ_GBE0 || irq == MV64361_IRQ_GBE1) {
+        s->gbe_intr_level = deposit32(s->gbe_intr_level, n, 1, level);
+        qemu_set_irq(s->gbe_intr, s->gbe_intr_level != 0);
+    }
 }
 
 static uint64_t mv64361_read(void *opaque, hwaddr addr, unsigned int size)
@@ -530,6 +581,30 @@ static uint64_t mv64361_read(void *opaque, hwaddr addr, unsigned int size)
     case MV64340_CPU_INTERRUPT0_MASK_HIGH:
         ret = s->cpu0_int_mask >> 32;
         break;
+    case MV64340_CPU_INTERRUPT1_MASK_LOW:
+        ret = s->cpu1_int_mask;
+        break;
+    case MV64340_CPU_INTERRUPT1_MASK_HIGH:
+        ret = s->cpu1_int_mask >> 32;
+        break;
+    case MV64340_INTERRUPT0_MASK_0_LOW:
+        ret = s->int0_mask;
+        break;
+    case MV64340_INTERRUPT0_MASK_0_HIGH:
+        ret = s->int0_mask >> 32;
+        break;
+    case MV64340_INTERRUPT1_MASK_0_LOW:
+        ret = s->int1_mask;
+        break;
+    case MV64340_INTERRUPT1_MASK_0_HIGH:
+        ret = s->int1_mask >> 32;
+        break;
+    case MV64340_INTEGRATED_SRAM_BASE_ADDR:
+        ret = s->sram_base;
+        break;
+    case MV64340_SRAM_CONFIG:
+        ret = s->sram_conf;
+        break;
     case MV64340_CPU_INTERRUPT0_SELECT_CAUSE:
         ret = s->main_int_cr;
         if (s->main_int_cr & s->cpu0_int_mask) {
@@ -539,12 +614,6 @@ static uint64_t mv64361_read(void *opaque, hwaddr addr, unsigned int size)
                 ret |= BIT(31);
             }
         }
-        break;
-    case MV64340_ETH_PHY_ADDR:
-        ret = 0x98;
-        break;
-    case MV64340_ETH_SMI:
-        ret = BIT(27);
         break;
     case MV64340_CUNIT_ARBITER_CONTROL_REG:
         ret = 0x11ff0000 | (s->gpp_int_level << 10);
@@ -775,12 +844,39 @@ static void mv64361_write(void *opaque, hwaddr addr, uint64_t val,
             addr - MV64340_PCI_1_CONFIG_DATA_VIRTUAL_REG, val, size);
         break;
     case MV64340_CPU_INTERRUPT0_MASK_LOW:
-        s->cpu0_int_mask &= 0xffffffff00000000ULL;
-        s->cpu0_int_mask |= val & 0xffffffffULL;
+        s->cpu0_int_mask = deposit64(s->cpu0_int_mask, 0, 32, val);
+        mv64361_update_cpu_irq(s);
         break;
     case MV64340_CPU_INTERRUPT0_MASK_HIGH:
-        s->cpu0_int_mask &= 0xffffffffULL;
-        s->cpu0_int_mask |= val << 32;
+        s->cpu0_int_mask = deposit64(s->cpu0_int_mask, 32, 32, val);
+        mv64361_update_cpu_irq(s);
+        break;
+    case MV64340_CPU_INTERRUPT1_MASK_LOW:
+        s->cpu1_int_mask = deposit64(s->cpu1_int_mask, 0, 32, val);
+        break;
+    case MV64340_CPU_INTERRUPT1_MASK_HIGH:
+        s->cpu1_int_mask = deposit64(s->cpu1_int_mask, 32, 32, val);
+        break;
+    case MV64340_INTERRUPT0_MASK_0_LOW:
+        s->int0_mask = deposit64(s->int0_mask, 0, 32, val);
+        break;
+    case MV64340_INTERRUPT0_MASK_0_HIGH:
+        s->int0_mask = deposit64(s->int0_mask, 32, 32, val);
+        break;
+    case MV64340_INTERRUPT1_MASK_0_LOW:
+        s->int1_mask = deposit64(s->int1_mask, 0, 32, val);
+        break;
+    case MV64340_INTERRUPT1_MASK_0_HIGH:
+        s->int1_mask = deposit64(s->int1_mask, 32, 32, val);
+        break;
+    case MV64340_INTEGRATED_SRAM_BASE_ADDR:
+        s->sram_base = val & 0xfffff;
+        if (!(s->base_addr_enable & BIT(19))) {
+            memory_region_set_address(&s->sram, s->sram_base << 16);
+        }
+        break;
+    case MV64340_SRAM_CONFIG:
+        s->sram_conf = val;
         break;
     case MV64340_CUNIT_ARBITER_CONTROL_REG:
         s->gpp_int_level = !!(val & BIT(10));
@@ -868,6 +964,22 @@ static void mv64361_realize(DeviceState *dev, Error **errp)
     memory_region_init_io(&s->regs, OBJECT(s), &mv64361_ops, s,
                           TYPE_MV64361, 0x10000);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->regs);
+    memory_region_init_ram(&s->sram, OBJECT(s), "mv64361-sram", 256 * KiB,
+                           &error_fatal);
+
+    /* the Gigabit Ethernet unit, at 0x2000-0x3fff of the registers */
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->eth), errp)) {
+        return;
+    }
+    memory_region_add_subregion_overlap(&s->regs, 0x2000,
+        sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->eth), 0), 1);
+    qdev_init_gpio_in_named(dev, mv64361_gbe_irq, "gbe",
+                            MV643XX_ETH_NUM_IRQS);
+    for (i = 0; i < MV643XX_ETH_NUM_IRQS; i++) {
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->eth), i,
+                           qdev_get_gpio_in_named(dev, "gbe", i));
+    }
+
     for (i = 0; i < 2; i++) {
         g_autofree char *name = g_strdup_printf("pcihost%d", i);
         object_initialize_child(OBJECT(dev), name, &s->pci[i],
@@ -878,6 +990,22 @@ static void mv64361_realize(DeviceState *dev, Error **errp)
     }
     sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->cpu_irq);
     qdev_init_gpio_in_named(dev, mv64361_gpp_irq, "gpp", 32);
+    /*
+     * The Gigabit Ethernet ports' summary interrupts on their own, whatever
+     * the main interrupt masks say: the Pegasos II takes them to its
+     * VT8231. The port's mask silences them, as MorphOS's driver wants.
+     */
+    qdev_init_gpio_out_named(dev, &s->gbe_intr, "gbe-intr", 1);
+}
+
+static void mv64361_init(Object *obj)
+{
+    MV64361State *s = MV64361(obj);
+
+    object_initialize_child(obj, "eth", &s->eth, TYPE_MV643XX_ETH);
+    /* so that the board can give it a -nic */
+    object_property_add_alias(obj, "mac", OBJECT(&s->eth), "mac");
+    object_property_add_alias(obj, "netdev", OBJECT(&s->eth), "netdev");
 }
 
 static void mv64361_reset(DeviceState *dev)
@@ -890,6 +1018,12 @@ static void mv64361_reset(DeviceState *dev)
      * Real chip supports init from an eprom but that's not modelled
      */
     set_mem_windows(s, 0x1fffff);
+    s->cpu0_int_mask = 0;
+    s->cpu1_int_mask = 0;
+    s->int0_mask = 0;
+    s->int1_mask = 0;
+    s->sram_base = 0x4200;
+    s->sram_conf = 0;
     s->cpu_conf = 0x28000ff;
     s->regs_base = 0x100f100;
     s->pci[0].io_base = 0x100f800;
@@ -934,6 +1068,7 @@ static const TypeInfo mv64361_type_info = {
     .name = TYPE_MV64361,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(MV64361State),
+    .instance_init = mv64361_init,
     .class_init = mv64361_class_init,
 };
 
