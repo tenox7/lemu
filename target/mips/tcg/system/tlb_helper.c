@@ -1539,13 +1539,15 @@ void mips_cpu_do_interrupt(CPUState *cs)
         env->active_tc.PC += offset;
         if (r3000) {
             /*
-             * MIPS-I places the normal vectors at 0x80000000 (refill) and
-             * 0x80000080 (general), unlike MIPS32's 0x80000100/0x80000180.
+             * MIPS-I refill/general vectors are 0x80000000/0x80000080 with
+             * BEV=0 and 0xBFC00000/0xBFC00180 with BEV=1, unlike MIPS32's
+             * 0x80000100/0x80000180 and 0xBFC00200/0xBFC00380.
              */
-            target_ulong base = env->CP0_Status & (1 << CP0St_BEV) ?
-                                env->exception_base : 0x80000000u;
+            bool bev = env->CP0_Status & (1 << CP0St_BEV);
+            target_ulong base = bev ? env->exception_base : 0x80000000u;
 
-            env->active_tc.PC = base + (r3000_refill ? 0x100 : 0x80);
+            env->active_tc.PC = base + (r3000_refill ? 0 :
+                                        (bev ? 0x180 : 0x80));
         }
         set_hflags_for_handler(env);
         env->CP0_Cause = (env->CP0_Cause & ~(0x1f << CP0Ca_EC)) |
