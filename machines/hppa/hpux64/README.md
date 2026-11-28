@@ -191,6 +191,38 @@ gvid driver takes a Radeon 7500. Add the card (the console stays on the serial p
   the Local line in `/etc/dt/config/Xservers`. It does not put it back. Before the next
   boot with the card: `cp /usr/dt/config/Xservers /etc/dt/config/Xservers`.
 
+### Graphics console on 11.31
+
+With the card ROM `hppa-sti-radeon.rom` and `opt/console=graphics`, the Radeon is the system
+console: the firmware text, the HP-UX boot and rc messages and the console login are on the
+screen, with the USB keyboard. CDE starts as before, and the console text comes back when X
+stops.
+
+```
+  -device ati-vga,model=rv200,x-linear-aper-size=0x4000000,guest_hwcursor=true,romfile=hppa-sti-radeon.rom \
+  -fw_cfg opt/console,string=graphics -serial mon:stdio
+```
+
+- The ROM is QEMU's x86 VGA BIOS (`vgabios-ati.bin`), then an STI image for the card
+  (SeaBIOS-hppa `stirom.c`, `STI_RADEON`: 1280x1024, 8 bits). X POSTs the card with the x86
+  BIOS (`gvid_him_cons`). `make parisc-qemu-install` in `roms/seabios-hppa` builds it. The
+  64-bit firmware has the same STI image in it, for its own console.
+- gvid takes a card with an STI ROM only if bit 0x04 of `ext_bus_support` (byte 0x37 of the
+  STI header) is set. Else graph3 gets the card, and graph3 does not know the Radeon.
+- Without an STI ROM, gvid gives the console the kernel's own VGA STI image. Its CRC check
+  fails, and HP-UX panics ("CRC check of STI rom failed").
+- STI fonts: `next_font` is an offset from the first font. With an offset from the current
+  font, HP-UX panicked in `sti_get_fontdata`.
+- On a card with an STI ROM, gvid does not load a HIM for X (EACCES), unless the kernel
+  variable `gvid_him_override` is set. X then stops with "Failed to load gvid_him_cons". The
+  rc script [gvidhim](gvidhim) sets it before dtlogin starts. Install it as
+  `/sbin/init.d/gvidhim` (mode 555, owner bin:bin) and link it as `/sbin/rc3.d/S980gvidhim`.
+  It writes the running kernel only:
+  `echo 'gvid_him_override/W 1' | adb -w /stand/vmunix /dev/kmem`. On a card without an STI
+  ROM the variable has no effect.
+- After the boot loader starts, the firmware's own messages ("Unimplemented PDC_PAT_...") go
+  to the serial port only, so they do not write over the HP-UX console.
+
 ## Not working yet
 
 - HP-UX 11.31: PDC_PAT_IO 13 and PDC_PAT_COMPLEX 0 and 13 are not there.

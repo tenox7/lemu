@@ -32,7 +32,7 @@ hpux11v1) name=hpux11v1b160l-lemu img=$vm/hpux.img ;;
 hpux11v2) name=hpux11v2c3700-lemu img=$vm/hpux1123.qcow2
 	fw="hppa-firmware64.img hppa-sti-artist.rom" ;;
 hpux11v3) name=hpux11v3a400-lemu img=$vm/hpux1131.qcow2
-	fw="hppa-firmware64.img vgabios-ati.bin" ;;
+	fw="hppa-firmware64.img vgabios-ati.bin hppa-sti-radeon.rom" ;;
 *) echo "unknown OS: $os" >&2; exit 1 ;;
 esac
 # the macOS binaries must be signed with the Developer ID and notarized

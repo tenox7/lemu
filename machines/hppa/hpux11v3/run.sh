@@ -12,10 +12,18 @@ esac
 # The firmware is LEMU's SeaBIOS-hppa (bin/share/qemu/hppa-firmware64.img), and the
 # card's PCI ROM is bin/share/qemu/vgabios-ati.bin.
 # tb-size=512 keeps the code buffer where it is fast on Apple Silicon.
-# The terminal is the serial console: HP-UX 11.31 has no console on this card.
-#   Ctrl-A c = QEMU monitor (again = back), Ctrl-A x = quit.
+# The terminal is the serial console. Ctrl-A c = QEMU monitor (again = back), Ctrl-A x = quit.
+# CONSOLE=graphics ./run.sh: the card is the system console. The card's ROM is then
+#   hppa-sti-radeon.rom (the VGA BIOS and an STI ROM): firmware text, HP-UX boot messages
+#   and the console login are in the window, with the USB keyboard. The terminal gets a
+#   copy of the firmware text and no login. The firmware boot menu reads the terminal.
 # guest_hwcursor=true: QEMU draws the mouse pointer into the screen, so it does not jump.
 # HP-UX takes 10.0.2.15 from QEMU's DHCP (hostname hpux11v3).
+rom= con=
+if [ "$CONSOLE" = graphics ]; then
+	rom=,romfile=hppa-sti-radeon.rom
+	con="-fw_cfg opt/console,string=graphics"
+fi
 exec "$q" \
 	-name "HP-UX 11i v3 PA-RISC A400" \
 	-M A400,pluto=on -smp 1 -m 2048 \
@@ -23,6 +31,6 @@ exec "$q" \
 	-boot c -boot menu=off \
 	-drive if=scsi,bus=0,index=6,file=hpux11v3.qcow2,format=qcow2 \
 	-nic user,model=tulip,hostfwd=tcp:127.0.0.1:11131-10.0.2.15:23 \
-	-device ati-vga,model=rv200,x-linear-aper-size=0x4000000,guest_hwcursor=true \
-	-serial mon:stdio \
+	-device ati-vga,model=rv200,x-linear-aper-size=0x4000000,guest_hwcursor=true$rom \
+	-serial mon:stdio $con \
 	"$@"
