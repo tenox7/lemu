@@ -4952,7 +4952,7 @@ static inline void gen_mtc0_store32(TCGv arg, target_ulong off)
 
 static inline bool disas_r3000_mmu(DisasContext *ctx)
 {
-    return ((ctx->CP0_Config0 >> CP0C0_MT) & 7) == MMU_TYPE_R3000;
+    return ctx->mmu_type == MMU_TYPE_R3000;
 }
 
 #define CP0_CHECK(c)                            \
@@ -15174,6 +15174,7 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->page_start = ctx->base.pc_first & TARGET_PAGE_MASK;
     ctx->saved_pc = -1;
     ctx->insn_flags = env->insn_flags;
+    ctx->mmu_type = env->cpu_model->mmu_type;
     ctx->CP0_Config0 = env->CP0_Config0;
     ctx->CP0_Config1 = env->CP0_Config1;
     ctx->CP0_Config2 = env->CP0_Config2;
