@@ -182,6 +182,14 @@ execution.  This special treatment of ``"no"`` is deprecated.  Use an
 empty string instead.  In a future version, ``"no"`` will be treated as
 a plain file name.
 
+``ignore-unavailable`` in ``trace-event-set-state`` (since 11.2)
+''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+Trace events are now unconditionally built-in to all QEMU builds,
+so the concept of an 'unavailable' trace event no longer exists.
+The ``ignore-unavailable`` parameter in ``trace-event-set-state``
+thus has no effect and should no longer be used.
+
 Human Machine Protocol (HMP) commands
 -------------------------------------
 
@@ -286,6 +294,16 @@ object.
 The machine never got fully implemented and can only show the firmware prompt.
 Given the incomplete state and slow progress on improvements, it might get
 removed again without replacement.
+
+``quanta-gsj`` Arm machine (since 11.2)
+'''''''''''''''''''''''''''''''''''''''
+
+The ``quanta-gsj`` machine models a system with a Nuvoton SoC
+intended for use as a baseband management controller in a server.
+Support for this machine type was dropped from the OpenBMC project
+in 2023. If OpenBMC no longer care about this hardware, the QEMU
+model is unlikely to have many users, so we are deprecating it.
+Users should consider one of the other Nuvoton-based board models.
 
 
 Backend options
@@ -441,8 +459,8 @@ across versions).
 linux-user mode CPUs
 --------------------
 
-OABI and NWFPE support for Arm CPUs
-'''''''''''''''''''''''''''''''''''
+OABI and NWFPE support for Arm CPUs (since 11.0)
+''''''''''''''''''''''''''''''''''''''''''''''''
 
 Linux for 32-bit Arm has had two major ABIs: the original OABI and the
 more modern EABI. OABI support was marked as obsolete in GCC 4.7 and
@@ -466,7 +484,7 @@ Build features
 --------------
 
 Crypto AF_ALG backend (since 11.2)
-----------------------------------
+''''''''''''''''''''''''''''''''''
 
 The use of the AF_ALG backend for cryptography has been deprecated
 with no replacement.

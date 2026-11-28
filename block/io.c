@@ -2,6 +2,7 @@
  * Block layer I/O functions
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -2346,6 +2347,41 @@ out:
     return ret;
 }
 
+/*
+ * CD images with tracks: the driver of the image answers, through any
+ * filters above it. -ENOTSUP when the image is not such a CD.
+ */
+int coroutine_fn bdrv_co_get_cd_toc(BlockDriverState *bs, BlockCdToc *toc)
+{
+    IO_CODE();
+    assert_bdrv_graph_readable();
+
+    while (bs && bs->drv) {
+        if (bs->drv->bdrv_get_cd_toc) {
+            return bs->drv->bdrv_get_cd_toc(bs, toc);
+        }
+        bs = bdrv_filter_bs(bs);
+    }
+
+    return -ENOTSUP;
+}
+
+int coroutine_fn bdrv_co_read_cd_raw(BlockDriverState *bs, int64_t lba,
+                                     uint8_t *raw, uint8_t *subchannel)
+{
+    IO_CODE();
+    assert_bdrv_graph_readable();
+
+    while (bs && bs->drv) {
+        if (bs->drv->bdrv_co_read_cd_raw) {
+            return bs->drv->bdrv_co_read_cd_raw(bs, lba, raw, subchannel);
+        }
+        bs = bdrv_filter_bs(bs);
+    }
+
+    return -ENOTSUP;
+}
+
 int coroutine_fn bdrv_co_pwrite_zeroes(BdrvChild *child, int64_t offset,
                                        int64_t bytes, BdrvRequestFlags flags)
 {
@@ -3636,6 +3672,16 @@ int coroutine_fn bdrv_co_copy_range(BdrvChild *src, int64_t src_offset,
                                    bytes, read_flags, write_flags);
 }
 
+void coroutine_fn bdrv_co_child_notify_resize(BdrvChild *c)
+{
+    IO_CODE();
+    assert_bdrv_graph_readable();
+
+    if (c->klass->resize) {
+        c->klass->resize(c);
+    }
+}
+
 void coroutine_fn bdrv_co_parent_cb_resize(BlockDriverState *bs)
 {
     BdrvChild *c;
@@ -3644,9 +3690,7 @@ void coroutine_fn bdrv_co_parent_cb_resize(BlockDriverState *bs)
     assert_bdrv_graph_readable();
 
     QLIST_FOREACH(c, &bs->parents, next_parent) {
-        if (c->klass->resize) {
-            c->klass->resize(c);
-        }
+        bdrv_co_child_notify_resize(c);
     }
 }
 

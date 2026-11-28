@@ -15,12 +15,16 @@ OUT=$(mkdir -p "$2" && cd "$2" && pwd)
 O=$OUT/macos-arm64 B=$OUT/build-mac
 BINS="qemu-system-i386 qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-system-mips64el qemu-system-mips64 qemu-system-hppa qemu-system-sparc qemu-system-m68k"
 export MACOSX_DEPLOYMENT_TARGET=15.0
+# libaaruformat (AaruFormat images) is built with CMake
+command -v cmake >/dev/null || { echo "cmake is needed: brew install cmake" >&2; exit 1; }
+sh $R/get-libaaruformat.sh $SRC
 mkdir -p $B && cd $B
 $SRC/configure --target-list=i386-softmmu,ppc-softmmu,ppc64-softmmu,alpha-softmmu,mips64el-softmmu,mips64-softmmu,hppa-softmmu,sparc-softmmu,m68k-softmmu \
   --without-default-features --enable-system --enable-tcg --enable-hmp \
   --enable-sdl --enable-cocoa --enable-coreaudio --enable-vmnet --enable-slirp --enable-pixman \
   --enable-fdt=internal --enable-vnc --enable-rdp --enable-vvfat --enable-qcow1 --enable-vdi --enable-vmdk \
   --enable-vpc --enable-vhdx --enable-qed --enable-bochs --enable-cloop --enable-dmg --enable-parallels \
+  --enable-aaruformat \
   --disable-docs --disable-werror --disable-capstone > configure.log
 ninja $BINS > ninja.log
 rm -rf $O && mkdir -p $O/lib && cp $BINS $O/ && cd $O

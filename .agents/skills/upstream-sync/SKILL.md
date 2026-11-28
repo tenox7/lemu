@@ -139,6 +139,7 @@ git -c merge.conflictStyle=zdiff3 merge --no-ff --no-commit upstream/master
 | `AGENTS.md` | QEMU has its own agent rules, and LEMU replaced them | Keep LEMU's: `git checkout --ours AGENTS.md`. Carry over only a real rule change, such as a security one. |
 | Files LEMU deleted, such as `hw/alpha/dp264.c` | QEMU changed a file LEMU removed | Keep it deleted: `git rm` it. If QEMU's change is an API change, make the same change in LEMU's replacement. |
 | `target/alpha/`, `hw/alpha/` | LEMU replaced QEMU's Alpha code with its own (Jensen, ES40) | Keep LEMU's side. Read each QEMU commit there and port by hand what still applies. |
+| `hw/m68k/next-cube.c`, `hw/display/next-fb.c`, `include/hw/m68k/next-cube.h`, `tests/functional/m68k/test_nextcube.py`; `hw/m68k/next-kbd.c`, which LEMU deleted (`hw/input/next-kms.c` replaced it) | LEMU took over QEMU's NeXTcube and made it the board of all seven NeXT machines (`machines/next/`). QEMU deprecated it in 11.2 and may delete it | Keep LEMU's side, and keep the files if QEMU deletes them; keep `next-kbd.c` deleted. Port by hand any API change QEMU made there. |
 | `meson.build`, `Kconfig`, `trace-events`, `qapi/*.json`, `*.hx`, `system/vl.c`, `monitor/` | Both sides add entries | Keep both. Check commas and order. |
 | Any other QEMU file LEMU changed | Both sides changed the same lines | Understand both. Keep LEMU's behaviour and QEMU's cleanup. |
 

@@ -3,6 +3,7 @@
  *
  *  Copyright (c) 2006-2007 CodeSourcery
  *  Written by Paul Brook
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -746,4 +747,170 @@ void HELPER(fsinh)(CPUM68KState *env, FPReg *res, FPReg *val)
 void HELPER(fcosh)(CPUM68KState *env, FPReg *res, FPReg *val)
 {
     res->d = floatx80_cosh(val->d, &env->fp_status);
+}
+
+/*
+ * Packed decimal real: 3 BCD digits of exponent and 17 of mantissa.
+ *
+ *   word 0: SM SE YY e2 e1 e0 e3 0 0 d16
+ *   words 1 and 2: d15 ... d0
+ *
+ * The value is (-1)^SM * d16.d15...d0 * 10^((-1)^SE * e2e1e0). The 68881
+ * and 68882 convert it themselves; the 68040 traps to its FPSP software
+ * package, which needs FSAVE frames QEMU does not make. The conversion is
+ * done here for all of them, as QEMU does with the transcendental
+ * functions the 68040 also leaves to software.
+ */
+
+static floatx80 fp_pow10(int n, float_status *st)
+{
+    floatx80 r = int32_to_floatx80(1, st);
+    floatx80 b = int32_to_floatx80(10, st);
+
+    while (n) {
+        if (n & 1) {
+            r = floatx80_mul(r, b, st);
+        }
+        n >>= 1;
+        if (n) {
+            b = floatx80_mul(b, b, st);
+        }
+    }
+    return r;
+}
+
+void HELPER(frompacked)(CPUM68KState *env, FPReg *res, uint32_t w0,
+                        uint32_t w1, uint32_t w2)
+{
+    float_status *st = &env->fp_status;
+    bool sm = w0 >> 31;
+    bool se = (w0 >> 30) & 1;
+    uint64_t m = w0 & 0xf;
+    int exp = 0;
+    floatx80 v;
+
+    if (((w0 >> 16) & 0x7fff) == 0x7fff) {
+        /* infinity or NaN: the mantissa is the binary one */
+        res->d = make_floatx80(sm ? 0xffff : 0x7fff,
+                               ((uint64_t)w1 << 32) | w2);
+        if (!w1 && !w2) {
+            res->d = sm ? floatx80_default_inf(1, st) :
+                          floatx80_default_inf(0, st);
+        }
+        return;
+    }
+    for (int i = 0; i < 3; i++) {
+        exp = exp * 10 + ((w0 >> (24 - 4 * i)) & 0xf);
+    }
+    for (int i = 0; i < 8; i++) {
+        m = m * 10 + ((w1 >> (28 - 4 * i)) & 0xf);
+    }
+    for (int i = 0; i < 8; i++) {
+        m = m * 10 + ((w2 >> (28 - 4 * i)) & 0xf);
+    }
+    if (m == 0) {
+        res->d = make_floatx80(sm ? 0x8000 : 0, 0);
+        return;
+    }
+    exp = (se ? -exp : exp) - 16;
+    v = int64_to_floatx80(m, st);
+    if (exp > 0) {
+        v = floatx80_mul(v, fp_pow10(exp, st), st);
+    } else if (exp < 0) {
+        v = floatx80_div(v, fp_pow10(-exp, st), st);
+    }
+    res->d = sm ? floatx80_chs(v) : v;
+}
+
+static const uint64_t pow10_u64[18] = {
+    1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL,
+    10000000ULL, 100000000ULL, 1000000000ULL, 10000000000ULL,
+    100000000000ULL, 1000000000000ULL, 10000000000000ULL,
+    100000000000000ULL, 1000000000000000ULL, 10000000000000000ULL,
+    100000000000000000ULL,
+};
+
+/* |x| scaled by 10^scale and rounded to an integer by FPCR */
+static uint64_t fp_scale_to_int(floatx80 x, int scale, float_status *st)
+{
+    if (scale > 0) {
+        x = floatx80_mul(x, fp_pow10(scale, st), st);
+    } else if (scale < 0) {
+        x = floatx80_div(x, fp_pow10(-scale, st), st);
+    }
+    return floatx80_to_int64(x, st);
+}
+
+void HELPER(topacked)(CPUM68KState *env, FPReg *val, int32_t k)
+{
+    float_status *st = &env->fp_status;
+    floatx80 x = val->d;
+    bool sm = extractFloatx80Sign(x);
+    uint32_t w0, w1 = 0, w2 = 0;
+    int e10, ndig, ae;
+    uint64_t m;
+    char digits[18];
+
+    if (floatx80_is_infinity(x, st) || floatx80_is_any_nan(x)) {
+        env->fp_packed[0] = (sm ? 0x80000000 : 0) | 0x7fff0000;
+        env->fp_packed[1] = floatx80_is_any_nan(x) ? x.low >> 32 : 0;
+        env->fp_packed[2] = floatx80_is_any_nan(x) ? (uint32_t)x.low : 0;
+        return;
+    }
+    if (floatx80_is_zero(x)) {
+        env->fp_packed[0] = sm ? 0x80000000 : 0;
+        env->fp_packed[1] = env->fp_packed[2] = 0;
+        return;
+    }
+    x = floatx80_abs(x);
+
+    /* the decimal exponent */
+    {
+        floatx80 l = floatx80_log10(x, st);
+        FloatRoundMode rm = get_float_rounding_mode(st);
+
+        set_float_rounding_mode(float_round_down, st);
+        e10 = floatx80_to_int32(l, st);
+        set_float_rounding_mode(rm, st);
+    }
+
+    for (int tries = 0; tries < 3; tries++) {
+        if (k > 0) {
+            ndig = MIN(k, 17);
+        } else {
+            ndig = e10 + 1 - k;
+        }
+        ndig = MAX(MIN(ndig, 17), 1);
+        m = fp_scale_to_int(x, ndig - 1 - e10, st);
+        if (m >= pow10_u64[ndig]) {
+            e10++;          /* log10 was low, or rounding carried */
+            continue;
+        }
+        if (m < pow10_u64[ndig - 1] && ndig > 1) {
+            e10--;          /* log10 was high */
+            continue;
+        }
+        break;
+    }
+    if (m >= pow10_u64[ndig]) {
+        m /= 10;
+    }
+
+    /* digits of m, left aligned in 17 places */
+    memset(digits, 0, sizeof(digits));
+    for (int i = ndig - 1; i >= 0; i--) {
+        digits[i] = m % 10;
+        m /= 10;
+    }
+    for (int i = 0; i < 8; i++) {
+        w1 = (w1 << 4) | digits[1 + i];
+        w2 = (w2 << 4) | digits[9 + i];
+    }
+    ae = e10 < 0 ? -e10 : e10;
+    w0 = (sm ? 0x80000000 : 0) | (e10 < 0 ? 0x40000000 : 0) |
+         ((ae / 100 % 10) << 24) | ((ae / 10 % 10) << 20) |
+         ((ae % 10) << 16) | ((ae / 1000 % 10) << 12) | digits[0];
+    env->fp_packed[0] = w0;
+    env->fp_packed[1] = w1;
+    env->fp_packed[2] = w2;
 }

@@ -19,6 +19,7 @@
 #include "hw/pci/pci_device.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/scsi/scsi.h"
+#include "lsi_scsi.h"
 #include "migration/vmstate.h"
 #include "system/dma.h"
 #include "qemu/log.h"
@@ -43,20 +44,9 @@ static const char *names[] = {
 
 #define LSI_MAX_DEVS 7
 
-#define LSI_SCNTL0_TRG    0x01
-#define LSI_SCNTL0_AAP    0x02
-#define LSI_SCNTL0_EPC    0x08
-#define LSI_SCNTL0_WATN   0x10
-#define LSI_SCNTL0_START  0x20
-
 #define LSI_SCNTL1_SST    0x01
 #define LSI_SCNTL1_IARB   0x02
-#define LSI_SCNTL1_AESP   0x04
-#define LSI_SCNTL1_RST    0x08
-#define LSI_SCNTL1_CON    0x10
 #define LSI_SCNTL1_DHP    0x20
-#define LSI_SCNTL1_ADB    0x40
-#define LSI_SCNTL1_EXC    0x80
 
 #define LSI_SCNTL2_WSR    0x01
 #define LSI_SCNTL2_VUE0   0x02
@@ -67,14 +57,8 @@ static const char *names[] = {
 #define LSI_SCNTL2_CHM    0x40
 #define LSI_SCNTL2_SDU    0x80
 
-#define LSI_ISTAT0_DIP    0x01
-#define LSI_ISTAT0_SIP    0x02
 #define LSI_ISTAT0_INTF   0x04
-#define LSI_ISTAT0_CON    0x08
 #define LSI_ISTAT0_SEM    0x10
-#define LSI_ISTAT0_SIGP   0x20
-#define LSI_ISTAT0_SRST   0x40
-#define LSI_ISTAT0_ABRT   0x80
 
 #define LSI_ISTAT1_SI     0x01
 #define LSI_ISTAT1_SRUN   0x02
@@ -106,43 +90,30 @@ static const char *names[] = {
 #define LSI_SOCL_IO       0x01
 #define LSI_SOCL_CD       0x02
 #define LSI_SOCL_MSG      0x04
-#define LSI_SOCL_ATN      0x08
 #define LSI_SOCL_SEL      0x10
 #define LSI_SOCL_BSY      0x20
 #define LSI_SOCL_ACK      0x40
 #define LSI_SOCL_REQ      0x80
 
-#define LSI_DSTAT_IID     0x01
-#define LSI_DSTAT_SIR     0x04
-#define LSI_DSTAT_SSI     0x08
-#define LSI_DSTAT_ABRT    0x10
-#define LSI_DSTAT_BF      0x20
 #define LSI_DSTAT_MDPE    0x40
-#define LSI_DSTAT_DFE     0x80
 
-#define LSI_DCNTL_COM     0x01
 #define LSI_DCNTL_IRQD    0x02
-#define LSI_DCNTL_STD     0x04
 #define LSI_DCNTL_IRQM    0x08
-#define LSI_DCNTL_SSM     0x10
 #define LSI_DCNTL_PFEN    0x20
 #define LSI_DCNTL_PFF     0x40
 #define LSI_DCNTL_CLSE    0x80
 
-#define LSI_DMODE_MAN     0x01
 #define LSI_DMODE_BOF     0x02
 #define LSI_DMODE_ERMP    0x04
 #define LSI_DMODE_ERL     0x08
 #define LSI_DMODE_DIOM    0x10
 #define LSI_DMODE_SIOM    0x20
 
-#define LSI_CTEST2_DACK   0x01
 #define LSI_CTEST2_DREQ   0x02
 #define LSI_CTEST2_TEOP   0x04
 #define LSI_CTEST2_PCICIE 0x08
 #define LSI_CTEST2_CM     0x10
 #define LSI_CTEST2_CIO    0x20
-#define LSI_CTEST2_SIGP   0x40
 #define LSI_CTEST2_DDIR   0x80
 
 #define LSI_CTEST5_BL2    0x04
@@ -164,59 +135,10 @@ static const char *names[] = {
 #define LSI_CCNTL1_DDAC      0x08
 #define LSI_CCNTL1_ZMOD      0x80
 
-#define LSI_SBCL_ATN         0x08
-#define LSI_SBCL_BSY         0x20
-#define LSI_SBCL_ACK         0x40
-#define LSI_SBCL_REQ         0x80
-
 /* Enable Response to Reselection */
 #define LSI_SCID_RRE      0x60
 
 #define LSI_CCNTL1_40BIT (LSI_CCNTL1_EN64TIBMV|LSI_CCNTL1_64TIMOD)
-
-#define PHASE_DO          0
-#define PHASE_DI          1
-#define PHASE_CMD         2
-#define PHASE_ST          3
-#define PHASE_MO          6
-#define PHASE_MI          7
-#define PHASE_MASK        7
-
-/* Maximum length of MSG IN data.  */
-#define LSI_MAX_MSGIN_LEN 8
-
-/* Flag set if this is a tagged command.  */
-#define LSI_TAG_VALID     (1 << 16)
-
-/* Maximum instructions to process. */
-#define LSI_MAX_INSN    500
-
-typedef struct lsi_request {
-    SCSIRequest *req;
-    uint32_t tag;
-    uint32_t dma_len;
-    uint8_t *dma_buf;
-    uint32_t pending;
-    int out;
-    bool orphan;
-    QTAILQ_ENTRY(lsi_request) next;
-} lsi_request;
-
-enum {
-    LSI_NOWAIT, /* SCRIPTS are running or stopped */
-    LSI_WAIT_RESELECT, /* Wait Reselect instruction has been issued */
-    LSI_DMA_SCRIPTS, /* processing DMA from lsi_execute_script */
-    LSI_DMA_IN_PROGRESS, /* DMA operation is in progress */
-    LSI_WAIT_SCRIPTS, /* SCRIPTS stopped because of instruction count limit */
-    LSI_WAIT_COMPLETE, /* no-data command runs, target holds the bus */
-};
-
-enum {
-    LSI_MSG_ACTION_COMMAND = 0,
-    LSI_MSG_ACTION_DISCONNECT = 1,
-    LSI_MSG_ACTION_DOUT = 2,
-    LSI_MSG_ACTION_DIN = 3,
-};
 
 struct LSIState {
     /*< private >*/
@@ -346,6 +268,7 @@ struct LSIState {
 
 #define TYPE_LSI53C810  "lsi53c810"
 #define TYPE_LSI53C895A "lsi53c895a"
+#define TYPE_LSI53C875  "lsi53c875"
 
 OBJECT_DECLARE_SIMPLE_TYPE(LSIState, LSI53C895A)
 
@@ -2775,10 +2698,28 @@ static const TypeInfo lsi53c810_info = {
     .class_init    = lsi53c810_class_init,
 };
 
+/*
+ * The 53C895A model with the PCI ID of a 53C875. HP-UX 11.31 c8xx takes the
+ * 53C875, 53C896 and 53C1010-66, and turns down the 53C895 and 53C895A.
+ */
+static void lsi53c875_class_init(ObjectClass *klass, const void *data)
+{
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = PCI_DEVICE_ID_LSI_53C875;
+}
+
+static const TypeInfo lsi53c875_info = {
+    .name          = TYPE_LSI53C875,
+    .parent        = TYPE_LSI53C895A,
+    .class_init    = lsi53c875_class_init,
+};
+
 static void lsi53c895a_register_types(void)
 {
     type_register_static(&lsi_info);
     type_register_static(&lsi53c810_info);
+    type_register_static(&lsi53c875_info);
 }
 
 type_init(lsi53c895a_register_types)

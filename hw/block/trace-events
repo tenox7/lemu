@@ -111,3 +111,10 @@ swim_iwmctrl_read(int reg, const char *name, unsigned size, uint64_t value) "reg
 swim_iwmctrl_write(int reg, const char *name, unsigned size, uint64_t value) "reg=%d [%s] size=%u value=0x%"PRIx64
 swim_switch_to_ism(void) "switch from IWM to ISM mode"
 swim_switch_to_iwm(void) "switch from ISM to IWM mode"
+
+# next-mo.c
+next_mo_reg_read(unsigned reg, uint8_t val) "reg 0x%02x -> 0x%02x"
+next_mo_reg_write(unsigned reg, uint8_t val) "reg 0x%02x <- 0x%02x"
+next_mo_drive_cmd(int drive, uint16_t cmd, int complete) "drive %d command 0x%04x (complete %d)"
+next_mo_signals(int drive, int complete, int attn) "drive %d complete %d attn %d"
+next_mo_fmt(int mode, uint32_t sector_id, uint32_t want) "formatter mode %d at 0x%06x, looking for 0x%06x"

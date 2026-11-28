@@ -106,11 +106,13 @@ by the used format or see the format descriptions below for details.
 
 .. option:: -c
 
-  Indicates that target image must be compressed (qcow/qcow2 and vmdk with
-  streamOptimized subformat only).
+  Indicates that target image must be compressed (qcow/qcow2, vmdk with
+  streamOptimized subformat, and aaruformat only).
 
   For qcow2, the compression algorithm can be specified with the ``-o
-  compression_type=...`` option (see below).
+  compression_type=...`` option (see below). aaruformat compresses with
+  LZMA with ``-c``; ``-o compress=on,compression_type=zstd`` uses
+  Zstandard instead.
 
 .. option:: -h
 
@@ -430,9 +432,9 @@ Command description:
   be optionally compressed (``-c`` option) or use any format specific
   options like encryption (``-o`` option).
 
-  Only the formats ``qcow`` and ``qcow2`` support compression. The
-  compression is read-only. It means that if a compressed sector is
-  rewritten, then it is rewritten as uncompressed data.
+  Only the formats ``qcow``, ``qcow2`` and ``aaruformat`` support
+  compression. The compression is read-only. It means that if a compressed
+  sector is rewritten, then it is rewritten as uncompressed data.
 
   Image conversion is also useful to get smaller image when using a
   growable format such as ``qcow``: the empty sectors are detected and

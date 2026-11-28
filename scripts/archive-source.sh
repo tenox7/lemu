@@ -36,6 +36,7 @@ subprojects=(
   foreign-0.3-rs
   glib-sys-0.21-rs
   keycodemapdb
+  libaaruformat
   libc-0.2-rs
   libvfio-user
   probe-0.5-rs

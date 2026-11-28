@@ -3,6 +3,7 @@
  *
  *  Copyright (c) 2005-2007 CodeSourcery
  *  Written by Paul Brook
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -107,6 +108,7 @@ typedef struct CPUArchState {
 
     FPReg fregs[8];
     FPReg fp_result;
+    uint32_t fp_packed[3];  /* a packed decimal operand being stored */
     uint32_t fpcr;
     uint32_t fpsr;
     float_status fp_status;
@@ -140,11 +142,21 @@ typedef struct CPUArchState {
         uint32_t mmusr;
     } mmu;
 
+    /* 68030 MMU */
+    struct {
+        uint32_t tc;
+        uint64_t crp;
+        uint64_t srp;
+        uint32_t tt[2];
+        uint16_t mmusr;
+    } mmu030;
+
     /* Control registers.  */
     uint32_t vbr;
     uint32_t mbar;
     uint32_t rambar0;
     uint32_t cacr;
+    uint32_t caar;      /* 68020/68030 */
     uint32_t sfc;
     uint32_t dfc;
 
@@ -156,6 +168,11 @@ typedef struct CPUArchState {
 
     /* Fields from here on are preserved across CPU reset. */
     uint64_t features;
+
+    /* Halt in Mach's idle loop on the NeXT machines, see nextstep_idle.c */
+    bool nextstep_idle;
+    int64_t nextstep_idle_since;    /* when the loop first found no work */
+    int64_t nextstep_idle_last;     /* when the loop last found no work */
 } CPUM68KState;
 
 /*
@@ -168,6 +185,9 @@ struct ArchCPU {
     CPUState parent_obj;
 
     CPUM68KState env;
+
+    /* M68K_FEATURE_FPU_PACKED: on, off, or as the model has it */
+    OnOffAuto packed_decimal;
 };
 
 /*
@@ -559,6 +579,11 @@ enum m68k_features {
     M68K_FEATURE_EXCEPTION_FORMAT_VEC,
     /* LINK.L (680[2346]0, and CPU32) */
     M68K_FEATURE_LINKL,
+    /*
+     * Packed decimal reals done by the FPU (68881/68882); the 68040 and
+     * 68060 trap to their FPSP for them (unimplemented data type)
+     */
+    M68K_FEATURE_FPU_PACKED,
 };
 
 static inline bool m68k_feature(CPUM68KState *env, int feature)
@@ -567,6 +592,18 @@ static inline bool m68k_feature(CPUM68KState *env, int feature)
 }
 
 void register_m68k_insns (CPUM68KState *env);
+
+#ifndef CONFIG_USER_ONLY
+/* 68030 MMU, in mmu030.c */
+bool m68k_mmu030_enabled(CPUM68KState *env);
+bool m68k_mmu030_get_phys(CPUM68KState *env, uint32_t addr, int access_type,
+                          hwaddr *phys);
+bool m68k_mmu030_tlb_fill(CPUState *cs, vaddr address, int size,
+                          MMUAccessType qemu_access_type, int mmu_idx,
+                          bool probe, uintptr_t retaddr);
+void m68k_mmu030_fault_ssw(CPUM68KState *env, uint32_t addr, int size,
+                           MMUAccessType qemu_access_type, int mmu_idx);
+#endif
 
 enum {
     /* 1 bit to define user level / supervisor access */
@@ -606,8 +643,8 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
 #define TB_FLAGS_SFC_S          (1 << TB_FLAGS_SFC_S_BIT)
 #define TB_FLAGS_DFC_S_BIT      15
 #define TB_FLAGS_DFC_S          (1 << TB_FLAGS_DFC_S_BIT)
-#define TB_FLAGS_TRACE          16
-#define TB_FLAGS_TRACE_BIT      (1 << TB_FLAGS_TRACE)
+#define TB_FLAGS_TRACE_BIT      16
+#define TB_FLAGS_TRACE          (1 << TB_FLAGS_TRACE_BIT)
 
 void dump_mmu(CPUM68KState *env);
 

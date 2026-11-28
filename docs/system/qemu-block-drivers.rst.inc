@@ -370,6 +370,76 @@ This section describes each format and the options that are supported for it.
 
       Log size; min 1 MB.
 
+.. program:: image-formats
+.. option:: aaruformat
+
+  AaruFormat, the image format of the Aaru Data Preservation Suite, read
+  and written through libaaruformat. Built when libaaruformat is found, or
+  from its ``subprojects/libaaruformat.wrap`` (CMake is needed for that).
+
+  Hard disk images (block media) can be read and written. AaruFormat never
+  writes over data already in the file: every write is added at the end,
+  so the file grows as the guest rewrites sectors. ``qemu-img convert``
+  makes a compact copy. A guest flush writes a checkpoint: if QEMU or the
+  host stops, the image opens as it was at the last checkpoint. Many old
+  guests (DOS, Windows 9x) never flush, so a checkpoint is also written
+  a few seconds after the guest writes (``checkpoint-interval``).
+
+  CD and DVD images (optical discs) are read-only. Guests read the 2048
+  bytes of user data of each sector; with ``ide-cd`` and ``scsi-cd``, CD
+  images also give the guest their real track list (READ TOC, READ DISC
+  INFORMATION) and their raw 2352-byte sectors and subchannel (READ CD),
+  so audio and mixed-mode discs look as they were dumped. Playing audio
+  tracks through the drive (PLAY AUDIO) is not supported.
+
+  Tape, flux-only and other media images cannot be opened. Images must
+  be local files, because the library opens them itself.
+
+  Supported options:
+
+  .. program:: aaruformat
+  .. option:: sector_size
+
+    Sector size in bytes, a power of two from 512 to 32768 (default: 512).
+
+  .. option:: compress
+
+    Compress the data written right after the image is created, as by
+    ``qemu-img convert -O aaruformat -o compress=on`` (default: ``off``).
+    AaruFormat does not keep this setting: when the image is opened again
+    later, the ``compress`` runtime option chooses.
+    ``qemu-img convert -c`` also compresses.
+
+  .. option:: compression_type
+
+    ``lzma`` (smaller, slower; the default) or ``zstd`` (faster).
+
+  .. option:: deduplicate
+
+    Store identical sectors once (default: ``on``).
+
+  .. option:: error_recovery
+
+    Percentage (1 to 100) of error recovery data (erasure coding) to add,
+    as Aaru's ``--error-recovery`` (default: 0, none). Damaged blocks of
+    the image are rebuilt from it when read. It covers the data written
+    right after the image is created, as by ``qemu-img convert -O
+    aaruformat -o error_recovery=10``; writing to the image later, from a
+    VM, drops it. ``qemu-img info`` shows whether an image has it.
+
+  .. option:: table_shift
+
+    Sectors per secondary deduplication table, as a power of two
+    (default: 12). Each flush writes the tables that changed, so small
+    tables keep flushes small. 0 makes a single table, written whole on
+    each flush.
+
+  Runtime options (``-drive``/``-blockdev``): ``compress``,
+  ``compression-type`` and ``deduplicate``, for the data written while
+  the image is open, and ``checkpoint-interval``, the seconds after a
+  write before a checkpoint is written when the guest does not flush
+  (default: 5; 0 writes checkpoints only when the guest flushes).
+
 Read-only formats
 ~~~~~~~~~~~~~~~~~
 

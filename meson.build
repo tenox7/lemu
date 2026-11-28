@@ -78,7 +78,6 @@ have_user = have_linux_user or have_bsd_user
 ############
 
 sh = find_program('sh')
-git = find_program('git', required: false)
 python = import('python').find_installation()
 
 cc = meson.get_compiler('c')
@@ -1745,6 +1744,39 @@ if liblzfse.found() and not cc.links('''
   endif
 endif
 
+# libaaruformat: the system library if it is new enough (it has aaruf_flush), or
+# the bundled CMake subproject, built as a static library.
+aaruformat = not_found
+if get_option('aaruformat').enabled() or (get_option('aaruformat').auto() and have_block)
+  aaruformat = dependency('libaaruformat', required: false)
+  if aaruformat.found() and not cc.has_function('aaruf_flush', prefix: '#include <aaruformat.h>',
+                                                dependencies: aaruformat)
+    aaruformat = not_found
+  endif
+  if not aaruformat.found() and (get_option('wrap_mode') != 'nodownload' or
+                                 fs.is_dir('subprojects/libaaruformat'))
+    aaruformat_cmake_opts = import('cmake').subproject_options()
+    aaruformat_cmake_opts.add_cmake_defines({
+      'BUILD_SHARED_LIBS': false,
+      'AARU_BUILD_PACKAGE': true,
+      'AARU_SYSTEM_ZSTD': zstd.found(),
+      'CMAKE_POSITION_INDEPENDENT_CODE': true,
+    })
+    aaruformat_cmake_opts.set_override_option('werror', 'false')
+    aaruformat_cmake_opts.set_override_option('warning_level', '0')
+    aaruformat_cmake_opts.set_install(false)
+    aaruformat_proj = import('cmake').subproject('libaaruformat',
+                                                 options: aaruformat_cmake_opts,
+                                                 required: get_option('aaruformat'))
+    if aaruformat_proj.found()
+      aaruformat = aaruformat_proj.dependency('aaruformat')
+    endif
+  endif
+  if not aaruformat.found() and get_option('aaruformat').enabled()
+    error('libaaruformat not found, and the subproject could not be used')
+  endif
+endif
+
 oss = not_found
 if get_option('oss').allowed() and have_system
   if not cc.has_header('sys/soundcard.h')
@@ -2460,6 +2492,7 @@ config_host_data.set('CONFIG_POSIX', host_os != 'windows')
 config_host_data.set('CONFIG_WIN32', host_os == 'windows')
 config_host_data.set('CONFIG_LZO', lzo.found())
 config_host_data.set('CONFIG_MPATH', mpathpersist.found())
+config_host_data.set('CONFIG_AARUFORMAT', aaruformat.found())
 config_host_data.set('CONFIG_BLKIO', blkio.found())
 if blkio.found()
   config_host_data.set('CONFIG_BLKIO_VHOST_VDPA_FD',
@@ -2653,7 +2686,7 @@ config_host_data.set('CONFIG_TIMERFD', cc.has_function('timerfd_create'))
 config_host_data.set('CONFIG_GETLOADAVG', cc.has_function('getloadavg'))
 config_host_data.set('CONFIG_ARPA_INET_64', cc.has_function('htonll'))
 config_host_data.set('HAVE_COPY_FILE_RANGE', cc.has_function('copy_file_range'))
-config_host_data.set('HAVE_GETIFADDRS', cc.has_function('getifaddrs'))
+config_host_data.set('HAVE_GETIFADDRS', cc.has_function('getifaddrs', dependencies: socket))
 config_host_data.set('HAVE_GLIB_WITH_SLICE_ALLOCATOR', glib_has_gslice)
 config_host_data.set('HAVE_OPENPTY', cc.has_function('openpty', dependencies: util))
 config_host_data.set('HAVE_STRCHRNUL', cc.has_function('strchrnul', prefix: osdep_prefix))
@@ -2728,6 +2761,8 @@ if linux_io_uring.found()
                        cc.has_header_symbol('liburing.h', 'io_uring_prep_writev2'))
   config_host_data.set('HAVE_IO_URING_CQ_HAS_OVERFLOW',
                        cc.has_header_symbol('liburing.h', 'io_uring_cq_has_overflow'))
+  config_host_data.set('HAVE_IO_URING_SET_IOWAIT',
+                       cc.has_header_symbol('liburing.h', 'io_uring_set_iowait'))
 endif
 config_host_data.set('HAVE_TCP_KEEPCNT',
                      cc.has_header_symbol('netinet/tcp.h', 'TCP_KEEPCNT') or
@@ -3572,25 +3607,15 @@ tracetool_depends = files(
   'scripts/tracetool/__init__.py',
 )
 
-qemu_pkgversion = get_option('pkgversion')
-git_describe_version = [git, 'describe', '--match', 'v*', '--dirty']
-if qemu_pkgversion == '' and git.found() and fs.exists('.git') and \
-    run_command(git_describe_version, check: false).returncode() == 0
-  # Refresh the version at build time, so that "make" after a commit updates it.
-  qemu_version = vcs_tag(input: 'scripts/qemu-version.h.in',
-                         output: 'qemu-version.h',
-                         command: git_describe_version,
-                         fallback: '')
-else
-  # Unlike vcs_tag(), which always defines QEMU_PKGVERSION, leave it out if
-  # empty.  include/qemu/version.h then omits the parentheses from
-  # QEMU_FULL_VERSION.
-  qemu_version_data = configuration_data()
-  if qemu_pkgversion != ''
-    qemu_version_data.set_quoted('QEMU_PKGVERSION', qemu_pkgversion)
-  endif
-  qemu_version = configure_file(output: 'qemu-version.h', configuration: qemu_version_data)
-endif
+qemu_version_cmd = [find_program('scripts/qemu-version.sh'),
+                    meson.current_source_dir(),
+                    get_option('pkgversion'), meson.project_version()]
+qemu_version = custom_target('qemu-version.h',
+                             output: 'qemu-version.h',
+                             command: qemu_version_cmd,
+                             capture: true,
+                             build_by_default: true,
+                             build_always_stale: true)
 genh += qemu_version
 
 hxdep = []
@@ -3733,6 +3758,7 @@ if have_system or have_user
     'target/i386/kvm',
     'target/i386/whpx',
     'target/loongarch',
+    'target/m68k',
     'target/mips/tcg',
     'target/ppc',
     'target/riscv',
@@ -4956,6 +4982,7 @@ if have_block
   summary_info += {'bochs support':     get_option('bochs').allowed()}
   summary_info += {'cloop support':     get_option('cloop').allowed()}
   summary_info += {'dmg support':       get_option('dmg').allowed()}
+  summary_info += {'AaruFormat support': aaruformat}
   summary_info += {'qcow v1 support':   get_option('qcow1').allowed()}
   summary_info += {'vdi support':       get_option('vdi').allowed()}
   summary_info += {'vhdx support':      get_option('vhdx').allowed()}

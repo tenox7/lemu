@@ -321,7 +321,7 @@
 #define PLL_TEST_CNTL                           0x13
 #define P2PLL_CNTL                              0x2a
 #define P2PLL_REF_DIV                           0x2b
-#define P2PLL_DIV_0                             0x2b
+#define P2PLL_DIV_0                             0x2c
 #define POWER_MANAGEMENT                        0x2f
 
 #define PPLL_RESET                              0x00000001
@@ -427,6 +427,7 @@
 #define SRC_COLOR                               0x00030000
 #define DP_SRC_DATATYPE                         0x00030000
 #define DP_BYTE_PIX_ORDER                       0x40000000
+#define DP_HOST_BIG_ENDIAN_EN                   0x20000000
 
 #define BRUSH_8X8_MONO_FRGD_BKGD                0x00000000
 #define BRUSH_8X8_MONO_FRGD                     0x00000100

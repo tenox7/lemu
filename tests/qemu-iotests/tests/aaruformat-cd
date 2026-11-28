@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# group: rw quick
+#
+# AaruFormat CD images on ide-cd: the real track list (READ TOC, READ DISC
+# INFORMATION) and the raw sectors of audio and data tracks (READ CD).
+#
+# The sample image was made by Aaru from a cue sheet: track 1 is mode 1
+# data (LBA 0-31, sector s filled with (s * 7 + i) & 0xff), tracks 2 and 3
+# are audio (LBA 32-106 and 107-181, sector s of the audio file filled
+# with (s * 3 + i * 5 + 1) & 0xff).
+#
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import struct
+import time
+
+import iotests
+from iotests import log
+
+iotests.script_initialize(supported_fmts=['aaruformat'],
+                          supported_protocols=['file'],
+                          supported_platforms=['linux'])
+
+# Primary IDE channel, legacy ports
+DATA, FEATURE, COUNT, LBA_MID, LBA_HIGH, DEVICE, STATUS = \
+    0x1f0, 0x1f1, 0x1f2, 0x1f4, 0x1f5, 0x1f6, 0x1f7
+BSY, DRQ, ERR = 0x80, 0x08, 0x01
+
+
+class Atapi:
+    def __init__(self, vm):
+        self.vm = vm
+
+    def inb(self, port):
+        return int(self.vm.qtest(f'inb {port:#x}').split()[1], 16)
+
+    def inw(self, port):
+        return int(self.vm.qtest(f'inw {port:#x}').split()[1], 16)
+
+    def outb(self, port, val):
+        self.vm.qtest(f'outb {port:#x} {val:#x}')
+
+    def outw(self, port, val):
+        self.vm.qtest(f'outw {port:#x} {val:#x}')
+
+    def wait(self):
+        """Status once not busy"""
+        for _ in range(5000):
+            status = self.inb(STATUS)
+            if not status & BSY:
+                return status
+            self.vm.qtest('clock_step 100000')
+            time.sleep(0.001)
+        raise RuntimeError('device stays busy')
+
+    def command(self, cdb):
+        """Send a packet command, return (data, error)"""
+        cdb = bytes(cdb).ljust(12, b'\0')
+        self.outb(DEVICE, 0xa0)
+        self.outb(FEATURE, 0)
+        self.outb(LBA_MID, 0xfe)
+        self.outb(LBA_HIGH, 0xff)
+        self.outb(STATUS, 0xa0)
+        self.wait()
+        for i in range(0, 12, 2):
+            self.outw(DATA, cdb[i] | cdb[i + 1] << 8)
+        data = bytearray()
+        while True:
+            status = self.wait()
+            if status & ERR:
+                return bytes(data), True
+            if not status & DRQ:
+                return bytes(data), False
+            count = self.inb(LBA_MID) | self.inb(LBA_HIGH) << 8
+            for _ in range(count // 2):
+                data += struct.pack('<H', self.inw(DATA))
+
+
+def audio_sector(s):
+    return bytes((s * 3 + i * 5 + 1) & 0xff for i in range(2352))
+
+
+def data_sector(s):
+    return bytes((s * 7 + i) & 0xff for i in range(2048))
+
+
+def read_cd(lba, count, sector_type, fields, sub=0):
+    return [0xbe, sector_type << 2] + list(struct.pack('>I', lba)) + \
+        [count >> 16 & 0xff, count >> 8 & 0xff, count & 0xff, fields, sub]
+
+
+with iotests.FilePath('mixed.aif') as img:
+    iotests.unarchive_sample_image('aaruformat-mixed-cd.aif', img)
+
+    vm = iotests.VM()
+    vm.add_args('-machine', 'pc')
+    vm.add_args('-drive', f'if=none,id=cd,file={img},format=aaruformat,'
+                'media=cdrom,read-only=on')
+    vm.add_args('-device', 'ide-cd,drive=cd,bus=ide.0,unit=0')
+    vm.launch()
+    atapi = Atapi(vm)
+
+    # A first command reports the medium change
+    atapi.command([0x00])
+
+    log('== READ TOC ==')
+    toc, err = atapi.command([0x43, 0, 0, 0, 0, 0, 1, 0x03, 0x24])
+    log(f'error {err}, first {toc[2]}, last {toc[3]}')
+    for off in range(4, len(toc), 8):
+        adr_ctl, track, lba = toc[off + 1], toc[off + 2], \
+            struct.unpack('>I', toc[off + 4:off + 8])[0]
+        log(f'track {track:#04x} control {adr_ctl & 0xf:#x} lba {lba}')
+
+    log('== READ TOC, full ==')
+    raw, err = atapi.command([0x43, 0, 2, 0, 0, 0, 0, 0x03, 0x24, 0x80])
+    log(f'error {err}, sessions {raw[2]}-{raw[3]}')
+    for off in range(4, len(raw), 11):
+        d = raw[off:off + 11]
+        log(f'point {d[3]:#04x} control {d[1] & 0xf:#x} '
+            f'p {d[8]:02d}:{d[9]:02d}:{d[10]:02d}')
+
+    log('== READ DISC INFORMATION ==')
+    info, err = atapi.command([0x51, 0, 0, 0, 0, 0, 0, 0, 34])
+    log(f'error {err}, first track {info[3]}, sessions {info[4]}, '
+        f'last session tracks {info[5]}-{info[6]}')
+
+    log('== READ CD of audio sectors ==')
+    data, err = atapi.command(read_cd(32, 3, 1, 0x10))
+    log(f'error {err}, {len(data)} bytes, same as the audio file: ' +
+        str(data == b''.join(audio_sector(s) for s in range(3))))
+    data, err = atapi.command(read_cd(107, 1, 0, 0xf8))
+    log(f'error {err}, {len(data)} bytes, same as the audio file: ' +
+        str(data == audio_sector(75)))
+
+    log('== READ CD of data sectors ==')
+    data, err = atapi.command(read_cd(5, 2, 2, 0xf8))
+    log(f'error {err}, {len(data)} bytes')
+    for i in range(2):
+        sector = data[i * 2352:(i + 1) * 2352]
+        log(f'sync {sector[:12].hex()}, mode {sector[15]}, user data ' +
+            str(sector[16:2064] == data_sector(5 + i)))
+    data, err = atapi.command(read_cd(5, 1, 2, 0x10))
+    log(f'user data only: error {err}, {len(data)} bytes, ' +
+        str(data == data_sector(5)))
+
+    log('== READ CD with Q subchannel ==')
+    data, err = atapi.command(read_cd(40, 1, 1, 0x10, 2))
+    q = data[2352:]
+    log(f'error {err}, {len(data)} bytes, Q {q[:10].hex()}')
+
+    log('== READ CD of the wrong sector type ==')
+    data, err = atapi.command(read_cd(40, 1, 2, 0x10))
+    log(f'error {err}')
+
+    vm.shutdown()

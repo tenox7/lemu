@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qemu/module.h"
+#include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/isa/isa.h"
 #include "hw/core/irq.h"
@@ -33,6 +34,7 @@
 #include "net/net.h"
 #include "net/eth.h"
 #include "system/address-spaces.h"
+#include "system/runstate.h"
 #include "qom/object.h"
 #include "trace.h"
 #include <zlib.h>
@@ -90,6 +92,8 @@ struct WD8003State {
 
     uint32_t iobase;
     uint32_t isairq;
+    QEMUTimer *rx_timer;
+    int64_t rx_next;        /* QEMU_CLOCK_VIRTUAL: the wire is free again */
     MemoryRegion io;
     MemoryRegion shmem;
     qemu_irq irq;
@@ -171,8 +175,13 @@ static unsigned wd_ring_free(WD8003State *s)
 
 static bool wd_ring_full(WD8003State *s)
 {
-    /* the header, the largest frame and its CRC, rounded up to pages */
-    return wd_ring_free(s) < ((4 + WD_MAX_FRAME + 255) & ~255);
+    /*
+     * Room for the largest frame (the header, the frame and its CRC,
+     * rounded up to pages) and one page more. The DP8390 never stores
+     * into the BNRY page, so a frame never takes CURR up to BNRY, where
+     * the ring would look empty.
+     */
+    return wd_ring_free(s) <= ((4 + WD_MAX_FRAME + 255) & ~255);
 }
 
 static bool wd_accept(WD8003State *s, const uint8_t *buf)
@@ -195,7 +204,14 @@ static bool wd_accept(WD8003State *s, const uint8_t *buf)
     return !memcmp(buf, s->par, 6);
 }
 
-/* Store a frame in the receive ring: 4 header bytes, the frame, its CRC. */
+/*
+ * Store a frame in the receive ring: 4 header bytes, the frame, its CRC.
+ * The byte count in the header is the frame and its CRC, without the
+ * header: 1518 for the largest frame. Drivers drop a frame with a
+ * larger count: when the count also had the header, the drivers of Dell
+ * UNIX (wdn) and SINIX-Z (wd) lost every frame over 1510 bytes, such as
+ * full TCP segments and NFS fragments.
+ */
 static void wd_store(WD8003State *s, const uint8_t *buf, size_t size)
 {
     uint8_t frame[WD_MAX_FRAME];
@@ -217,8 +233,8 @@ static void wd_store(WD8003State *s, const uint8_t *buf, size_t size)
     if (index < start || index >= stop) {
         index = start;
     }
-    count = size + 4;
-    next = index + ((count + 255) & ~255);
+    count = size;
+    next = index + ((4 + size + 255) & ~255);
     if (next >= stop) {
         next -= stop - start;
     }
@@ -244,6 +260,35 @@ static void wd_store(WD8003State *s, const uint8_t *buf, size_t size)
     wd_update_irq(s);
 }
 
+/* A frame's time on a 10 Mbit/s wire: preamble, frame, CRC and gap. */
+static int64_t wd_wire_ns(size_t size)
+{
+    size = MIN(MAX(size, 60), WD_MAX_FRAME - 4);
+    return (size + 8 + 4 + 12) * 800;
+}
+
+/*
+ * QEMU's network backends hand over a burst of frames at once, and each
+ * BNRY write lets the next waiting frame into the ring, so the driver got
+ * a whole burst in one receive interrupt. Dell UNIX then lost the second
+ * of two 8 KB NFS replies (12 frames), although its driver read every
+ * frame. So frames come no faster than on the wire: about 1.2 ms for a
+ * full frame. A stopped VM gets the waiting frames at once, and a wait
+ * longer than one frame time means the clock went back (loadvm).
+ */
+static bool wd_on_wire(WD8003State *s, int64_t now)
+{
+    return runstate_is_running() && now < s->rx_next &&
+           s->rx_next - now <= wd_wire_ns(WD_MAX_FRAME - 4);
+}
+
+static void wd_rx_timer(void *opaque)
+{
+    WD8003State *s = opaque;
+
+    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+}
+
 static bool wd_can_receive(NetClientState *nc)
 {
     WD8003State *s = qemu_get_nic_opaque(nc);
@@ -258,6 +303,7 @@ static bool wd_can_receive(NetClientState *nc)
 static ssize_t wd_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 {
     WD8003State *s = qemu_get_nic_opaque(nc);
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     if ((s->cr & CR_STP) || (s->tcr & TCR_LB) || size < 6 ||
         !wd_accept(s, buf)) {
@@ -266,14 +312,24 @@ static ssize_t wd_receive(NetClientState *nc, const uint8_t *buf, size_t size)
     if (s->rcr & RCR_MON) {
         return size;
     }
+    if (wd_on_wire(s, now)) {
+        /* the timer flushes QEMU's queue when the wire is free */
+        timer_mod(s->rx_timer, s->rx_next);
+        return 0;
+    }
     if (wd_ring_full(s)) {
-        s->rsr |= RSR_MPA;
-        s->cntr[2]++;
-        s->isr |= ISR_OVW;
-        wd_update_irq(s);
+        /*
+         * The frame waits in QEMU's queue until the driver frees pages:
+         * a BNRY write flushes the queue. Nothing is lost, so no overflow
+         * warning and no missed packet. Dell UNIX's wdn driver answers
+         * OVW by restarting the NIC without reading the ring, so an OVW
+         * for a waiting frame left the frames in the ring unread, and
+         * with no room for another frame, no PRX came again.
+         */
         return 0;
     }
     wd_store(s, buf, size);
+    s->rx_next = now + wd_wire_ns(size);
     return size;
 }
 
@@ -583,6 +639,8 @@ static void wd_reset(DeviceState *dev)
     s->msr = 0;
     wd_map_ram(s);
     wd_nic_reset(s);
+    timer_del(s->rx_timer);
+    s->rx_next = 0;
 }
 
 static void wd_realize(DeviceState *dev, Error **errp)
@@ -625,6 +683,7 @@ static void wd_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion_overlap(get_system_memory(), 0xd0000,
                                         &s->shmem, 2);
     s->irq = isa_get_irq(isa, s->isairq);
+    s->rx_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, wd_rx_timer, s);
 
     s->nic = qemu_new_nic(&net_wd8003_info, &s->conf,
                           object_get_typename(OBJECT(dev)), dev->id,

@@ -2,6 +2,13 @@
  * NeXT Cube/Station Framebuffer Emulation
  *
  * Copyright (c) 2011 Bryce Lanham
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+ *
+ * The screen is 1120x832. The monochrome machines have 2 bits per pixel,
+ * 0 being white, in 256 kB of VRAM; the colour machines 16 bits per pixel
+ * (4 bits each of red, green, blue and alpha, big-endian) in 2 MB. Lines
+ * are 1152 pixels apart, but on the Turbo machines 1120 (Previous's
+ * sdlscreen.c).
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -22,15 +29,20 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "ui/console.h"
 #include "hw/core/loader.h"
+#include "hw/core/qdev-properties.h"
 #include "framebuffer.h"
 #include "ui/pixel_ops.h"
 #include "hw/m68k/next-cube.h"
 #include "qom/object.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(NeXTFbState, NEXTFB)
+
+#define NEXTFB_WIDTH    1120
+#define NEXTFB_HEIGHT   832
 
 struct NeXTFbState {
     SysBusDevice parent_obj;
@@ -39,64 +51,76 @@ struct NeXTFbState {
     MemoryRegionSection fbsection;
     QemuConsole *con;
 
+    bool color;
+    bool turbo;
     uint32_t cols;
     uint32_t rows;
+    uint32_t stride;
     int invalidate;
 };
 
-static void nextfb_draw_line(void *opaque, uint8_t *d, const uint8_t *s,
-                             int width, int pitch)
+static void nextfb_draw_line_mono(void *opaque, uint8_t *d, const uint8_t *s,
+                                  int width, int pitch)
 {
-    NeXTFbState *nfbstate = NEXTFB(opaque);
     static const uint32_t pal[4] = {
         0xFFFFFFFF, 0xFFAAAAAA, 0xFF555555, 0xFF000000
     };
     uint32_t *buf = (uint32_t *)d;
-    int i = 0;
 
-    for (i = 0; i < nfbstate->cols / 4; i++) {
-        int j = i * 4;
+    for (int i = 0; i < width / 4; i++) {
         uint8_t src = s[i];
-        buf[j + 3] = pal[src & 0x3];
-        src >>= 2;
-        buf[j + 2] = pal[src & 0x3];
-        src >>= 2;
-        buf[j + 1] = pal[src & 0x3];
-        src >>= 2;
-        buf[j + 0] = pal[src & 0x3];
+
+        buf[i * 4 + 0] = pal[(src >> 6) & 3];
+        buf[i * 4 + 1] = pal[(src >> 4) & 3];
+        buf[i * 4 + 2] = pal[(src >> 2) & 3];
+        buf[i * 4 + 3] = pal[src & 3];
+    }
+}
+
+static void nextfb_draw_line_color(void *opaque, uint8_t *d, const uint8_t *s,
+                                   int width, int pitch)
+{
+    uint32_t *buf = (uint32_t *)d;
+
+    for (int i = 0; i < width; i++) {
+        uint16_t c = lduw_be_p(s + i * 2);
+        uint32_t r = ((c >> 12) & 0xF) * 0x11;
+        uint32_t g = ((c >> 8) & 0xF) * 0x11;
+        uint32_t b = ((c >> 4) & 0xF) * 0x11;
+
+        buf[i] = 0xFF000000 | (r << 16) | (g << 8) | b;
     }
 }
 
 static bool nextfb_update(void *opaque)
 {
     NeXTFbState *s = NEXTFB(opaque);
-    int dest_width = 4;
-    int src_width;
-    int first = 0;
-    int last  = 0;
     DisplaySurface *surface = qemu_console_surface(s->con);
-
-    src_width = s->cols / 4 + 8;
-    dest_width = s->cols * 4;
+    int first = 0;
+    int last = 0;
 
     if (s->invalidate) {
         framebuffer_update_memory_section(&s->fbsection, &s->fb_mr, 0,
-                                          s->cols, src_width);
-        s->invalidate = 0;
+                                          s->rows, s->stride);
     }
 
     framebuffer_update_display(surface, &s->fbsection, s->cols, s->rows,
-                               src_width, dest_width, 0, 1, nextfb_draw_line,
+                               s->stride, s->cols * 4, 0, s->invalidate,
+                               s->color ? nextfb_draw_line_color
+                                        : nextfb_draw_line_mono,
                                s, &first, &last);
+    s->invalidate = 0;
 
-    qemu_console_update(s->con, 0, 0, s->cols, s->rows);
-
+    if (first >= 0) {
+        qemu_console_update(s->con, 0, first, s->cols, last - first + 1);
+    }
     return true;
 }
 
 static void nextfb_invalidate(void *opaque)
 {
     NeXTFbState *s = NEXTFB(opaque);
+
     s->invalidate = 1;
 }
 
@@ -107,19 +131,30 @@ static const GraphicHwOps nextfb_ops = {
 
 static void nextfb_realize(DeviceState *dev, Error **errp)
 {
+    ERRP_GUARD();
     NeXTFbState *s = NEXTFB(dev);
+    uint32_t line_pixels = s->turbo ? NEXTFB_WIDTH : 1152;
 
-    memory_region_init_ram(&s->fb_mr, OBJECT(dev), "next-video", 0x1CB100,
-                           &error_fatal);
+    s->cols = NEXTFB_WIDTH;
+    s->rows = NEXTFB_HEIGHT;
+    s->stride = s->color ? line_pixels * 2 : line_pixels / 4;
+
+    memory_region_init_ram(&s->fb_mr, OBJECT(dev), "next-video",
+                           s->color ? 2 * MiB : 256 * KiB, errp);
+    if (*errp) {
+        return;
+    }
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->fb_mr);
 
     s->invalidate = 1;
-    s->cols = 1120;
-    s->rows = 832;
-
     s->con = qemu_graphic_console_create(dev, 0, &nextfb_ops, s);
     qemu_console_resize(s->con, s->cols, s->rows);
 }
+
+static const Property nextfb_properties[] = {
+    DEFINE_PROP_BOOL("color", NeXTFbState, color, false),
+    DEFINE_PROP_BOOL("turbo", NeXTFbState, turbo, false),
+};
 
 static void nextfb_class_init(ObjectClass *oc, const void *data)
 {
@@ -127,8 +162,9 @@ static void nextfb_class_init(ObjectClass *oc, const void *data)
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->realize = nextfb_realize;
+    device_class_set_props(dc, nextfb_properties);
 
-    /* Note: This device does not have any state that we have to reset or migrate */
+    /* The VRAM is RAM and migrates by itself; there is no other state */
 }
 
 static const TypeInfo nextfb_info = {

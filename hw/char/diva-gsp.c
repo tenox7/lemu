@@ -17,6 +17,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
+#include "qemu/log.h"
 #include "hw/char/serial.h"
 #include "hw/core/irq.h"
 #include "hw/pci/pci_device.h"
@@ -45,6 +46,7 @@ typedef struct PCIDivaSerialState {
     PCIDevice    dev;
     MemoryRegion membar;        /* for serial ports */
     MemoryRegion mailboxbar;    /* for hardware mailbox */
+    MemoryRegion irq_status;    /* which UARTs have their interrupt up */
     uint32_t     subvendor;
     uint32_t     ports;
     char         *name[PCI_SERIAL_MAX_PORTS];
@@ -81,6 +83,48 @@ static void multi_serial_irq_mux(void *opaque, int n, int level)
     }
     pci_set_irq(&pci->dev, pending);
 }
+
+/*
+ * HP-UX 11.31 asio0_intr reads the byte at BAR0 + 0x1b on a Diva card:
+ * bit n set = UART n has its interrupt up. It then services those UARTs.
+ */
+#define DIVA_IRQ_STATUS_OFFSET  0x18
+
+static uint64_t diva_irq_status_read(void *opaque, hwaddr addr, unsigned size)
+{
+    PCIDivaSerialState *pci = opaque;
+    uint64_t val = 0;
+    int i;
+
+    if (addr == 3) {
+        for (i = 0; i < pci->ports; i++) {
+            if (pci->level[i]) {
+                val |= BIT(i);
+            }
+        }
+    } else {
+        qemu_log_mask(LOG_UNIMP, "diva-gsp: read of irq status byte %d\n",
+                      (int)addr);
+    }
+    return val;
+}
+
+static void diva_irq_status_write(void *opaque, hwaddr addr, uint64_t val,
+                                  unsigned size)
+{
+    qemu_log_mask(LOG_UNIMP, "diva-gsp: write 0x%" PRIx64
+                  " to irq status byte %d\n", val, (int)addr);
+}
+
+static const MemoryRegionOps diva_irq_status_ops = {
+    .read = diva_irq_status_read,
+    .write = diva_irq_status_write,
+    .endianness = DEVICE_BIG_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
 
 struct diva_info {
     unsigned int nports:4; /* number of serial ports */
@@ -148,6 +192,14 @@ static void diva_pci_realize(PCIDevice *dev, Error **errp)
         offset += 8;
         portmask >>= 1;
         pci->ports++;
+    }
+
+    /* the UART interrupt status byte, after the UARTs */
+    if (!(di.omask & BIT(DIVA_IRQ_STATUS_OFFSET / 8))) {
+        memory_region_init_io(&pci->irq_status, OBJECT(pci),
+                              &diva_irq_status_ops, pci, "irq status", 8);
+        memory_region_add_subregion(&pci->membar, DIVA_IRQ_STATUS_OFFSET,
+                                    &pci->irq_status);
     }
 
     /* mailbox bar */

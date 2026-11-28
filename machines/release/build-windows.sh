@@ -9,6 +9,7 @@ BINS="qemu-system-i386 qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-
 if [ "$1" != --container ]; then
     [ $# -eq 2 ] || { echo "usage: $0 SRC OUT" >&2; exit 1; }
     mkdir -p "$2"
+    sh "$(dirname "$0")/get-libaaruformat.sh" "$1"
     exec docker run --rm \
         -e "PKGVERSION=$(git -C "$1" describe --match 'v*' --dirty 2>/dev/null)" \
         -v "$(cd "$1" && pwd):/src:ro" -v "$(cd "$(dirname "$0")" && pwd):/work:ro" \
@@ -19,7 +20,7 @@ exec 2>/out/windows-x86_64-err.log
 set -x
 dnf -y -q install gcc mingw64-gcc mingw64-glib2 mingw64-pixman \
     mingw64-sdl2-compat mingw64-SDL3 mingw64-pkg-config make ninja-build \
-    python3 git bzip2 diffutils findutils tar >/dev/null
+    python3 git bzip2 diffutils findutils tar cmake >/dev/null
 mkdir -p /b/build
 tar -C /src --exclude=./.git --exclude='./build*' --exclude=.env -cf - . | tar -C /b -xf -
 cd /b/build
@@ -31,6 +32,7 @@ cd /b/build
     --enable-dsound --enable-pixman --enable-slirp --enable-fdt=internal --enable-vnc --enable-rdp \
     --enable-vvfat --enable-qcow1 --enable-vdi --enable-vmdk --enable-vpc --enable-vhdx \
     --enable-qed --enable-bochs --enable-cloop --enable-dmg --enable-parallels \
+    --enable-aaruformat \
     --enable-stack-protector --disable-docs > /out/windows-x86_64-configure.log
 exes=
 for b in $BINS; do exes="$exes $b.exe"; done
@@ -65,7 +67,8 @@ while [ -n "$todo" ]; do
 done
 set +x
 fail=0
-for f in 'SDL support' 'DirectSound support' 'slirp support' 'RDP support'; do
+for f in 'SDL support' 'DirectSound support' 'slirp support' 'RDP support' \
+         'AaruFormat support'; do
     grep -q "^ *$f *: YES" /out/windows-x86_64-configure.log ||
         { echo "MISSING: $f"; fail=1; }
 done

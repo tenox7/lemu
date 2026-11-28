@@ -79,7 +79,7 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_I440FX') and                                          \
    config_all_devices.has_key('CONFIG_E1000_PCI') ? ['pci-slot-clash-test'] : []) +         \
   (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : []) +           \
-  (config_all_devices.has_key('CONFIG_SGA') ? ['boot-serial-test'] : []) +                  \
+  ['boot-serial-test'] + \
   (config_all_devices.has_key('CONFIG_ISA_IPMI_KCS') ? ['ipmi-kcs-test'] : []) +            \
   (host_os == 'linux' and                                                                  \
    config_all_devices.has_key('CONFIG_ISA_IPMI_BT') and
@@ -176,6 +176,7 @@ qtests_loongarch64 = qtests_filter + \
    'migration-test']
 
 qtests_m68k = ['boot-serial-test'] + \
+  (config_all_devices.has_key('CONFIG_NEXTCUBE') ? ['next-test'] : []) + \
   qtests_filter
 
 qtests_microblaze = ['boot-serial-test'] + \
@@ -273,6 +274,8 @@ qtests_exynos4210 = \
 qtests_arm = \
   (config_all_devices.has_key('CONFIG_OLIMEX_STM32_H405') ? \
    ['stm32f405-timer-test', 'stm32f405-rcc-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_NETDUINO2') and
+   config_all_devices.has_key('CONFIG_SSI_M25P80') ? ['stm32f2xx-spi-test'] : []) + \
   (config_all_devices.has_key('CONFIG_MPS2') ? ['sse-timer-test'] : []) + \
   (config_all_devices.has_key('CONFIG_CMSDK_APB_DUALTIMER') ? ['cmsdk-apb-dualtimer-test'] : []) + \
   (config_all_devices.has_key('CONFIG_CMSDK_APB_TIMER') ? ['cmsdk-apb-timer-test'] : []) + \

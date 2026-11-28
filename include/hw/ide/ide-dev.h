@@ -2,6 +2,7 @@
  * ide device definitions
  *
  * Copyright (c) 2009 Gerd Hoffmann <kraxel@redhat.com>
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This code is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -101,8 +102,18 @@ struct IDEState {
     int packet_transfer_size;
     int elementary_transfer_size;
     int32_t io_buffer_index;
-    int lba;
+    int64_t lba;
     int cd_sector_size;
+    /* READ CD served from the raw sectors of a CD image with tracks */
+    bool cd_raw;
+    uint8_t cd_raw_fields;     /* byte 9 of READ CD */
+    uint8_t cd_raw_sub;        /* subchannel selection of READ CD */
+    bool cd_raw_nosub;         /* the image has no subchannel: Q made up */
+    struct BlockCdToc *cd_toc; /* tracks of the image, NULL if none */
+    uint8_t *cd_raw_buf;       /* raw sectors read, cd_raw_buf_sectors */
+    uint8_t *cd_raw_sub_buf;
+    int cd_raw_buf_sectors;
+    int64_t cd_last_lba;       /* last sector read, for READ SUB-CHANNEL */
     int atapi_dma; /* true if dma is requested for the packet cmd */
     BlockAcctCookie acct;
     BlockAIOCB *pio_aiocb;

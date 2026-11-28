@@ -465,6 +465,34 @@
             '*maxlen': 'uint32' } }
 
 ##
+# @FilterNextProperties:
+#     Properties for filter-next objects, which serve NeXTSTEP on the
+#     user network as the Previous emulator does: bootparam, NetInfo,
+#     the time and, with a shared folder, NFS.
+#
+# @share: a host folder to share by NFS; NeXTSTEP mounts it on /Net
+#
+# @hostname: the NeXT's host name (default: next)
+#
+# @system-type: the machine type NetInfo gives (default: NeXTstation)
+#
+# @network-time: tell NeXTSTEP to take its time from the host
+#     (default: true)
+#
+# @debug: log the requests to stderr (default: false)
+#
+# Since: 11.2
+##
+{ 'struct': 'FilterNextProperties',
+  'base': 'NetfilterProperties',
+  'data': { '*share': 'str',
+            '*hostname': 'str',
+            '*system-type': 'str',
+            '*network-time': 'bool',
+            '*debug': 'bool' },
+  'if': 'CONFIG_SLIRP' }
+
+##
 # @FilterMirrorProperties:
 #     Properties for filter-mirror objects.
 #
@@ -1266,6 +1294,8 @@
     'filter-buffer',
     'filter-dump',
     'filter-mirror',
+    { 'name': 'filter-next',
+      'if': 'CONFIG_SLIRP' },
     'filter-redirector',
     'filter-replay',
     'filter-rewriter',
@@ -1345,6 +1375,8 @@
       'filter-buffer':              'FilterBufferProperties',
       'filter-dump':                'FilterDumpProperties',
       'filter-mirror':              'FilterMirrorProperties',
+      'filter-next':                { 'type': 'FilterNextProperties',
+                                      'if': 'CONFIG_SLIRP' },
       'filter-redirector':          'FilterRedirectorProperties',
       'filter-replay':              'NetfilterProperties',
       'filter-rewriter':            'FilterRewriterProperties',

@@ -13,3 +13,5 @@ system_ss.add(when: 'CONFIG_SB16', if_true: files('sb16.c'))
 system_ss.add(when: 'CONFIG_VT82C686', if_true: files('via-ac97.c'))
 system_ss.add(when: ['CONFIG_VIRTIO_SND', 'CONFIG_VIRTIO'], if_true: files('virtio-snd.c'))
 system_ss.add(when: ['CONFIG_VIRTIO_SND', 'CONFIG_VIRTIO', 'CONFIG_VIRTIO_PCI'], if_true: files('virtio-snd-pci.c'))
+system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-dsp.c', 'next-sound.c',
+    'dsp56k/dsp56k_core.c', 'dsp56k/dsp56k_cpu.c'))

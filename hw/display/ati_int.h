@@ -30,6 +30,8 @@
 #define PCI_DEVICE_ID_ATI_RAGE128_PF 0x5046
 /* Radeon RV100 (VE) */
 #define PCI_DEVICE_ID_ATI_RADEON_QY 0x5159
+/* Radeon 7500 (RV200), emulated as the RV100 */
+#define PCI_DEVICE_ID_ATI_RADEON_QW 0x5157
 /* Radeon ES1000 (RN50), a server RV100 with one CRTC */
 #define PCI_DEVICE_ID_ATI_RADEON_ES1000 0x515e
 
@@ -44,6 +46,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(ATIVGAState, ATI_VGA)
 
 typedef struct ATIVGARegs {
     uint32_t mm_index;
+    uint32_t clock_cntl_index;
+    uint32_t pll[64];
     uint32_t bios_scratch[8];
     uint32_t gen_int_cntl;
     uint32_t gen_int_status;

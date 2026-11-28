@@ -25,7 +25,7 @@
 	url = https://gitlab.com/qemu-project/QemuMacDrivers.git
 [submodule "roms/seabios-hppa"]
 	path = roms/seabios-hppa
-	# fork of https://github.com/hdeller/seabios-hppa, branch hpux11
+	# fork of https://github.com/hdeller/seabios-hppa, branch hpux1131
 	url = https://github.com/tenox7/seabios-hppa.git
 [submodule "roms/u-boot-sam460ex"]
 	path = roms/u-boot-sam460ex

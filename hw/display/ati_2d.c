@@ -594,6 +594,23 @@ bool ati_host_data_flush(ATIVGAState *s)
     if (src_datatype == SRC_COLOR) {
         pix_count /= ctx.bpp;
         memcpy(pix_buf, s->host_data.acc, sizeof(s->host_data.acc));
+        /*
+         * HOST_BIG_ENDIAN_EN: the words hold big endian pixels, which go
+         * to a big endian frame buffer in its byte order, as fills do.
+         * The HP-UX 11.31 X server (XFree86 4.2 radeon) sets it. AIX
+         * does not: it swaps with RBBM_GUICNTL instead.
+         */
+        if (ctx.need_swap && (s->regs.dp_datatype & DP_HOST_BIG_ENDIAN_EN)) {
+            for (idx = 0; idx < pix_count; idx++) {
+                uint8_t *p = &pix_buf[idx * bypp];
+
+                if (bypp == 4) {
+                    stl_he_p(p, bswap32(ldl_he_p(p)));
+                } else if (bypp == 2) {
+                    stw_he_p(p, bswap16(lduw_he_p(p)));
+                }
+            }
+        }
     } else {
         /* Expand monochrome bits to color pixels */
         uint32_t byte_pix_order = s->regs.dp_datatype & DP_BYTE_PIX_ORDER;

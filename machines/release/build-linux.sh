@@ -11,6 +11,7 @@ BINS="qemu-system-i386 qemu-system-ppc qemu-system-ppc64 qemu-system-alpha qemu-
 if [ "$1" != --container ]; then
     [ $# -eq 3 ] || { echo "usage: $0 amd64|arm64 SRC OUT" >&2; exit 1; }
     mkdir -p "$3"
+    sh "$(dirname "$0")/get-libaaruformat.sh" "$2"
     exec docker run --rm --platform "linux/$1" \
         -e "PKGVERSION=$(git -C "$2" describe --match 'v*' --dirty 2>/dev/null)" \
         -v "$(cd "$2" && pwd):/src:ro" -v "$(cd "$(dirname "$0")" && pwd):/work:ro" \
@@ -22,7 +23,7 @@ dnf config-manager --set-enabled crb
 dnf -y -q install gcc-toolset-13-gcc gcc-toolset-13-binutils make ninja-build \
     python3.12 glib2-devel pixman-devel SDL2-devel libslirp-devel zlib-devel \
     pulseaudio-libs-devel alsa-lib-devel \
-    diffutils findutils patchelf bzip2 tar
+    diffutils findutils patchelf bzip2 tar cmake
 . /opt/rh/gcc-toolset-13/enable
 mkdir -p /b/build
 tar -C /src --exclude=./.git --exclude='./build*' --exclude=.env -cf - . | tar -C /b -xf -
@@ -34,6 +35,7 @@ cd /b/build
     --enable-pixman --enable-slirp --enable-pa --enable-alsa --enable-malloc-trim --enable-membarrier \
     --enable-fdt=internal --enable-vnc --enable-rdp --enable-vvfat --enable-qcow1 --enable-vdi --enable-vmdk \
     --enable-vpc --enable-vhdx --enable-qed --enable-bochs --enable-cloop --enable-dmg --enable-parallels \
+    --enable-aaruformat \
     --enable-stack-protector --disable-docs > $out-configure.log
 ninja $BINS > $out-ninja.log
 

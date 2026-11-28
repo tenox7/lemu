@@ -12,3 +12,4 @@ system_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-hos
 system_ss.add(when: 'CONFIG_LASIPS2', if_true: files('lasips2.c'))
 
 system_ss.add(when: 'CONFIG_VMMOUSE_MMIO', if_true: files('vmmouse-mmio.c'))
+system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-kms.c'))

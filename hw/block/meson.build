@@ -19,3 +19,5 @@ system_ss.add(when: 'CONFIG_VHOST_USER_BLK', if_true: files('vhost-user-blk.c'))
 system_ss.add(when: 'CONFIG_VHOST_USER_BLK', if_true: files('virtio-blk-common.c'))
 
 subdir('dataplane')
+system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-mo.c', 'next-mo-rs.c'))
+system_ss.add(when: 'CONFIG_NEXTCUBE', if_true: files('next-fdc.c'))

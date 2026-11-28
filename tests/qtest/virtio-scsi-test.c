@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2014 SUSE LINUX Products GmbH
  * Copyright (c) 2015 Red Hat Inc.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -61,7 +62,7 @@ static uint64_t qvirtio_scsi_alloc(QVirtioSCSIQueues *vs, size_t alloc_size,
 
 static uint8_t virtio_scsi_do_command(QVirtioSCSIQueues *vs,
                                       const uint8_t *cdb,
-                                      const uint8_t *data_in,
+                                      uint8_t *data_in,
                                       size_t data_in_len,
                                       uint8_t *data_out, size_t data_out_len,
                                       struct virtio_scsi_cmd_resp *resp_out)
@@ -109,6 +110,9 @@ static uint8_t virtio_scsi_do_command(QVirtioSCSIQueues *vs,
 
     if (resp_out) {
         memread(resp_addr, resp_out, sizeof(*resp_out));
+    }
+    if (data_in_len) {
+        memread(data_in_addr, data_in, data_in_len);
     }
 
     guest_free(alloc, req_addr);
@@ -309,6 +313,110 @@ static void test_write_to_cdrom(void *obj, void *data,
     qvirtio_scsi_pci_free(vs);
 }
 
+/* READ CD of a drive with no disc: NOT READY, MEDIUM NOT PRESENT */
+static void test_read_cd_no_medium(void *obj, void *data,
+                                   QGuestAllocator *t_alloc)
+{
+    QVirtioSCSI *scsi = obj;
+    QVirtioSCSIQueues *vs;
+    uint8_t buf[2352];
+    const uint8_t read_cd_cdb[VIRTIO_SCSI_CDB_SIZE] = {
+        /* READ CD of LBA 0, 1 sector, user data */
+        0xbe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x10
+    };
+    struct virtio_scsi_cmd_resp resp;
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+
+    virtio_scsi_do_command(vs, read_cd_cdb, buf, sizeof(buf), NULL, 0, &resp);
+    g_assert_cmphex(resp.response, ==, 0);
+    g_assert_cmphex(resp.status, ==, CHECK_CONDITION);
+    g_assert_cmphex(resp.sense[2], ==, NOT_READY);
+    g_assert_cmphex(resp.sense[12], ==, 0x3a); /* MEDIUM NOT PRESENT */
+
+    qvirtio_scsi_pci_free(vs);
+}
+
+#ifdef CONFIG_AARUFORMAT
+/*
+ * The mixed CD of the aaruformat-cd iotest: track 1 is mode 1 data (LBA
+ * 0-31), tracks 2 and 3 audio (LBA 32-106 and 107-181), byte i of audio
+ * sector s (counted from LBA 32) is (s * 3 + i * 5 + 1) & 0xff.
+ */
+static char *aaruformat_cd_path;
+
+static void *virtio_scsi_setup_aaruformat_cd(GString *cmd_line, void *arg)
+{
+    g_autofree char *sample =
+        g_test_build_filename(G_TEST_DIST, "..", "qemu-iotests",
+                              "sample_images", "aaruformat-mixed-cd.aif.bz2",
+                              NULL);
+    g_autofree char *cmd = NULL;
+    int fd;
+
+    fd = g_file_open_tmp("qtest-aaruformat-cd.XXXXXX", &aaruformat_cd_path,
+                         NULL);
+    g_assert(fd >= 0);
+    close(fd);
+    cmd = g_strdup_printf("sh -c 'bunzip2 -c \"%s\" > \"%s\"'", sample,
+                          aaruformat_cd_path);
+    g_assert(system(cmd) == 0);
+
+    g_string_append_printf(cmd_line,
+                           " -drive file=%s,if=none,id=dr1,"
+                           "format=aaruformat,media=cdrom,read-only=on "
+                           "-device scsi-cd,drive=dr1,lun=0,scsi-id=1",
+                           aaruformat_cd_path);
+    return arg;
+}
+
+/*
+ * READ CD of all the audio sectors: more than one chunk of them goes to
+ * the scatter/gather list virtio-scsi gives.
+ */
+static void test_read_cd_aaruformat(void *obj, void *data,
+                                    QGuestAllocator *t_alloc)
+{
+    QVirtioSCSI *scsi = obj;
+    QVirtioSCSIQueues *vs;
+    const int count = 150;
+    g_autofree uint8_t *buf = g_malloc0(count * 2352);
+    const uint8_t read_cd_cdb[VIRTIO_SCSI_CDB_SIZE] = {
+        /* READ CD of LBA 32, 150 CD-DA sectors, user data */
+        0xbe, 0x04, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, count, 0x10
+    };
+    struct virtio_scsi_cmd_resp resp;
+    int bad = 0;
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+
+    /* the first command after the disc is inserted reports it */
+    virtio_scsi_do_command(vs, read_cd_cdb, buf, count * 2352, NULL, 0,
+                           &resp);
+    if (resp.status == CHECK_CONDITION && resp.sense[2] == UNIT_ATTENTION) {
+        virtio_scsi_do_command(vs, read_cd_cdb, buf, count * 2352, NULL, 0,
+                               &resp);
+    }
+    g_assert_cmphex(resp.response, ==, 0);
+    g_assert_cmphex(resp.status, ==, GOOD);
+    g_assert_cmpint(resp.resid, ==, 0);
+
+    for (int s = 0; s < count; s++) {
+        for (int i = 0; i < 2352; i++) {
+            bad += buf[s * 2352 + i] != ((s * 3 + i * 5 + 1) & 0xff);
+        }
+    }
+    g_assert_cmpint(bad, ==, 0);
+
+    qvirtio_scsi_pci_free(vs);
+    unlink(aaruformat_cd_path);
+    g_free(aaruformat_cd_path);
+    aaruformat_cd_path = NULL;
+}
+#endif
+
 static void test_iothread_attach_node(void *obj, void *data,
                                       QGuestAllocator *t_alloc)
 {
@@ -434,6 +542,12 @@ static void *virtio_scsi_setup_cd(GString *cmd_line, void *arg)
     return arg;
 }
 
+static void *virtio_scsi_setup_cd_empty(GString *cmd_line, void *arg)
+{
+    g_string_append(cmd_line, " -device scsi-cd,lun=0,scsi-id=1");
+    return arg;
+}
+
 static void *virtio_scsi_setup_iothread(GString *cmd_line, void *arg)
 {
     g_string_append(cmd_line,
@@ -464,6 +578,16 @@ static void register_virtio_scsi_test(void)
 
     opts.before = virtio_scsi_setup_cd;
     qos_add_test("write-to-cdrom", "virtio-scsi", test_write_to_cdrom, &opts);
+
+    opts.before = virtio_scsi_setup_cd_empty;
+    qos_add_test("read-cd-no-medium", "virtio-scsi", test_read_cd_no_medium,
+                 &opts);
+
+#ifdef CONFIG_AARUFORMAT
+    opts.before = virtio_scsi_setup_aaruformat_cd;
+    qos_add_test("read-cd-aaruformat", "virtio-scsi", test_read_cd_aaruformat,
+                 &opts);
+#endif
 
     opts.before = virtio_scsi_setup_iothread;
     opts.edge = (QOSGraphEdgeOptions) {

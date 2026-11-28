@@ -1,0 +1,21 @@
+# What qemu-system-m68k must have for the NeXT kits. check.sh fails if one
+# is missing. WHERE is all or a platform (macos, linux).
+#
+# WHERE   KIND     NAME                       # why
+all       version  git-id                     # --version names the commit
+all       monitor  hmp                        # run.sh uses -monitor stdio
+all       accel    tcg                        # the only accelerator for m68k
+all       netdev   user                       # run.sh uses -nic user
+macos     audio    coreaudio                  # sound on the Mac
+linux     audio    pa                         # the default sound on Linux
+linux     audio    alsa                       # sound on Linux hosts without PulseAudio
+all       format   qcow2                      # the kit disks
+all       format   raw                        # nvram.bin
+all       machine  next-computer              # ns08computer to ns22computer
+all       machine  next-cube                  # ns20cube, ns32cube
+all       machine  next-cube-turbo            # os40cubeturbo
+all       machine  next-station               # ns30station, ns33station
+all       machine  next-station-color         # ns21color, os42color
+all       machine  next-station-turbo         # ns31turbo
+all       machine  next-station-turbo-color   # ns33turbocolor
+all       device   scsi-hd                    # the kit disks

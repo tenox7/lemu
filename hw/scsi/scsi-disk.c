@@ -2,6 +2,7 @@
  * SCSI Device emulation
  *
  * Copyright (c) 2006 CodeSourcery.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  * Based on code by Fabrice Bellard
  *
  * Written by Paul Brook
@@ -924,6 +925,23 @@ static inline bool media_is_cd(SCSIDiskState *s)
     return nb_sectors <= CD_MAX_SECTORS;
 }
 
+/* The track list of a CD image with tracks, or NULL (a plain ISO image) */
+static BlockCdToc *scsi_cd_image_toc(SCSIDiskState *s)
+{
+    BlockCdToc *toc;
+
+    if (s->qdev.type != TYPE_ROM) {
+        return NULL;
+    }
+
+    toc = g_new0(BlockCdToc, 1);
+    if (blk_get_cd_toc(s->qdev.conf.blk, toc) < 0 || toc->n_tracks == 0) {
+        g_free(toc);
+        return NULL;
+    }
+    return toc;
+}
+
 static int scsi_read_disc_information(SCSIDiskState *s, SCSIDiskReq *r,
                                       uint8_t *outbuf)
 {
@@ -948,6 +966,27 @@ static int scsi_read_disc_information(SCSIDiskState *s, SCSIDiskReq *r,
     outbuf[6] = 1;   /* last track of last session */
     outbuf[7] = 0x20; /* unrestricted use */
     outbuf[8] = 0x00; /* CD-ROM or DVD-ROM */
+
+    {
+        g_autofree BlockCdToc *toc = scsi_cd_image_toc(s);
+
+        if (toc) {
+            const BlockCdTrack *last = &toc->tracks[toc->n_tracks - 1];
+            int first_last = last->number;
+
+            for (int i = 0; i < toc->n_tracks; i++) {
+                if (toc->tracks[i].session == toc->last_session) {
+                    first_last = toc->tracks[i].number;
+                    break;
+                }
+            }
+            outbuf[3] = toc->tracks[0].number;
+            outbuf[4] = toc->last_session - toc->first_session + 1;
+            outbuf[5] = first_last;
+            outbuf[6] = last->number;
+            outbuf[8] = toc->disc_type;
+        }
+    }
     /* 9-10-11: most significant byte corresponding bytes 4-5-6 */
     /* 12-23: not meaningful for CD-ROM or DVD-ROM */
     /* 24-31: disc bar code */
@@ -1187,6 +1226,15 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
     /* Solaris 2.5.1 overruns its buffer once it gets this page */
     if (page == MODE_PAGE_FORMAT_DEVICE &&
         !(s->quirks & (1 << SCSI_DISK_QUIRK_MODE_PAGE_FORMAT_DEVICE))) {
+        return -1;
+    }
+
+    /*
+     * The flexible disk page is only implemented by floppy drives.  Some
+     * guests (HP-UX 9 ioscan) take a disk that returns it for a floppy.
+     */
+    if (page == MODE_PAGE_FLEXIBLE_DISK_GEOMETRY &&
+        (s->quirks & (1 << SCSI_DISK_QUIRK_MODE_PAGE_NO_FLEXIBLE_DISK))) {
         return -1;
     }
 
@@ -1514,12 +1562,29 @@ static int scsi_disk_emulate_mode_sense(SCSIDiskReq *r, uint8_t *outbuf)
 static int scsi_disk_emulate_read_toc(SCSIRequest *req, uint8_t *outbuf)
 {
     SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, req->dev);
+    SCSIDiskReq *r = DO_UPCAST(SCSIDiskReq, req, req);
     int start_track, format, msf, toclen;
     uint64_t nb_sectors;
+    g_autofree BlockCdToc *toc = NULL;
 
     msf = req->cmd.buf[1] & 2;
     format = req->cmd.buf[2] & 0xf;
     start_track = req->cmd.buf[6];
+
+    toc = scsi_cd_image_toc(s);
+    if (toc) {
+        switch (format) {
+        case 0:
+            return cdrom_read_toc_tracks(toc, outbuf, msf, start_track);
+        case 1:
+            return cdrom_read_session_info(toc, outbuf, msf);
+        case 2:
+            return cdrom_read_toc_raw_tracks(toc, outbuf, r->buflen);
+        default:
+            return -1;
+        }
+    }
+
     blk_get_geometry(s->qdev.conf.blk, &nb_sectors);
     trace_scsi_disk_emulate_read_toc(start_track, format, msf >> 1);
     nb_sectors /= s->qdev.blocksize / BDRV_SECTOR_SIZE;
@@ -2764,6 +2829,238 @@ static void scsi_cd_realize(SCSIDevice *dev, Error **errp)
 }
 
 
+/*
+ * READ CD of scsi-cd with a CD image with tracks: the fields asked for,
+ * made from the raw sectors of the image. Other images do not have it.
+ */
+typedef struct SCSIDiskReadCdReq {
+    SCSIDiskReq r;
+    BlockCdToc *toc;
+    int64_t lba;
+    uint32_t remaining;   /* sectors */
+    int sector_size;      /* bytes of each sector sent */
+    int chunk;            /* sectors being read */
+    uint64_t sent;        /* bytes given to the HBA's scatter/gather list */
+    uint8_t fields;
+    uint8_t sub;
+    uint8_t *raw;
+    uint8_t *subchannel;
+} SCSIDiskReadCdReq;
+
+static const BlockCdTrack *scsi_read_cd_track(SCSIDiskReadCdReq *rc,
+                                              int64_t lba)
+{
+    const BlockCdTrack *t = block_cd_toc_find(rc->toc, lba);
+
+    /* a sector in a gap takes the format of the next track */
+    for (int i = 0; !t && i < rc->toc->n_tracks; i++) {
+        if (rc->toc->tracks[i].start > lba) {
+            t = &rc->toc->tracks[i];
+        }
+    }
+    return t ? t : &rc->toc->tracks[rc->toc->n_tracks - 1];
+}
+
+static int32_t scsi_disk_read_cd_command(SCSIRequest *req, uint8_t *buf)
+{
+    SCSIDiskReadCdReq *rc = DO_UPCAST(SCSIDiskReadCdReq, r.req, req);
+    SCSIDiskReq *r = &rc->r;
+    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, req->dev);
+    static const SCSISense illegal_mode = {
+        .key = ILLEGAL_REQUEST, .asc = 0x64, .ascq = 0x00
+    };
+    int expected = (buf[1] >> 2) & 7;
+    uint32_t nb_sectors = ldl_be_p(buf + 5) & 0xffffff;   /* bytes 6-8 */
+    uint64_t total_sectors;
+
+    if (!blk_is_available(s->qdev.conf.blk)) {
+        scsi_check_condition(r, SENSE_CODE(NO_MEDIUM));
+        return 0;
+    }
+
+    rc->toc = scsi_cd_image_toc(s);
+    if (!rc->toc) {
+        scsi_check_condition(r, SENSE_CODE(INVALID_OPCODE));
+        return 0;
+    }
+
+    rc->lba = ldl_be_p(buf + 2);
+    rc->remaining = nb_sectors;
+    rc->fields = buf[9] & 0xfe;
+    rc->sub = buf[10] & 7;
+
+    blk_get_geometry(s->qdev.conf.blk, &total_sectors);
+    total_sectors /= s->qdev.blocksize / BDRV_SECTOR_SIZE;
+    if (rc->lba + nb_sectors > total_sectors) {
+        scsi_check_condition(r, SENSE_CODE(LBA_OUT_OF_RANGE));
+        return 0;
+    }
+    if (nb_sectors == 0) {
+        scsi_req_complete(req, GOOD);
+        return 0;
+    }
+
+    rc->sector_size = cdrom_read_cd_sector_size(scsi_read_cd_track(rc, rc->lba),
+                                                rc->fields, rc->sub);
+    if (rc->sector_size < 0) {
+        scsi_check_condition(r, SENSE_CODE(INVALID_FIELD));
+        return 0;
+    }
+
+    /* every sector must be of the type asked for, and of the same size */
+    for (uint32_t i = 0; i < nb_sectors; i++) {
+        const BlockCdTrack *t = scsi_read_cd_track(rc, rc->lba + i);
+
+        if (!cdrom_read_cd_type_matches(t, expected) ||
+            cdrom_read_cd_sector_size(t, rc->fields, rc->sub) !=
+            rc->sector_size) {
+            scsi_check_condition(r, illegal_mode);
+            return 0;
+        }
+        if (t->end > rc->lba + i) {
+            i = MIN(nb_sectors - 1, t->end - rc->lba);
+        }
+    }
+
+    if (rc->sector_size == 0) {
+        scsi_req_complete(req, GOOD);
+        return 0;
+    }
+    if ((uint64_t)nb_sectors * rc->sector_size > INT32_MAX) {
+        scsi_check_condition(r, SENSE_CODE(INVALID_FIELD));
+        return 0;
+    }
+
+    return (int32_t)nb_sectors * rc->sector_size;
+}
+
+/*
+ * Copies @len bytes to the HBA's scatter/gather list, @offset bytes into
+ * it. scsi_req_data() can only fill a list once, from its start, and READ
+ * CD gives the data a chunk at a time.
+ */
+static void scsi_read_cd_to_sg(QEMUSGList *sg, uint64_t offset,
+                               const uint8_t *buf, uint64_t len)
+{
+    for (int i = 0; i < sg->nsg && len > 0; i++) {
+        ScatterGatherEntry *e = &sg->sg[i];
+        dma_addr_t n;
+
+        if (offset >= e->len) {
+            offset -= e->len;
+            continue;
+        }
+        n = MIN(len, e->len - offset);
+        dma_memory_write(sg->as, e->base + offset, buf, n,
+                         MEMTXATTRS_UNSPECIFIED);
+        buf += n;
+        len -= n;
+        offset = 0;
+    }
+}
+
+static void scsi_disk_read_cd_data(SCSIRequest *req);
+
+static void scsi_disk_read_cd_complete(void *opaque, int ret)
+{
+    SCSIDiskReadCdReq *rc = opaque;
+    SCSIDiskReq *r = &rc->r;
+    uint32_t len = rc->chunk * rc->sector_size;
+
+    assert(r->req.aiocb != NULL);
+    r->req.aiocb = NULL;
+
+    if (r->req.io_canceled) {
+        scsi_req_cancel_complete(&r->req);
+        goto done;
+    }
+    if (ret < 0) {
+        scsi_check_condition(r, ret == -ENOMEDIUM ? SENSE_CODE(NO_MEDIUM) :
+                                                    SENSE_CODE(IO_ERROR));
+        goto done;
+    }
+
+    for (int i = 0; i < rc->chunk; i++) {
+        int64_t lba = rc->lba + i;
+
+        cdrom_read_cd_format((uint8_t *)r->iov.iov_base + i * rc->sector_size,
+                             rc->raw + i * BLOCK_CD_RAW_SECTOR,
+                             rc->sub && ret != BLOCK_CD_NO_SUBCHANNEL ?
+                             rc->subchannel + i * BLOCK_CD_SUBCHANNEL : NULL,
+                             rc->toc, scsi_read_cd_track(rc, lba), lba,
+                             rc->fields, rc->sub);
+    }
+
+    rc->lba += rc->chunk;
+    rc->remaining -= rc->chunk;
+
+    if (!r->req.sg) {
+        scsi_req_data(&r->req, len);
+        goto done;
+    }
+
+    /* with a scatter/gather list, fill it here and read the next chunk */
+    if (rc->sent < r->req.sg->size) {
+        scsi_read_cd_to_sg(r->req.sg, rc->sent, r->iov.iov_base,
+                           MIN(len, r->req.sg->size - rc->sent));
+    }
+    rc->sent += len;
+    r->req.residual = r->req.sg->size - MIN(rc->sent, r->req.sg->size);
+    scsi_disk_read_cd_data(&r->req);
+
+done:
+    scsi_req_unref(&r->req);
+}
+
+static void scsi_disk_read_cd_data(SCSIRequest *req)
+{
+    SCSIDiskReadCdReq *rc = DO_UPCAST(SCSIDiskReadCdReq, r.req, req);
+    SCSIDiskReq *r = &rc->r;
+    SCSIDiskState *s = DO_UPCAST(SCSIDiskState, qdev, req->dev);
+
+    if (rc->remaining == 0) {
+        scsi_req_complete(req, GOOD);
+        return;
+    }
+
+    assert(r->req.aiocb == NULL);
+
+    rc->chunk = MIN(rc->remaining,
+                    MAX(1, SCSI_DMA_BUF_SIZE / rc->sector_size));
+    if (!r->iov.iov_base) {
+        r->buflen = MAX(SCSI_DMA_BUF_SIZE, rc->sector_size);
+        r->iov.iov_base = blk_blockalign(s->qdev.conf.blk, r->buflen);
+        rc->raw = g_malloc(rc->chunk * BLOCK_CD_RAW_SECTOR);
+        rc->subchannel = g_malloc0(rc->chunk * BLOCK_CD_SUBCHANNEL);
+    }
+    r->iov.iov_len = rc->chunk * rc->sector_size;
+    qemu_iovec_init_external(&r->qiov, &r->iov, 1);
+
+    scsi_req_ref(&r->req);
+    r->req.aiocb = blk_aio_read_cd_raw(s->qdev.conf.blk, rc->lba, rc->chunk,
+                                       rc->raw,
+                                       rc->sub ? rc->subchannel : NULL,
+                                       scsi_disk_read_cd_complete, rc);
+}
+
+static void scsi_disk_read_cd_free(SCSIRequest *req)
+{
+    SCSIDiskReadCdReq *rc = DO_UPCAST(SCSIDiskReadCdReq, r.req, req);
+
+    g_free(rc->toc);
+    g_free(rc->raw);
+    g_free(rc->subchannel);
+    scsi_free_request(req);
+}
+
+static const SCSIReqOps scsi_disk_read_cd_reqops = {
+    .size         = sizeof(SCSIDiskReadCdReq),
+    .free_req     = scsi_disk_read_cd_free,
+    .send_command = scsi_disk_read_cd_command,
+    .read_data    = scsi_disk_read_cd_data,
+    .get_buf      = scsi_get_buf,
+};
+
 static const SCSIReqOps scsi_disk_emulate_reqops = {
     .size         = sizeof(SCSIDiskReq),
     .free_req     = scsi_free_request,
@@ -2848,6 +3145,9 @@ static SCSIRequest *scsi_new_request(SCSIDevice *d, uint32_t tag, uint32_t lun,
 
     command = buf[0];
     ops = scsi_disk_reqops_dispatch[command];
+    if (command == READ_CD && d->type == TYPE_ROM) {
+        ops = &scsi_disk_read_cd_reqops;
+    }
     if (!ops) {
         ops = &scsi_disk_emulate_reqops;
     }
@@ -3397,6 +3697,8 @@ static const Property scsi_hd_properties[] = {
                     SCSI_DISK_QUIRK_MODE_PAGE_FORMAT_DEVICE, 0),
     DEFINE_PROP_BIT("quirk_mode_page_rw_error_vms", SCSIDiskState, quirks,
                     SCSI_DISK_QUIRK_MODE_PAGE_RW_ERROR_VMS, 0),
+    DEFINE_PROP_BIT("quirk_mode_page_no_flexible_disk", SCSIDiskState,
+                    quirks, SCSI_DISK_QUIRK_MODE_PAGE_NO_FLEXIBLE_DISK, 0),
     DEFINE_BLOCK_CHS_PROPERTIES(SCSIDiskState, qdev.conf),
 };
 
@@ -3482,6 +3784,7 @@ static const TypeInfo scsi_hd_info = {
     .name          = "scsi-hd",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_hd_class_initfn,
+    .secure        = true,
 };
 
 static const Property scsi_cd_properties[] = {
@@ -3510,6 +3813,8 @@ static const Property scsi_cd_properties[] = {
                     SCSI_DISK_QUIRK_MODE_PAGE_RW_ERROR_VMS, 0),
     DEFINE_PROP_BIT("quirk_mode_sense_rom_wp", SCSIDiskState, quirks,
                     SCSI_DISK_QUIRK_MODE_SENSE_ROM_WP, 0),
+    DEFINE_PROP_BIT("quirk_mode_page_no_flexible_disk", SCSIDiskState,
+                    quirks, SCSI_DISK_QUIRK_MODE_PAGE_NO_FLEXIBLE_DISK, 0),
 };
 
 static void scsi_cd_class_initfn(ObjectClass *klass, const void *data)
@@ -3531,6 +3836,7 @@ static const TypeInfo scsi_cd_info = {
     .name          = "scsi-cd",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_cd_class_initfn,
+    .secure        = true,
 };
 
 #ifdef __linux__
@@ -3573,6 +3879,7 @@ static const TypeInfo scsi_block_info = {
     .name          = "scsi-block",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_block_class_initfn,
+    .secure        = true,
 };
 #endif
 

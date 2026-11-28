@@ -2,6 +2,7 @@
  * QEMU System Emulator block driver
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +26,7 @@
 #define BLOCK_INT_COMMON_H
 
 #include "block/block-common.h"
+#include "block/cdrom-image.h"
 #include "block/block-global-state.h"
 #include "block/snapshot.h"
 #include "qemu/aiocb.h"
@@ -748,6 +750,18 @@ struct BlockDriver {
     ImageInfoSpecific * GRAPH_RDLOCK_PTR (*bdrv_get_specific_info)(
         BlockDriverState *bs, Error **errp);
     BlockStatsSpecific *(*bdrv_get_specific_stats)(BlockDriverState *bs);
+
+    /*
+     * CD images with tracks (see block/cdrom-image.h): the track list of the
+     * disc, and one raw 2352-byte sector with its 96 bytes of subchannel
+     * when @subchannel is not NULL (BLOCK_CD_NO_SUBCHANNEL, with the 96
+     * bytes zeroed, if the image has none).
+     * Return -ENOTSUP when the image is not such a CD.
+     */
+    int GRAPH_RDLOCK_PTR (*bdrv_get_cd_toc)(
+        BlockDriverState *bs, BlockCdToc *toc);
+    int coroutine_fn GRAPH_RDLOCK_PTR (*bdrv_co_read_cd_raw)(
+        BlockDriverState *bs, int64_t lba, uint8_t *raw, uint8_t *subchannel);
 
     int coroutine_fn GRAPH_RDLOCK_PTR (*bdrv_co_save_vmstate)(
         BlockDriverState *bs, QEMUIOVector *qiov, int64_t pos);

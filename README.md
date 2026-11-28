@@ -49,6 +49,8 @@ Windows NT 3.1 on the PC has no kit, so its `run.sh` is an example.
 | HP C3700 (PA-RISC 2.0, PA-8700, 64-bit) | [HP-UX 11i v1 and 11i v2](machines/hppa/hpux64/run.sh) |
 | HP 9000/715 (PA-RISC 1.1, PA-7100LC) | [HP-UX 9.05](machines/hppa/hpux905/run.sh), [HP-UX 9.07](machines/hppa/hpux907/run.sh) ([with OpenView NNM](machines/hppa/hpux907nnm/run.sh)) |
 | Apple Quadra 800 (68040) | [A/UX 3.1.1](machines/q800/aux311/run.sh) |
+| NeXT Computer (68030) | [NeXTSTEP 0.8](machines/next/ns08computer/run.sh), [0.9](machines/next/ns09computer/run.sh), [1.0](machines/next/ns10computer/run.sh), [1.0a](machines/next/ns10acomputer/run.sh), [2.2](machines/next/ns22computer/run.sh) |
+| NeXTcube, NeXTcube Turbo, NeXTstation, NeXTstation Color, NeXTstation Turbo, NeXTstation Turbo Color (68040) | [NeXTSTEP 2.0](machines/next/ns20cube/run.sh), [2.1](machines/next/ns21color/run.sh), [3.0](machines/next/ns30station/run.sh), [3.1](machines/next/ns31turbo/run.sh), [3.2](machines/next/ns32cube/run.sh), [3.3](machines/next/ns33station/run.sh) ([Turbo Color](machines/next/ns33turbocolor/run.sh)), [OPENSTEP 4.0](machines/next/os40cubeturbo/run.sh), [4.2](machines/next/os42color/run.sh) |
 | Sun SPARCstation 5 (sun4m, microSPARC II) | [SunOS 4.1.4](machines/sun4m/sunos414/run.sh) |
 
 ## Build

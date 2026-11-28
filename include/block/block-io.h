@@ -2,6 +2,7 @@
  * QEMU System Emulator block driver
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +28,7 @@
 #include "qemu/aiocb.h"
 #include "qemu/aio-wait.h"
 #include "block/block-common.h"
+#include "block/cdrom-image.h"
 #include "block/graph-lock.h"
 #include "qemu/coroutine.h"
 #include "qemu/iov.h"
@@ -214,6 +216,14 @@ bdrv_co_get_info(BlockDriverState *bs, BlockDriverInfo *bdi);
 
 int co_wrapper_mixed_bdrv_rdlock
 bdrv_get_info(BlockDriverState *bs, BlockDriverInfo *bdi);
+
+/* CD images with tracks, see block/cdrom-image.h */
+int coroutine_fn GRAPH_RDLOCK
+bdrv_co_get_cd_toc(BlockDriverState *bs, BlockCdToc *toc);
+
+int coroutine_fn GRAPH_RDLOCK
+bdrv_co_read_cd_raw(BlockDriverState *bs, int64_t lba, uint8_t *raw,
+                    uint8_t *subchannel);
 
 ImageInfoSpecific * GRAPH_RDLOCK
 bdrv_get_specific_info(BlockDriverState *bs, Error **errp);

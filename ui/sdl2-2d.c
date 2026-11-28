@@ -2,6 +2,7 @@
  * QEMU SDL display driver
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -32,41 +33,49 @@ void sdl2_2d_update(DisplayChangeListener *dcl,
                     int x, int y, int w, int h)
 {
     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
-    DisplaySurface *surf = scon->surface;
-    SDL_Rect rect;
-    size_t surface_data_offset;
     assert(!scon->opengl);
 
     if (!scon->texture) {
         return;
     }
 
-    surface_data_offset = surface_bytes_per_pixel(surf) * x +
-                          surface_stride(surf) * y;
-    rect.x = x;
-    rect.y = y;
-    rect.w = w;
-    rect.h = h;
-
-    SDL_UpdateTexture(scon->texture, &rect,
-                      surface_data(surf) + surface_data_offset,
-                      surface_stride(surf));
     /*
-     * Show the new picture at the next refresh, not here.  On macOS a
-     * present waits for the next frame of the display, and a text console
-     * (a serial port shown in a window) comes here once per character, so
-     * the guest could send only one character per frame: about 120 a
-     * second, in the CPU thread.
+     * Copy the new picture and show it at the next refresh, in the main
+     * thread, not here: see sdl2_mark_dirty(). On macOS a present also
+     * waits for the next frame of the display, and a text console comes here
+     * once per character, so the guest could send only one character per
+     * frame: about 120 a second.
      */
-    scon->updates++;
+    sdl2_mark_dirty(scon, x, y, w, h);
 }
 
 static void sdl2_2d_present(struct sdl2_console *scon)
 {
-    if (!scon->updates || !scon->texture) {
+    DisplaySurface *surf = scon->surface;
+    SDL_Rect rect;
+    int x0, y0, x1, y1;
+
+    if (!scon->updates || !scon->texture || !surf) {
         return;
     }
     scon->updates = 0;
+
+    x0 = MAX(scon->dirty_x0, 0);
+    y0 = MAX(scon->dirty_y0, 0);
+    x1 = MIN(scon->dirty_x1, surface_width(surf));
+    y1 = MIN(scon->dirty_y1, surface_height(surf));
+    if (x1 > x0 && y1 > y0) {
+        rect.x = x0;
+        rect.y = y0;
+        rect.w = x1 - x0;
+        rect.h = y1 - y0;
+        SDL_UpdateTexture(scon->texture, &rect,
+                          surface_data(surf) +
+                          surface_bytes_per_pixel(surf) * x0 +
+                          surface_stride(surf) * y0,
+                          surface_stride(surf));
+    }
+
     SDL_RenderClear(scon->real_renderer);
     SDL_RenderCopy(scon->real_renderer, scon->texture, NULL, NULL);
     SDL_RenderPresent(scon->real_renderer);

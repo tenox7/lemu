@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2003 Fabrice Bellard
  * Copyright (c) 2006 Openedhand Ltd.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -692,6 +693,67 @@ static void ide_buffered_readv_cb(void *opaque, int ret)
 }
 
 #define MAX_BUFFERED_REQS 16
+
+static void ide_buffered_read_cd_raw_cb(void *opaque, int ret)
+{
+    IDEBufferedRequest *req = opaque;
+
+    if (!req->orphaned) {
+        if (ret >= 0) {
+            memcpy(req->cd_raw_dst, req->cd_raw,
+                   req->cd_sectors * BLOCK_CD_RAW_SECTOR);
+            if (req->cd_sub_dst) {
+                memcpy(req->cd_sub_dst, req->cd_sub,
+                       req->cd_sectors * BLOCK_CD_SUBCHANNEL);
+            }
+        }
+        req->original_cb(req->original_opaque, ret);
+    }
+    QLIST_REMOVE(req, list);
+    g_free(req->cd_raw);
+    g_free(req->cd_sub);
+    g_free(req);
+}
+
+/*
+ * Raw sectors of a CD image with tracks, read into a private buffer like
+ * ide_buffered_readv(), so a cancelled request never writes to the
+ * device's buffers. Completes with 1 instead of 0 when the image has no
+ * subchannel (see blk_aio_read_cd_raw()).
+ */
+BlockAIOCB *ide_buffered_read_cd_raw(IDEState *s, int64_t lba, int nb_sectors,
+                                     uint8_t *raw, uint8_t *subchannel,
+                                     BlockCompletionFunc *cb, void *opaque)
+{
+    BlockAIOCB *aioreq;
+    IDEBufferedRequest *req;
+    int c = 0;
+
+    QLIST_FOREACH(req, &s->buffered_requests, list) {
+        c++;
+    }
+    if (c > MAX_BUFFERED_REQS) {
+        return blk_abort_aio_request(s->blk, cb, opaque, -EIO);
+    }
+
+    req = g_new0(IDEBufferedRequest, 1);
+    req->original_cb = cb;
+    req->original_opaque = opaque;
+    req->cd_sectors = nb_sectors;
+    req->cd_raw = g_malloc(nb_sectors * BLOCK_CD_RAW_SECTOR);
+    req->cd_raw_dst = raw;
+    if (subchannel) {
+        req->cd_sub = g_malloc0(nb_sectors * BLOCK_CD_SUBCHANNEL);
+        req->cd_sub_dst = subchannel;
+    }
+
+    aioreq = blk_aio_read_cd_raw(s->blk, lba, nb_sectors, req->cd_raw,
+                                 req->cd_sub, ide_buffered_read_cd_raw_cb,
+                                 req);
+
+    QLIST_INSERT_HEAD(&s->buffered_requests, req, list);
+    return aioreq;
+}
 
 BlockAIOCB *ide_buffered_readv(IDEState *s, int64_t sector_num,
                                QEMUIOVector *iov, int nb_sectors,
@@ -2847,6 +2909,9 @@ void ide_exit(IDEState *s)
     timer_free(s->sector_write_timer);
     qemu_vfree(s->smart_selftest_data);
     qemu_vfree(s->io_buffer);
+    g_free(s->cd_toc);
+    g_free(s->cd_raw_buf);
+    g_free(s->cd_raw_sub_buf);
 }
 
 static bool is_identify_set(void *opaque, int version_id)

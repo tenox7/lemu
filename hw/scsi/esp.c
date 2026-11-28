@@ -4,6 +4,7 @@
  * Copyright (c) 2005-2006 Fabrice Bellard
  * Copyright (c) 2012 Herve Poussineau
  * Copyright (c) 2023 Mark Cave-Ayland
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -103,8 +104,11 @@ void esp_dma_enable(ESPState *s, int irq, int level)
         s->dma_enabled = 1;
         trace_esp_dma_enable();
         if (s->dma_cb) {
-            s->dma_cb(s);
+            void (*cb)(ESPState *s) = s->dma_cb;
+
+            /* cleared first: the callback may have to wait again */
             s->dma_cb = NULL;
+            cb(s);
         }
     } else {
         trace_esp_dma_disable();
@@ -590,6 +594,14 @@ static void esp_do_dma(ESPState *s)
         switch (s->rregs[ESP_CMD]) {
         case CMD_TI | CMD_DMA:
             if (s->dma_memory_read) {
+                if (s->dma_read_avail) {
+                    len = MIN(len, s->dma_read_avail(s->dma_opaque));
+                    if (!len) {
+                        /* Go on when the DMA has more data for the drive */
+                        s->dma_cb = esp_do_dma;
+                        return;
+                    }
+                }
                 if (len) {
                     s->dma_memory_read(s->dma_opaque, s->async_buf, len);
                     esp_set_tc(s, esp_get_tc(s) - len);
@@ -624,6 +636,13 @@ static void esp_do_dma(ESPState *s)
         if (s->async_len == 0 && fifo8_num_used(&s->fifo) < 2) {
             /* Defer until the scsi layer has completed */
             scsi_req_continue(s->current_req);
+            return;
+        }
+
+        if (s->dma_read_avail && esp_get_tc(s) &&
+            s->rregs[ESP_CMD] == (CMD_TI | CMD_DMA)) {
+            /* The DMA gave part of the data: take the rest as it comes */
+            esp_do_dma(s);
             return;
         }
 

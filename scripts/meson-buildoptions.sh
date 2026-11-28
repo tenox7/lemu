@@ -99,6 +99,7 @@ meson_options_help() {
   printf "%s\n" 'disabled with --disable-FEATURE, default is enabled if available'
   printf "%s\n" '(unless built with --without-default-features):'
   printf "%s\n" ''
+  printf "%s\n" '  aaruformat      AaruFormat image support (libaaruformat)'
   printf "%s\n" '  af-xdp          AF_XDP network backend support'
   printf "%s\n" '  alsa            ALSA sound support'
   printf "%s\n" '  attr            attr/xattr support'
@@ -243,6 +244,8 @@ meson_options_help() {
 }
 _meson_option_parse() {
   case $1 in
+    --enable-aaruformat) printf "%s" -Daaruformat=enabled ;;
+    --disable-aaruformat) printf "%s" -Daaruformat=disabled ;;
     --enable-af-xdp) printf "%s" -Daf_xdp=enabled ;;
     --disable-af-xdp) printf "%s" -Daf_xdp=disabled ;;
     --enable-alsa) printf "%s" -Dalsa=enabled ;;

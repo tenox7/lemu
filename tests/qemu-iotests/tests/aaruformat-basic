@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# group: rw quick
+#
+# AaruFormat hard disk images: writing, rewriting, reopening, a stop
+# right after a flush, and conversion with and without compression
+#
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+seq=`basename $0`
+echo "QA output created by $seq"
+
+status=1	# failure is the default!
+
+_cleanup()
+{
+    _cleanup_test_img
+    _rm_test_img "$TEST_IMG.raw"
+    _rm_test_img "$TEST_IMG.back"
+    _rm_test_img "$TEST_IMG.conv"
+}
+trap "_cleanup; exit \$status" 0 1 2 3 15
+
+# get standard environment, filters and checks
+. ../common.rc
+. ../common.filter
+
+_supported_fmt aaruformat
+_supported_proto file
+_supported_os Linux
+
+SIZE=$((16 * 1024 * 1024))
+
+io()
+{
+    $QEMU_IO -f $IMGFMT "$@" "$TEST_IMG" 2>&1 | _filter_qemu_io
+}
+
+echo "== create =="
+_make_test_img $SIZE
+$QEMU_IMG info "$TEST_IMG" | _filter_img_info | grep -v "^disk size"
+
+echo "== a new image reads as zeros =="
+io -c "read -P 0 0 $SIZE"
+
+echo "== write, read back at once, rewrite =="
+io -c "write -P 0x11 0 1M" -c "read -P 0x11 0 1M" \
+   -c "write -P 0x22 64k 4k" -c "read -P 0x22 64k 4k" \
+   -c "read -P 0x11 68k 4k" -c "write -P 0x33 15M 1M"
+
+echo "== reopen =="
+io -c "read -P 0x11 0 64k" -c "read -P 0x22 64k 4k" \
+   -c "read -P 0x11 68k 956k" -c "read -P 0 1M 14M" \
+   -c "read -P 0x33 15M 1M"
+
+echo "== stop right after a flush =="
+io -c "write -P 0x44 2M 1M" -c "flush" -c "write -P 0x55 4M 1M" \
+   -c "sigraise 9" | grep -v Killed
+io -c "read -P 0x44 2M 1M" -c "read -P 0 4M 1M" -c "read -P 0x33 15M 1M"
+
+echo "== stop without a flush, after a checkpoint of our own =="
+$QEMU_IO_PROG --image-opts \
+    -c "write -P 0x66 6M 1M" -c "sleep 2500" -c "sigraise 9" \
+    "driver=$IMGFMT,checkpoint-interval=1,file.filename=$TEST_IMG" 2>&1 | \
+    _filter_qemu_io | grep -v Killed
+io -c "read -P 0x66 6M 1M" -c "read -P 0x44 2M 1M"
+
+echo "== convert =="
+$QEMU_IMG convert -f $IMGFMT -O raw "$TEST_IMG" "$TEST_IMG.raw"
+for opts in "" "-o compress=on,compression_type=zstd" "-c" \
+            "-o table_shift=0,deduplicate=off"; do
+    echo "-- $opts"
+    _rm_test_img "$TEST_IMG.conv"
+    $QEMU_IMG convert -f raw -O $IMGFMT $opts "$TEST_IMG.raw" "$TEST_IMG.conv"
+    $QEMU_IMG compare -f raw -F $IMGFMT "$TEST_IMG.raw" "$TEST_IMG.conv"
+    $QEMU_IMG convert -f $IMGFMT -O raw "$TEST_IMG.conv" "$TEST_IMG.back"
+    cmp "$TEST_IMG.raw" "$TEST_IMG.back" && echo "same data"
+done
+
+echo "== error recovery =="
+_rm_test_img "$TEST_IMG.conv"
+$QEMU_IMG convert -f raw -O $IMGFMT -o error_recovery=25,table_shift=8 \
+    "$TEST_IMG.raw" "$TEST_IMG.conv"
+$QEMU_IMG info "$TEST_IMG.conv" | grep "error recovery"
+# damage the payload of a user data block, which error recovery rebuilds
+python3 -I - "$TEST_IMG.conv" <<'PYEOF'
+import mmap, struct, sys
+with open(sys.argv[1], 'r+b') as f, mmap.mmap(f.fileno(), 0) as m:
+    pos = m.find(b'DBLK', 512)
+    while struct.unpack_from('<H', m, pos + 4)[0] != 1:
+        pos = m.find(b'DBLK', pos + 4)
+    m[pos + 4096:pos + 4096 + 1024] = b'\xee' * 1024
+PYEOF
+$QEMU_IMG compare -f raw -F $IMGFMT "$TEST_IMG.raw" "$TEST_IMG.conv"
+
+echo "== sector size 4096 =="
+_rm_test_img "$TEST_IMG.conv"
+$QEMU_IMG create -f $IMGFMT -o sector_size=4096 "$TEST_IMG.conv" 1M | \
+    _filter_img_create | _filter_testdir
+$QEMU_IO -f $IMGFMT -c "write -P 0x66 4k 4k" -c "read -P 0x66 4k 4k" \
+    -c "write -P 0x77 0 512" "$TEST_IMG.conv" 2>&1 | _filter_qemu_io
+
+# success, all done
+echo "*** done"
+rm -f $seq.full
+status=0

@@ -198,6 +198,53 @@
   'data': { '*bitmaps': ['ParallelsBitmapInfo'] } }
 
 ##
+# @AaruFormatMetadataType:
+#
+# Kind of media an AaruFormat image holds.
+#
+# @block: a block device, such as a hard disk or a floppy
+#
+# @optical: an optical disc, such as a CD or a DVD
+#
+# Since: 11.2
+##
+{ 'enum': 'AaruFormatMetadataType',
+  'data': [ 'block', 'optical' ],
+  'if': 'CONFIG_AARUFORMAT' }
+
+##
+# @ImageInfoSpecificAaruFormat:
+#
+# @media-type: AaruFormat media type number of the image
+#
+# @metadata-type: kind of media of the image
+#
+# @sector-size: size of a sector in bytes
+#
+# @sectors: number of sectors of the media
+#
+# @application: application that created the image, if known
+#
+# @application-version: version of that application, if known
+#
+# @tracks: number of tracks, for optical discs
+#
+# @error-recovery: the image has error recovery (erasure coding) data
+#
+# Since: 11.2
+##
+{ 'struct': 'ImageInfoSpecificAaruFormat',
+  'data': { 'media-type': 'uint32',
+            'metadata-type': 'AaruFormatMetadataType',
+            'sector-size': 'uint32',
+            'sectors': 'uint64',
+            '*application': 'str',
+            '*application-version': 'str',
+            '*tracks': 'uint32',
+            'error-recovery': 'bool' },
+  'if': 'CONFIG_AARUFORMAT' }
+
+##
 # @ImageInfoSpecificKind:
 #
 # @luks: Since 2.7
@@ -208,10 +255,13 @@
 #
 # @parallels: Since 11.2
 #
+# @aaruformat: Since 11.2
+#
 # Since: 1.7
 ##
 { 'enum': 'ImageInfoSpecificKind',
-  'data': [ 'qcow2', 'vmdk', 'luks', 'rbd', 'file', 'parallels' ] }
+  'data': [ 'qcow2', 'vmdk', 'luks', 'rbd', 'file', 'parallels',
+            { 'name': 'aaruformat', 'if': 'CONFIG_AARUFORMAT' } ] }
 
 ##
 # @ImageInfoSpecificQCow2Wrapper:
@@ -277,6 +327,17 @@
   'data': { 'data': 'ImageInfoSpecificParallels' } }
 
 ##
+# @ImageInfoSpecificAaruFormatWrapper:
+#
+# @data: image information specific to AaruFormat
+#
+# Since: 11.2
+##
+{ 'struct': 'ImageInfoSpecificAaruFormatWrapper',
+  'data': { 'data': 'ImageInfoSpecificAaruFormat' },
+  'if': 'CONFIG_AARUFORMAT' }
+
+##
 # @ImageInfoSpecific:
 #     A discriminated record of image format specific information
 #     structures.
@@ -294,7 +355,9 @@
       'luks': 'ImageInfoSpecificLUKSWrapper',
       'rbd': 'ImageInfoSpecificRbdWrapper',
       'file': 'ImageInfoSpecificFileWrapper',
-      'parallels': 'ImageInfoSpecificParallelsWrapper'
+      'parallels': 'ImageInfoSpecificParallelsWrapper',
+      'aaruformat': { 'type': 'ImageInfoSpecificAaruFormatWrapper',
+                      'if': 'CONFIG_AARUFORMAT' }
   } }
 
 ##
@@ -3307,6 +3370,8 @@
 #
 # @compress: Since 5.0
 #
+# @aaruformat: Since 11.2
+#
 # @copy-before-write: Since 6.2
 #
 # @snapshot-access: Since 7.0
@@ -3314,7 +3379,8 @@
 # Since: 2.9
 ##
 { 'enum': 'BlockdevDriver',
-  'data': [ 'blkdebug', 'blklogwrites', 'blkreplay', 'blkverify', 'bochs',
+  'data': [ { 'name': 'aaruformat', 'if': 'CONFIG_AARUFORMAT' },
+            'blkdebug', 'blklogwrites', 'blkreplay', 'blkverify', 'bochs',
             'cloop', 'compress', 'copy-before-write', 'copy-on-read', 'dmg',
             'file', 'snapshot-access', 'ftp', 'ftps',
             {'name': 'host_cdrom', 'if': 'HAVE_HOST_BLOCK_DEVICE' },
@@ -3468,6 +3534,47 @@
 { 'struct': 'BlockdevOptionsVVFAT',
   'data': { 'dir': 'str', '*fat-type': 'int', '*floppy': 'bool',
             '*label': 'str', '*rw': 'bool' } }
+
+##
+# @AaruFormatCompression:
+#
+# Compression of the data blocks of an AaruFormat image.
+#
+# @lzma: LZMA, smaller and slower
+#
+# @zstd: Zstandard, faster
+#
+# Since: 11.2
+##
+{ 'enum': 'AaruFormatCompression',
+  'data': [ 'lzma', 'zstd' ],
+  'if': 'CONFIG_AARUFORMAT' }
+
+##
+# @BlockdevOptionsAaruFormat:
+#     Driver specific block device options for AaruFormat images.
+#
+# @compress: compress the data written to the image (default: off,
+#     or what the image was just created with)
+#
+# @compression-type: compression for the written data (default: lzma)
+#
+# @deduplicate: store identical sectors once (default: on)
+#
+# @checkpoint-interval: seconds after a write before the image is
+#     checkpointed when the guest does not flush, so it opens with
+#     that data if QEMU stops; 0 checkpoints only on guest flushes
+#     (default: 5)
+#
+# Since: 11.2
+##
+{ 'struct': 'BlockdevOptionsAaruFormat',
+  'base': 'BlockdevOptionsGenericFormat',
+  'data': { '*compress': 'bool',
+            '*compression-type': 'AaruFormatCompression',
+            '*deduplicate': 'bool',
+            '*checkpoint-interval': 'uint32' },
+  'if': 'CONFIG_AARUFORMAT' }
 
 ##
 # @BlockdevOptionsGenericFormat:
@@ -4781,6 +4888,8 @@
             '*detect-zeroes': 'BlockdevDetectZeroesOptions' },
   'discriminator': 'driver',
   'data': {
+      'aaruformat': { 'type': 'BlockdevOptionsAaruFormat',
+                      'if': 'CONFIG_AARUFORMAT' },
       'blkdebug':   'BlockdevOptionsBlkdebug',
       'blklogwrites':'BlockdevOptionsBlklogwrites',
       'blkverify':  'BlockdevOptionsBlkverify',
@@ -5360,6 +5469,43 @@
             'size':             'size' } }
 
 ##
+# @BlockdevCreateOptionsAaruFormat:
+#     Driver specific image creation options for AaruFormat.
+#
+# @file: Node to create the image format on
+#
+# @size: Size of the virtual disk in bytes
+#
+# @sector-size: Size of a sector in bytes (default: 512)
+#
+# @compress: Compress the data written right after creating the image
+#     (default: off)
+#
+# @compression-type: Compression for that data (default: lzma)
+#
+# @deduplicate: Store identical sectors once (default: on)
+#
+# @table-shift: Sectors per secondary deduplication table as a power
+#     of two, 0 for a single table (default: 12)
+#
+# @error-recovery: Percentage (1 to 100) of error recovery data, as
+#     Aaru's --error-recovery, for the data written right after
+#     creating the image; 0 for none (default: 0)
+#
+# Since: 11.2
+##
+{ 'struct': 'BlockdevCreateOptionsAaruFormat',
+  'data': { 'file':                'BlockdevRef',
+            'size':                'size',
+            '*sector-size':        'uint32',
+            '*compress':           'bool',
+            '*compression-type':   'AaruFormatCompression',
+            '*deduplicate':        'bool',
+            '*table-shift':        'uint8',
+            '*error-recovery':     'uint8' },
+  'if': 'CONFIG_AARUFORMAT' }
+
+##
 # @BlockdevCreateOptionsVdi:
 #     Driver specific image creation options for VDI.
 #
@@ -5467,6 +5613,8 @@
       'driver':         'BlockdevDriver' },
   'discriminator': 'driver',
   'data': {
+      'aaruformat':     { 'type': 'BlockdevCreateOptionsAaruFormat',
+                          'if': 'CONFIG_AARUFORMAT' },
       'file':           'BlockdevCreateOptionsFile',
       'luks':           'BlockdevCreateOptionsLUKS',
       'nfs':            'BlockdevCreateOptionsNfs',

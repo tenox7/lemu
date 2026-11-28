@@ -2,6 +2,7 @@
  * QEMU SDL display driver -- opengl support
  *
  * Copyright (c) 2014 Red Hat
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Authors:
  *     Gerd Hoffmann <kraxel@redhat.com>
@@ -72,9 +73,8 @@ void sdl2_gl_update(DisplayChangeListener *dcl,
         return;
     }
 
-    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
-    surface_gl_update_texture(scon->gls, scon->surface, x, y, w, h);
-    scon->updates++;
+    /* copied in sdl2_gl_refresh(), in the main thread: see sdl2_mark_dirty() */
+    sdl2_mark_dirty(scon, x, y, w, h);
 }
 
 void sdl2_gl_switch(DisplayChangeListener *dcl,
@@ -116,8 +116,18 @@ void sdl2_gl_refresh(DisplayChangeListener *dcl)
     assert(scon->opengl);
 
     qemu_console_hw_update(dcl->con);
-    if (scon->updates && scon->real_window) {
+    if (scon->updates && scon->real_window && scon->surface) {
+        int x0 = MAX(scon->dirty_x0, 0);
+        int y0 = MAX(scon->dirty_y0, 0);
+        int x1 = MIN(scon->dirty_x1, surface_width(scon->surface));
+        int y1 = MIN(scon->dirty_y1, surface_height(scon->surface));
+
         scon->updates = 0;
+        SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+        if (x1 > x0 && y1 > y0) {
+            surface_gl_update_texture(scon->gls, scon->surface,
+                                      x0, y0, x1 - x0, y1 - y0);
+        }
         sdl2_gl_render_surface(scon);
     }
     sdl2_poll_events(scon);

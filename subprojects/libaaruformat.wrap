@@ -1,0 +1,6 @@
+[wrap-git]
+url = https://github.com/aaru-dps/libaaruformat.git
+# v1.0.0-beta.3.2
+revision = 785f39bf530bce929de8f95a6427993c1fb7ec5e
+clone-recursive = true
+method = cmake

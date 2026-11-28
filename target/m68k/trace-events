@@ -1,0 +1,7 @@
+# See docs/devel/tracing.rst for syntax documentation.
+
+# nextstep_idle.c
+m68k_nextstep_idle(uint32_t pc) "idle loop halt, go on at 0x%08x"
+
+# translate.c
+m68k_nextstep_idle_match(uint32_t pc, uint32_t top, uint32_t checks, uint32_t addr, uint32_t mask) "Mach idle loop: branch at 0x%08x to 0x%08x, checks 0x%08x addr 0x%08x mask 0x%08x"

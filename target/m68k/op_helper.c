@@ -2,6 +2,7 @@
  *  M68K helper routines
  *
  *  Copyright (c) 2007 CodeSourcery
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -74,6 +75,12 @@ throwaway:
             break;
         case 7:
             sp += 52;
+            break;
+        case 0xa:   /* 68020/68030 short bus cycle fault */
+            sp += 24;
+            break;
+        case 0xb:   /* 68020/68030 long bus cycle fault */
+            sp += 84;
             break;
         }
     }
@@ -290,7 +297,8 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
     sr &= ~SR_T;
     /* "sets the processor interrupt mask" */
     if (is_hw) {
-        sr |= (env->sr & ~SR_I) | (env->pending_level << SR_I_SHIFT);
+        /* only the mask: env->sr still has the trace bits cleared above */
+        sr = (sr & ~SR_I) | (env->pending_level << SR_I_SHIFT);
     }
     cpu_m68k_set_sr(env, sr);
     sp = env->aregs[7];
@@ -303,6 +311,27 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
     case EXCP_ACCESS:
         if (env->mmu.fault) {
             cpu_abort(cs, "DOUBLE MMU FAULT\n");
+        }
+        if (m68k_feature(env, M68K_FEATURE_M68030)) {
+            /*
+             * 68030 long bus cycle fault frame (format $B). The instruction
+             * is restarted on RTE, so only the special status word, the
+             * fault address and the stage B address matter.
+             */
+            env->mmu.fault = true;
+            sp -= 0x5c - 8;
+            for (int i = 0; i < 0x5c - 8; i += 2) {
+                cpu_stw_be_mmuidx_ra(env, sp + i, 0, MMU_KERNEL_IDX, 0);
+            }
+            cpu_stw_be_mmuidx_ra(env, sp + 0x0a - 8, env->mmu.ssw,
+                                 MMU_KERNEL_IDX, 0);
+            cpu_stl_be_mmuidx_ra(env, sp + 0x10 - 8, env->mmu.ar,
+                                 MMU_KERNEL_IDX, 0);
+            cpu_stl_be_mmuidx_ra(env, sp + 0x24 - 8, env->mmu.ar,
+                                 MMU_KERNEL_IDX, 0);
+            do_stack_frame(env, &sp, 0xb, oldsr, 0, env->pc);
+            env->mmu.fault = false;
+            break;
         }
         env->mmu.fault = true;
         /* push data 3 */
@@ -372,6 +401,7 @@ static void m68k_interrupt_all(CPUM68KState *env, int is_hw)
     case EXCP_DIV0:
     case EXCP_TRACE:
     case EXCP_TRAPCC:
+    case EXCP_MMU_CONF:     /* the 68030's, after a PMOVE to TC */
         do_stack_frame(env, &sp, 2, oldsr, env->mmu.ar, env->pc);
         break;
 
@@ -429,6 +459,12 @@ void m68k_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
     CPUM68KState *env = cpu_env(cs);
 
     cpu_restore_state(cs, retaddr);
+
+    if (m68k_feature(env, M68K_FEATURE_M68030)) {
+        m68k_mmu030_fault_ssw(env, addr, size, access_type, mmu_idx);
+        cs->exception_index = EXCP_ACCESS;
+        cpu_loop_exit(cs);
+    }
 
     if (m68k_feature(env, M68K_FEATURE_M68040)) {
         env->mmu.mmusr = 0;
@@ -1094,3 +1130,36 @@ void HELPER(cmp2)(CPUM68KState *env, int32_t val, int32_t lb, int32_t ub)
     env->cc_z = val != lb && val != ub;
     env->cc_c = lb <= ub ? val < lb || val > ub : val > ub && val < lb;
 }
+
+#if !defined(CONFIG_USER_ONLY)
+/* 68882 FSAVE: an idle frame, version 0x1f, 0x38 bytes of state */
+void HELPER(fsave882)(CPUM68KState *env, uint32_t addr)
+{
+    uintptr_t ra = GETPC();
+
+    cpu_stl_be_data_ra(env, addr, 0x1f380000, ra);
+    for (int i = 4; i < 4 + 0x38; i += 4) {
+        cpu_stl_be_data_ra(env, addr + i, 0, ra);
+    }
+}
+
+/*
+ * 68881/68882 FRESTORE: a null frame resets the FPU. Returns the size of
+ * the frame, for (An)+.
+ */
+uint32_t HELPER(frestore882)(CPUM68KState *env, uint32_t addr)
+{
+    uint32_t head = cpu_ldl_be_data_ra(env, addr, GETPC());
+
+    if ((head >> 24) == 0) {
+        cpu_m68k_set_fpcr(env, 0);
+        env->fpsr = 0;
+        for (int i = 0; i < 8; i++) {
+            env->fregs[i].l.upper = 0x7fff;
+            env->fregs[i].l.lower = 0xffffffffffffffffULL;
+        }
+        return 4;
+    }
+    return 4 + ((head >> 16) & 0xff);
+}
+#endif

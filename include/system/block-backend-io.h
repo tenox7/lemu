@@ -2,6 +2,7 @@
  * QEMU Block backends
  *
  * Copyright (C) 2014-2016 Red Hat, Inc.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Authors:
  *  Markus Armbruster <armbru@redhat.com>,
@@ -13,6 +14,7 @@
 #ifndef BLOCK_BACKEND_IO_H
 #define BLOCK_BACKEND_IO_H
 
+#include "block/cdrom-image.h"
 #include "block-backend-common.h"
 #include "block/accounting.h"
 
@@ -76,6 +78,22 @@ void blk_end_request(BlockBackend *blk);
 
 bool coroutine_fn GRAPH_RDLOCK blk_co_is_inserted(BlockBackend *blk);
 bool co_wrapper_mixed_bdrv_rdlock blk_is_inserted(BlockBackend *blk);
+
+/*
+ * CD images with tracks (see block/cdrom-image.h): the track list, and
+ * @nb_sectors raw 2352-byte sectors from @lba into @raw, with 96 bytes of
+ * subchannel each into @subchannel when not NULL. The read completes with
+ * BLOCK_CD_NO_SUBCHANNEL when the image has no subchannel. -ENOTSUP when
+ * the image is not such a CD.
+ */
+int coroutine_fn GRAPH_RDLOCK blk_co_get_cd_toc(BlockBackend *blk,
+                                                BlockCdToc *toc);
+int co_wrapper_mixed_bdrv_rdlock blk_get_cd_toc(BlockBackend *blk,
+                                                BlockCdToc *toc);
+BlockAIOCB *blk_aio_read_cd_raw(BlockBackend *blk, int64_t lba,
+                                int nb_sectors, uint8_t *raw,
+                                uint8_t *subchannel,
+                                BlockCompletionFunc *cb, void *opaque);
 
 bool coroutine_fn GRAPH_RDLOCK blk_co_is_available(BlockBackend *blk);
 bool co_wrapper_mixed_bdrv_rdlock blk_is_available(BlockBackend *blk);

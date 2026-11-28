@@ -49,9 +49,12 @@ struct HppaMachineState {
     bool legacy_fw;
     bool hpux_idle;
     bool hpux_x11_pace;
+    bool sba_pluto;
 };
 
 #define MIN_SEABIOS_HPPA_VERSION 26 /* require at least this fw version */
+
+#define HPA_POWER_BUTTON        (FIRMWARE_END - 0x10)
 
 /*
  * SeaBIOS-hppa 25 and older want the CPUs at 0xfffb0000 and the fw_cfg port
@@ -137,7 +140,6 @@ static time_t rtc_ref;
 
 static uint64_t io_cpu_read(void *opaque, hwaddr addr, unsigned size)
 {
-    HPPACPU *cpu = opaque;
     uint64_t val = 0;
 
     switch (addr) {
@@ -147,8 +149,6 @@ static uint64_t io_cpu_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case 8:             /* DebugOutputPort */
         return 0xe9;    /* readback */
-    case 16:            /* Power switch button */
-        return cpu->env.power_btn;
     }
     return val;
 }
@@ -156,7 +156,6 @@ static uint64_t io_cpu_read(void *opaque, hwaddr addr, unsigned size)
 static void io_cpu_write(void *opaque, hwaddr addr,
                          uint64_t val, unsigned size)
 {
-    HPPACPU *cpu = opaque;
     unsigned char ch;
     Chardev *debugout;
 
@@ -172,9 +171,6 @@ static void io_cpu_write(void *opaque, hwaddr addr,
         } else {
             fprintf(stderr, "%c", ch);
         }
-        break;
-    case 16:
-        cpu->env.power_btn = val;
         break;
     }
 }
@@ -257,6 +253,12 @@ static FWCfgState *create_fw_cfg(MachineState *ms, PCIBus *pci_bus,
     val = cpu_to_le64(hpm->memsplit_addr);
     fw_cfg_add_file(fw_cfg, "/etc/hppa/memsplit-addr",
                     g_memdup2(&val, sizeof(val)), sizeof(val));
+
+    if (hpm->sba_pluto) {
+        val = cpu_to_le64(1);
+        fw_cfg_add_file(fw_cfg, "/etc/hppa/sba-pluto",
+                        g_memdup2(&val, sizeof(val)), sizeof(val));
+    }
 
     val = cpu_to_le64(soft_power_reg);
     fw_cfg_add_file(fw_cfg, "/etc/hppa/power-button-addr",
@@ -342,6 +344,8 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine,
         ram_max = FIRMWARE_START;  /* 3.75 GB (32-bit CPU) */
     }
 
+    soft_power_reg = translate(NULL, HPA_POWER_BUTTON);
+
     for (unsigned int i = 0; i < smp_cpus; i++) {
         g_autofree char *name = g_strdup_printf("cpu%u-io-eir", i);
         g_autofree char *cflush_name = NULL;
@@ -376,11 +380,10 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine,
     /* RTC and DebugOutputPort on CPU #0 */
     cpu_region = g_new(MemoryRegion, 1);
     memory_region_init_io(cpu_region, OBJECT(cpu[0]), &hppa_io_helper_ops,
-                          cpu[0], "cpu0-io-rtc", 3 * sizeof(uint64_t));
+                          cpu[0], "cpu0-io-rtc", 2 * sizeof(uint64_t));
     memory_region_add_subregion(addr_space,
                                 translate(NULL, cpu[0]->env.cpu_hpa + 16),
                                 cpu_region);
-    soft_power_reg = translate(NULL, cpu[0]->env.cpu_hpa + 16 + 16);
 
     /* Main memory region. */
     if (machine->ram_size > ram_max) {
@@ -475,7 +478,12 @@ static void machine_HP_common_init_tail(MachineState *machine, PCIBus *pci_bus,
     if (!lasi_dev && machine->enable_graphics && defaults_enabled()) {
         USBBus *usb_bus;
         if (create_diva) {
-            pci_create_simple(pci_bus, -1, "pci-ohci");
+            /*
+             * HP-UX 11.31 (pluto) takes only some OHCIs, such as the NEC
+             * uPD720101 of the rp34x0, not the Apple one.
+             */
+            pci_create_simple(pci_bus, -1,
+                              hpm->sba_pluto ? "nec-usb-ohci" : "pci-ohci");
         }
         usb_bus = USB_BUS(object_resolve_type_unambiguous(TYPE_USB_BUS,
                                                           &error_abort));
@@ -658,7 +666,8 @@ static void machine_HP_715_init(MachineState *machine)
     ISABus *isa_bus;
 
     /* Create CPUs and RAM.  */
-    translate = machine_HP_common_init_cpus(machine, 0xfffbe000);
+    translate = machine_HP_common_init_cpus(machine,
+                    machine->smp.cpus <= 2 ? 0xfffbe000 : 0xfffa0000);
 
     if (hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP 715/64 workstation requires a 32-bit "
@@ -745,7 +754,7 @@ static void machine_HP_B160L_init(MachineState *machine)
     PCIBus *pci_bus;
 
     /* Create CPUs and RAM.  */
-    translate = machine_HP_common_init_cpus(machine, 0xfff10000);
+    translate = machine_HP_common_init_cpus(machine, 0xfffa0000);
 
     if (hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP B160L workstation requires a 32-bit "
@@ -811,7 +820,7 @@ static void machine_HP_B160L_init(MachineState *machine)
     machine_HP_common_init_tail(machine, pci_bus, translate, false);
 }
 
-static AstroState *astro_init(bool is_a400)
+static AstroState *astro_init(bool is_a400, bool pluto)
 {
     DeviceState *dev;
 
@@ -823,6 +832,7 @@ static AstroState *astro_init(bool is_a400)
                              &error_abort);
     object_property_set_bool(OBJECT(dev), "elroy1-on-rope2", is_a400,
                              &error_abort);
+    object_property_set_bool(OBJECT(dev), "pluto", pluto, &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
     return ASTRO_CHIP(dev);
@@ -851,7 +861,7 @@ static void machine_HP_C3700_init(MachineState *machine)
     }
 
     /* Init Astro and the Elroys (PCI host bus chips).  */
-    astro = astro_init(!is_C3700);
+    astro = astro_init(!is_C3700, HPPA_COMMON_MACHINE(machine)->sba_pluto);
     astro_dev = DEVICE(astro);
     memory_region_add_subregion(addr_space, translate(NULL, ASTRO_HPA),
                                 sysbus_mmio_get_region(
@@ -885,7 +895,10 @@ static void machine_HP_C3700_init(MachineState *machine)
 
     /* SCSI disk setup. */
     if (drive_get_max_bus(IF_SCSI) >= 0) {
-        DeviceState *dev = DEVICE(pci_create_simple(pci_bus, -1, "lsi53c895a"));
+        /* HP-UX 11.31 (the Pluto A400) has no driver for the 53C895A */
+        DeviceState *dev = DEVICE(pci_create_simple(pci_bus, -1,
+                               HPPA_COMMON_MACHINE(machine)->sba_pluto ?
+                               "lsi53c875" : "lsi53c895a"));
         lsi53c8xx_handle_legacy_cmdline(dev);
     }
 
@@ -938,6 +951,7 @@ static void hppa_machine_reset(MachineState *ms, ResetType type)
         static const struct { uint32_t start, last; } io_btlb[] = {
             { 0xf0100000, 0xf01fffff },     /* LASI */
             { 0xfff80000, 0xffffffff },     /* central bus */
+            { 0xf00ff000, 0xf00fffff },     /* soft power button register */
         };
         CPUHPPAState *env = &cpu[0]->env;
 
@@ -1012,6 +1026,16 @@ static bool hppa_get_hpux_x11_pace(Object *obj, Error **errp)
 static void hppa_set_hpux_x11_pace(Object *obj, bool value, Error **errp)
 {
     HPPA_COMMON_MACHINE(obj)->hpux_x11_pace = value;
+}
+
+static bool hppa_get_sba_pluto(Object *obj, Error **errp)
+{
+    return HPPA_COMMON_MACHINE(obj)->sba_pluto;
+}
+
+static void hppa_set_sba_pluto(Object *obj, bool value, Error **errp)
+{
+    HPPA_COMMON_MACHINE(obj)->sba_pluto = value;
 }
 
 static void hppa_machine_instance_init(Object *obj)
@@ -1107,7 +1131,20 @@ static void HP_A400_machine_init_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_size = 1024 * MiB;
     compat_props_add(mc->compat_props, hppa_astro_compat,
                      G_N_ELEMENTS(hppa_astro_compat));
+
+    object_class_property_add_bool(oc, "pluto", hppa_get_sba_pluto,
+                                   hppa_set_sba_pluto);
+    object_class_property_set_description(oc, "pluto",
+        "Show the Astro as a Pluto (zx1) SBA, as HP-UX 11.31 wants");
 }
+
+/*
+ * HP-UX 9 ioscan sends MODE SENSE page 5 to the open root disk and leaves
+ * the disk out of its listing if the page is returned.
+ */
+static GlobalProperty hp_715_scsi_quirks[] = {
+    { "scsi-hd", "quirk_mode_page_no_flexible_disk", "on" },
+};
 
 static void HP_715_machine_init_class_init(ObjectClass *oc, const void *data)
 {
@@ -1130,6 +1167,8 @@ static void HP_715_machine_init_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = MIN_CONST(HPPA_MAX_CPUS, 8);
     mc->default_ram_size = 256 * MiB;
     mc->default_nic = TYPE_LASI_82596;
+    compat_props_add(mc->compat_props, hp_715_scsi_quirks,
+                     G_N_ELEMENTS(hp_715_scsi_quirks));
 }
 
 

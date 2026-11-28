@@ -329,6 +329,12 @@ typedef struct IDEBufferedRequest {
     BlockCompletionFunc *original_cb;
     void *original_opaque;
     bool orphaned;
+    /* raw CD sectors (ide_buffered_read_cd_raw), else a readv */
+    int cd_sectors;
+    uint8_t *cd_raw;
+    uint8_t *cd_sub;
+    uint8_t *cd_raw_dst;
+    uint8_t *cd_sub_dst;
 } IDEBufferedRequest;
 
 /* These are used for the error_status field of IDEBus */
@@ -439,6 +445,9 @@ void ide_set_inactive(IDEState *s, bool more);
 BlockAIOCB *ide_issue_trim(
         int64_t offset, QEMUIOVector *qiov,
         BlockCompletionFunc *cb, void *cb_opaque, void *opaque);
+BlockAIOCB *ide_buffered_read_cd_raw(IDEState *s, int64_t lba, int nb_sectors,
+                                     uint8_t *raw, uint8_t *subchannel,
+                                     BlockCompletionFunc *cb, void *opaque);
 BlockAIOCB *ide_buffered_readv(IDEState *s, int64_t sector_num,
                                QEMUIOVector *iov, int nb_sectors,
                                BlockCompletionFunc *cb, void *opaque);

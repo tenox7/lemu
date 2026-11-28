@@ -3,6 +3,7 @@
  *
  *  Copyright (c) 2005-2007 CodeSourcery
  *  Written by Paul Brook
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -31,6 +32,8 @@
 #include "exec/log.h"
 #include "fpu/softfloat.h"
 #include "semihosting/semihost.h"
+
+#include "trace.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -110,6 +113,7 @@ typedef struct DisasContext {
     int writeback_mask;
     TCGv writeback[8];
     bool ss_active;
+    TCGv packed_k;      /* k-factor of an FMOVE.P to memory */
 } DisasContext;
 
 static TCGv get_areg(DisasContext *s, unsigned regno)
@@ -958,11 +962,21 @@ static void gen_load_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
         tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
         break;
     case OS_PACKED:
-        /*
-         * unimplemented data type on 68040/ColdFire
-         * FIXME if needed for another FPU
-         */
-        gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+        if (!m68k_feature(s->env, M68K_FEATURE_FPU_PACKED)) {
+            gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+            break;
+        }
+        {
+            TCGv w1 = tcg_temp_new();
+            TCGv w2 = tcg_temp_new();
+
+            tcg_gen_qemu_ld_tl(tmp, addr, index, MO_TEUL);
+            tcg_gen_addi_i32(w1, addr, 4);
+            tcg_gen_qemu_ld_tl(w1, w1, index, MO_TEUL);
+            tcg_gen_addi_i32(w2, addr, 8);
+            tcg_gen_qemu_ld_tl(w2, w2, index, MO_TEUL);
+            gen_helper_frompacked(tcg_env, fp, tmp, w1, w2);
+        }
         break;
     default:
         g_assert_not_reached();
@@ -1005,11 +1019,23 @@ static void gen_store_fp(DisasContext *s, int opsize, TCGv addr, TCGv_ptr fp,
         tcg_gen_qemu_st_i64(t64, tmp, index, MO_TEUQ);
         break;
     case OS_PACKED:
-        /*
-         * unimplemented data type on 68040/ColdFire
-         * FIXME if needed for another FPU
-         */
-        gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+        if (!m68k_feature(s->env, M68K_FEATURE_FPU_PACKED)) {
+            gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+            break;
+        }
+        gen_helper_topacked(tcg_env, fp, s->packed_k);
+        for (int i = 0; i < 3; i++) {
+            tcg_gen_ld_i32(tmp, tcg_env,
+                           offsetof(CPUM68KState, fp_packed[i]));
+            if (i) {
+                TCGv a = tcg_temp_new();
+
+                tcg_gen_addi_i32(a, addr, 4 * i);
+                tcg_gen_qemu_st_tl(tmp, a, index, MO_TEUL);
+            } else {
+                tcg_gen_qemu_st_tl(tmp, addr, index, MO_TEUL);
+            }
+        }
         break;
     default:
         g_assert_not_reached();
@@ -1137,11 +1163,17 @@ static int gen_ea_mode_fp(CPUM68KState *env, DisasContext *s, int mode,
                 tcg_gen_st_i64(t64, fp, offsetof(FPReg, l.lower));
                 break;
             case OS_PACKED:
-                /*
-                 * unimplemented data type on 68040/ColdFire
-                 * FIXME if needed for another FPU
-                 */
-                gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+                if (!m68k_feature(s->env, M68K_FEATURE_FPU_PACKED)) {
+                    gen_exception(s, s->base.pc_next, EXCP_FP_UNIMP);
+                    break;
+                }
+                {
+                    TCGv w0 = tcg_constant_i32(read_im32(env, s));
+                    TCGv w1 = tcg_constant_i32(read_im32(env, s));
+                    TCGv w2 = tcg_constant_i32(read_im32(env, s));
+
+                    gen_helper_frompacked(tcg_env, fp, w0, w1, w2);
+                }
                 break;
             default:
                 g_assert_not_reached();
@@ -2964,6 +2996,104 @@ DISAS_INSN(addsubq)
     DEST_EA(env, insn, opsize, dest, &addr);
 }
 
+#ifndef CONFIG_USER_ONLY
+/*
+ * Mach on the NeXT spins in idle_thread() when it has nothing to run; see
+ * nextstep_idle.c. At a beq.s back to a loop top, read the loop and, when
+ * it is that one, let helper_nextstep_idle() halt the CPU. The checks are
+ * packed as the helper takes them.
+ */
+static void gen_nextstep_idle(DisasContext *s, CPUM68KState *env,
+                              uint32_t top, uint32_t branch)
+{
+    DisasContextBase *db = &s->base;
+    uint8_t sym[8];             /* what each address register holds */
+    uint32_t checks = 0, addr = 0, mask = 0xffffffff;
+    bool have_addr = false;
+    int n = 0, i;
+    uint32_t pc = top;
+
+    if (tb_page_addr0(db->tb) == -1 || top >= branch ||
+        branch - top > 64 || !translator_is_same_page(db, top) ||
+        !translator_is_same_page(db, branch)) {
+        return;
+    }
+    for (i = 0; i < 8; i++) {
+        sym[i] = 8 + i;
+    }
+    while (pc < branch) {
+        uint16_t w = translator_lduw_end(env, db, pc, MO_BE);
+        unsigned an = w & 7;
+
+        if ((w & 0xf1ff) == 0x41f9) {
+            /* lea abs.l,An */
+            if (have_addr) {
+                return;
+            }
+            addr = translator_ldl_end(env, db, pc + 2, MO_BE);
+            have_addr = true;
+            sym[(w >> 9) & 7] = 15;
+            pc += 6;
+        } else if ((w & 0xf1f8) == 0x2040) {
+            /* movea.l Dm,An */
+            sym[(w >> 9) & 7] = w & 7;
+            pc += 2;
+        } else if ((w & 0xfff8) == 0x4a90 || (w & 0xfff8) == 0x2010) {
+            /* tst.l (An) or move.l (An),d0, then bne.s out or the end */
+            uint16_t b;
+
+            if (n == 4 || an == 7) {
+                return;
+            }
+            checks |= (0x80 | sym[an]) << (n++ * 8);
+            pc += 2;
+            if (pc == branch) {
+                break;
+            }
+            b = translator_lduw_end(env, db, pc, MO_BE);
+            if ((b & 0xff00) != 0x6600 || (int8_t)b <= 0) {
+                return;
+            }
+            pc += 2;
+        } else if ((w & 0xfff8) == 0x2030 && n == 0 && an != 7) {
+            /*
+             * move.l (0,An,Dx.l*4),d0; moveq #m,Dk; and.l Dk,d0;
+             * beq.s over the code that handles the flags
+             */
+            uint16_t ext = translator_lduw_end(env, db, pc + 2, MO_BE);
+            uint16_t mq = translator_lduw_end(env, db, pc + 4, MO_BE);
+            uint16_t andl = translator_lduw_end(env, db, pc + 6, MO_BE);
+            uint16_t b = translator_lduw_end(env, db, pc + 8, MO_BE);
+            unsigned k = (mq >> 9) & 7;
+
+            if ((ext & 0x8fff) != 0x0c00 || (mq & 0xf100) != 0x7000 ||
+                andl != (0xc080 | k) || (b & 0xff00) != 0x6700 ||
+                (int8_t)b <= 0) {
+                return;
+            }
+            mask = (int8_t)mq;
+            checks |= 0x80 | (((ext >> 12) & 7) << 4) | sym[an];
+            n++;
+            pc += 10 + (int8_t)b;
+        } else {
+            return;
+        }
+    }
+    if (pc != branch || n == 0) {
+        return;
+    }
+    trace_m68k_nextstep_idle_match(branch, top, checks, addr, mask);
+
+    /* The helper reads the clock and may halt: the flags must be in env */
+    update_cc_op(s);
+    translator_io_start(db);
+    gen_helper_nextstep_idle(tcg_env, tcg_constant_i32(top),
+                             tcg_constant_i32(checks),
+                             tcg_constant_i32(addr),
+                             tcg_constant_i32(mask));
+}
+#endif
+
 DISAS_INSN(branch)
 {
     int32_t offset;
@@ -2982,6 +3112,12 @@ DISAS_INSN(branch)
         /* bsr */
         gen_push(s, tcg_constant_i32(s->pc));
     }
+#ifndef CONFIG_USER_ONLY
+    if (op == 7 && offset < 0 && (int8_t)insn != 0 && !IS_USER(s) &&
+        env->nextstep_idle && !(tb_cflags(s->base.tb) & CF_SINGLE_STEP)) {
+        gen_nextstep_idle(s, env, base + offset, base - 2);
+    }
+#endif
     if (op > 1) {
         /* Bcc */
         TCGLabel *l1 = gen_new_label();
@@ -4644,6 +4780,83 @@ DISAS_INSN(ptest)
 }
 #endif
 
+#if !defined(CONFIG_USER_ONLY)
+/*
+ * 68030 MMU instructions: coprocessor 0, general type, with an extension
+ * word: PMOVE (types 0, 2 and 3), PFLUSH and PLOAD (type 1) and PTEST
+ * (type 4).
+ */
+DISAS_INSN(mmu030)
+{
+    uint16_t ext = read_im16(env, s);
+    int type = ext >> 13;
+    int mode = extract32(insn, 3, 3);
+    int reg0 = REG(insn, 0);
+    TCGv addr = NULL_QREG;
+    int size = 4;
+
+    if (IS_USER(s)) {
+        gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
+        return;
+    }
+
+    switch (type) {
+    case 0: /* PMOVE TT0, TT1 */
+    case 2: /* PMOVE TC, SRP, CRP */
+    case 3: /* PMOVE MMUSR */
+        if (type == 2 && ((ext >> 10) & 7) >= 2) {
+            size = 8;
+        } else if (type == 3) {
+            size = 2;
+        }
+        if (mode == 3) {        /* (An)+ */
+            addr = tcg_temp_new();
+            tcg_gen_mov_i32(addr, get_areg(s, reg0));
+            tcg_gen_addi_i32(get_areg(s, reg0), get_areg(s, reg0), size);
+        } else if (mode == 4) { /* -(An) */
+            addr = tcg_temp_new();
+            tcg_gen_subi_i32(addr, get_areg(s, reg0), size);
+            tcg_gen_mov_i32(get_areg(s, reg0), addr);
+        } else {
+            addr = gen_lea_mode(env, s, mode, reg0, OS_LONG);
+        }
+        if (IS_NULL_QREG(addr)) {
+            gen_addr_fault(s);
+            return;
+        }
+        /* the next instruction: where a bad TC's exception returns to */
+        gen_helper_pmove(tcg_env, tcg_constant_i32(ext), addr,
+                         tcg_constant_i32(s->pc));
+        break;
+    case 1: /* PFLUSH, PLOAD */
+        if (((ext >> 10) & 7) == 0 || ((ext >> 10) & 7) == 6) {
+            addr = gen_lea_mode(env, s, mode, reg0, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+        } else {
+            addr = tcg_constant_i32(0);
+        }
+        gen_helper_pflush030(tcg_env, tcg_constant_i32(ext), addr);
+        break;
+    case 4: /* PTEST */
+        addr = gen_lea_mode(env, s, mode, reg0, OS_LONG);
+        if (IS_NULL_QREG(addr)) {
+            gen_addr_fault(s);
+            return;
+        }
+        gen_helper_ptest030(tcg_env, tcg_constant_i32(ext), addr);
+        break;
+    default:
+        gen_exception(s, s->base.pc_next, EXCP_LINEF);
+        return;
+    }
+    /* the translation may have changed */
+    gen_exit_tb(s);
+}
+#endif
+
 DISAS_INSN(wddata)
 {
     gen_exception(s, s->base.pc_next, EXCP_PRIVILEGE);
@@ -4954,7 +5167,16 @@ DISAS_INSN(fpu)
         break;
     case 3: /* fmove out */
         cpu_src = gen_fp_ptr(REG(ext, 7));
-        opsize = ext_opsize(ext, 10);
+        if (((ext >> 10) & 7) == 7) {
+            /* packed, with the k-factor in a data register */
+            opsize = OS_PACKED;
+            s->packed_k = tcg_temp_new();
+            tcg_gen_sextract_i32(s->packed_k, cpu_dregs[(ext >> 4) & 7],
+                                 0, 7);
+        } else {
+            opsize = ext_opsize(ext, 10);
+            s->packed_k = tcg_constant_i32(sextract32(ext, 0, 7));
+        }
         if (gen_ea_fp(env, s, insn, opsize, cpu_src,
                       EA_STORE, IS_USER(s)) == -1) {
             gen_addr_fault(s);
@@ -5367,6 +5589,22 @@ DISAS_INSN(frestore)
     if (m68k_feature(s->env, M68K_FEATURE_M68040)) {
         SRC_EA(env, addr, OS_LONG, 0, NULL);
         /* FIXME: check the state frame */
+    } else if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
+        /* 68881/68882: the frame says its own size */
+        int mode = extract32(insn, 3, 3);
+        int reg0 = REG(insn, 0);
+        TCGv size = tcg_temp_new();
+
+        addr = mode == 3 ? get_areg(s, reg0)
+                         : gen_lea_mode(env, s, mode, reg0, OS_LONG);
+        if (mode == 4 || IS_NULL_QREG(addr)) {
+            gen_addr_fault(s);
+            return;
+        }
+        gen_helper_frestore882(size, tcg_env, addr);
+        if (mode == 3) {
+            tcg_gen_add_i32(get_areg(s, reg0), get_areg(s, reg0), size);
+        }
     } else {
         disas_undef(env, s, insn);
     }
@@ -5383,6 +5621,27 @@ DISAS_INSN(fsave)
         /* always write IDLE */
         TCGv idle = tcg_constant_i32(0x41000000);
         DEST_EA(env, insn, OS_LONG, idle, NULL);
+    } else if (m68k_feature(s->env, M68K_FEATURE_FPU)) {
+        /* 68882: always an idle frame, 4 + 0x38 bytes */
+        int mode = extract32(insn, 3, 3);
+        int reg0 = REG(insn, 0);
+        TCGv addr;
+
+        if (mode == 4) {
+            addr = tcg_temp_new();
+            tcg_gen_subi_i32(addr, get_areg(s, reg0), 4 + 0x38);
+            tcg_gen_mov_i32(get_areg(s, reg0), addr);
+        } else if (mode == 3) {
+            gen_addr_fault(s);
+            return;
+        } else {
+            addr = gen_lea_mode(env, s, mode, reg0, OS_LONG);
+            if (IS_NULL_QREG(addr)) {
+                gen_addr_fault(s);
+                return;
+            }
+        }
+        gen_helper_fsave882(tcg_env, addr);
     } else {
         disas_undef(env, s, insn);
     }
@@ -6005,6 +6264,7 @@ void register_m68k_insns (CPUM68KState *env)
     INSN(cinv,      f400, ff20, M68040);
     INSN(pflush,    f500, ffe0, M68040);
     INSN(ptest,     f548, ffd8, M68040);
+    INSN(mmu030,    f000, ffc0, M68030);
     INSN(wddata,    fb00, ff00, CF_ISA_A);
     INSN(wdebug,    fbc0, ffc0, CF_ISA_A);
 #endif

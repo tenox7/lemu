@@ -44,6 +44,7 @@ static const struct {
 } ati_model_aliases[] = {
     { "rage128p", PCI_DEVICE_ID_ATI_RAGE128_PF },
     { "rv100", PCI_DEVICE_ID_ATI_RADEON_QY },
+    { "rv200", PCI_DEVICE_ID_ATI_RADEON_QW },
     { "es1000", PCI_DEVICE_ID_ATI_RADEON_ES1000 },
 };
 
@@ -184,13 +185,52 @@ static int ati_cursor_lines(uint32_t hv_offs)
     return 64 - (hv_offs & 0x3f);
 }
 
-/* Used by host side hardware cursor */
+/*
+ * The cursor engine reads the frame buffer as the card stores it. When the
+ * aperture swaps bytes, LEMU keeps the frame buffer in the guest's byte
+ * order (big_endian_fb), so a read by the card swaps them back: byte n as
+ * the card sees it is byte n ^ 3 here (32 bpp swap) or n ^ 1 (16 bpp swap).
+ * HP-UX 11.31 sets the 32 bpp swap and writes its mono cursor through it.
+ */
+static unsigned ati_fb_swap_xor(ATIVGAState *s)
+{
+    if (!s->vga.big_endian_fb) {
+        return 0;
+    }
+    if ((s->regs.config_cntl & APER_0_ENDIAN) == 2 ||
+        (s->regs.config_cntl & APER_1_ENDIAN) == 8 ||
+        s->regs.surface_cntl & (NONSURF_AP0_SWP_32BPP |
+                                NONSURF_AP1_SWP_32BPP)) {
+        return 3;
+    }
+    return 1;
+}
+
+/* One line of a mono cursor plane: 64 pixels, the leftmost in the top bit */
+static uint64_t ati_cursor_bits(ATIVGAState *s, uint32_t off)
+{
+    unsigned x = ati_fb_swap_xor(s);
+    uint64_t v = 0;
+
+    for (int i = 0; i < 8; i++) {
+        v = v << 8 | s->vga.vram_ptr[(off + i) ^ x];
+    }
+    return v;
+}
+
+/*
+ * Used by host side hardware cursor. Each new image goes into a new
+ * QEMUCursor: a display (cocoa) may still draw from the old one. An
+ * unchanged image is not sent again, as the guest may rewrite CUR_OFFSET
+ * at every move.
+ */
 static void ati_cursor_define(ATIVGAState *s)
 {
     uint8_t data[1024];
     uint32_t srcoff;
     int xoff = ati_cursor_xoff(s->regs.cur_hv_offs);
     int lines = ati_cursor_lines(s->regs.cur_hv_offs);
+    QEMUCursor *c;
 
     if ((s->regs.cur_offset & BIT(31)) || s->cursor_guest_mode) {
         return; /* Do not update cursor if locked or rendered by guest */
@@ -200,9 +240,7 @@ static void ati_cursor_define(ATIVGAState *s)
         if (srcoff > s->vga.vram_size - 64 * 64 * 4) {
             return;
         }
-        if (!s->cursor) {
-            s->cursor = cursor_alloc(64, 64);
-        }
+        c = cursor_alloc(64, 64);
         for (int i = 0; i < 64; i++) {
             for (int j = 0; j < 64; j++) {
                 uint32_t px = 0xff000000; /* clear */
@@ -212,37 +250,40 @@ static void ati_cursor_define(ATIVGAState *s)
                                              (j + xoff) * 4);
                 }
                 if (!(px & 0xff000000)) {
-                    s->cursor->data[i * 64 + j] = px | 0xff000000;
+                    c->data[i * 64 + j] = px | 0xff000000;
                 } else if (px & 0xffffff) {
                     /* the host cursor cannot XOR, show it black */
-                    s->cursor->data[i * 64 + j] = 0xff000000;
+                    c->data[i * 64 + j] = 0xff000000;
                 } else {
-                    s->cursor->data[i * 64 + j] = 0;
+                    c->data[i * 64 + j] = 0;
                 }
             }
         }
-        qemu_console_set_cursor(s->vga.con, s->cursor);
-        return;
-    }
-    if (srcoff > s->vga.vram_size - 64 * 16) {
-        return;
-    }
-    for (int i = 0; i < 64; i++, srcoff += 16) {
-        uint64_t abits = UINT64_MAX, xbits = 0; /* transparent */
-
-        if (i < lines) {
-            abits = ldq_be_p(&s->vga.vram_ptr[srcoff]) << xoff |
-                    (BIT_ULL(xoff) - 1);
-            xbits = ldq_be_p(&s->vga.vram_ptr[srcoff + 8]) << xoff;
+    } else {
+        if (srcoff > s->vga.vram_size - 64 * 16) {
+            return;
         }
-        stq_be_p(&data[i * 8], abits);
-        stq_be_p(&data[512 + i * 8], xbits);
+        for (int i = 0; i < 64; i++, srcoff += 16) {
+            uint64_t abits = UINT64_MAX, xbits = 0; /* transparent */
+
+            if (i < lines) {
+                abits = ati_cursor_bits(s, srcoff) << xoff |
+                        (BIT_ULL(xoff) - 1);
+                xbits = ati_cursor_bits(s, srcoff + 8) << xoff;
+            }
+            stq_be_p(&data[i * 8], abits);
+            stq_be_p(&data[512 + i * 8], xbits);
+        }
+        c = cursor_alloc(64, 64);
+        cursor_set_mono(c, s->regs.cur_color1, s->regs.cur_color0,
+                        &data[512], 1, &data[0]);
     }
-    if (!s->cursor) {
-        s->cursor = cursor_alloc(64, 64);
+    if (s->cursor && !memcmp(c->data, s->cursor->data, 64 * 64 * 4)) {
+        cursor_unref(c);
+        return;
     }
-    cursor_set_mono(s->cursor, s->regs.cur_color1, s->regs.cur_color0,
-                    &data[512], 1, &data[0]);
+    cursor_unref(s->cursor);
+    s->cursor = c;
     qemu_console_set_cursor(s->vga.con, s->cursor);
 }
 
@@ -334,8 +375,8 @@ static void ati_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
     if (srcoff > s->vga.vram_size - 16) {
         return;
     }
-    abits = ldq_be_p(&vga->vram_ptr[srcoff]) << xoff;
-    xbits = ldq_be_p(&vga->vram_ptr[srcoff + 8]) << xoff;
+    abits = ati_cursor_bits(s, srcoff) << xoff;
+    xbits = ati_cursor_bits(s, srcoff + 8) << xoff;
     mask = BIT_ULL(63);
     for (int i = 0; i < 64 - xoff; i++, mask >>= 1) {
         if (vga->hw_cursor_x + i >= h) {
@@ -406,6 +447,14 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
     switch (addr) {
     case MM_INDEX:
         val = s->regs.mm_index;
+        break;
+    case CLOCK_CNTL_INDEX ... CLOCK_CNTL_INDEX + 3:
+        val = ati_reg_read_offs(s->regs.clock_cntl_index,
+                                addr - CLOCK_CNTL_INDEX, size);
+        break;
+    case CLOCK_CNTL_DATA ... CLOCK_CNTL_DATA + 3:
+        val = ati_reg_read_offs(s->regs.pll[s->regs.clock_cntl_index & 0x3f],
+                                addr - CLOCK_CNTL_DATA, size);
         break;
     case MM_DATA ... MM_DATA + 3:
         /* indexed access to regs or memory */
@@ -730,6 +779,28 @@ static void ati_mm_write(void *opaque, hwaddr addr,
     case MM_INDEX:
         s->regs.mm_index = data & ~3;
         break;
+    case CLOCK_CNTL_INDEX ... CLOCK_CNTL_INDEX + 3:
+        ati_reg_write_offs(&s->regs.clock_cntl_index,
+                           addr - CLOCK_CNTL_INDEX, data, size);
+        s->regs.clock_cntl_index &= 0x3bf;
+        break;
+    case CLOCK_CNTL_DATA ... CLOCK_CNTL_DATA + 3:
+    {
+        /*
+         * Writes are taken without PLL_WR_EN too: the HP-UX X server
+         * writes the data when the index is already right, and may not
+         * have set PLL_WR_EN.
+         */
+        int idx = s->regs.clock_cntl_index & 0x3f;
+
+        ati_reg_write_offs(&s->regs.pll[idx], addr - CLOCK_CNTL_DATA,
+                           data, size);
+        if (idx == PPLL_REF_DIV || idx == P2PLL_REF_DIV) {
+            /* the PLL takes the new dividers at once */
+            s->regs.pll[idx] &= ~PPLL_ATOMIC_UPDATE_R;
+        }
+        break;
+    }
     case MM_DATA ... MM_DATA + 3:
         /* indexed access to regs or memory */
         if (s->regs.mm_index & BIT(31)) {
@@ -931,12 +1002,23 @@ static void ati_mm_write(void *opaque, hwaddr addr,
     case CUR_OFFSET ... CUR_OFFSET + 3:
     {
         uint32_t t = s->regs.cur_offset;
+        bool unlock;
 
         ati_reg_write_offs(&t, addr - CUR_OFFSET, data, size);
         t &= 0x87fffff0;
+        unlock = (s->regs.cur_offset & ~t) & BIT(31);
         if (s->regs.cur_offset != t) {
             s->regs.cur_offset = t;
             ati_cursor_define(s);
+        }
+        /*
+         * X.org and the HP-UX 11.31 X server move the cursor with
+         * CUR_HORZ_VERT_OFF and _POSN locked, then unlock it here.
+         */
+        if (unlock && !s->cursor_guest_mode &&
+            (s->regs.crtc_gen_cntl & CRTC2_CUR_EN)) {
+            qemu_console_set_mouse(s->vga.con, s->regs.cur_hv_pos >> 16,
+                                   s->regs.cur_hv_pos & 0xffff, true);
         }
         break;
     }
@@ -1066,7 +1148,8 @@ static void ati_mm_write(void *opaque, hwaddr addr,
     case DP_GUI_MASTER_CNTL:
         s->regs.dp_gui_master_cntl = data & 0xf800000f;
         s->regs.dp_datatype = (data & 0x0f00) >> 8 | (data & 0x30f0) << 4 |
-                              (data & 0x4000) << 16;
+                              (data & 0x4000) << 16 |
+                              (s->regs.dp_datatype & DP_HOST_BIG_ENDIAN_EN);
         s->regs.dp_mix = (data & GMC_ROP3_MASK) | (data & 0x7000000) >> 16;
         ati_update_default_pitch_offset(s);
         if (!(data & GMC_SRC_CLIPPING)) {
@@ -1323,9 +1406,10 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     }
     if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF &&
         s->dev_id != PCI_DEVICE_ID_ATI_RADEON_QY &&
+        s->dev_id != PCI_DEVICE_ID_ATI_RADEON_QW &&
         s->dev_id != PCI_DEVICE_ID_ATI_RADEON_ES1000) {
         error_setg(errp, "Unknown ATI VGA device id, "
-                   "only 0x5046, 0x5159 and 0x515e are supported");
+                   "only 0x5046, 0x5159, 0x5157 and 0x515e are supported");
         return;
     }
     pci_set_word(dev->config + PCI_DEVICE_ID, s->dev_id);
@@ -1418,6 +1502,17 @@ static void ati_vga_reset(DeviceState *dev)
     s->regs.rbbm_guicntl = 0;
     s->regs.config_cntl = 0;
     s->regs.surface_cntl = 0;
+    /*
+     * PLL registers (CLOCK_CNTL_INDEX/DATA): only stored. The dividers are
+     * a 27 MHz reference / 12, as on many Radeons, so drivers that work
+     * out the clocks from them don't divide by zero.
+     */
+    s->regs.clock_cntl_index = 0;
+    memset(s->regs.pll, 0, sizeof(s->regs.pll));
+    s->regs.pll[PPLL_REF_DIV] = 12;
+    s->regs.pll[PPLL_DIV_3] = 0x00030060;
+    s->regs.pll[P2PLL_REF_DIV] = 12;
+    s->regs.pll[X_MPLL_REF_FB_DIV] = 0x0058580c;
 }
 
 static void ati_vga_exit(PCIDevice *dev)

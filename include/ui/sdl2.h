@@ -40,6 +40,8 @@ struct sdl2_console {
     int hidden;
     int opengl;
     int updates;
+    /* the area to copy to the window at the next refresh, if updates */
+    int dirty_x0, dirty_y0, dirty_x1, dirty_y1;
     int idle_counter;
     int ignore_hotkeys;
     bool gui_keysym;
@@ -68,6 +70,30 @@ void sdl2_poll_events(struct sdl2_console *scon);
 void sdl2_process_key(struct sdl2_console *scon,
                       SDL_KeyboardEvent *ev);
 void sdl2_release_modifiers(struct sdl2_console *scon);
+
+/*
+ * Note an area of the surface to copy to the window at the next refresh.
+ * A text console (a serial port shown in a window) changes in the thread
+ * that writes to the port, often a vCPU thread. SDL may only be called from
+ * the main thread: a GL renderer, as SDL uses on Wayland, makes its context
+ * current in the calling thread, and the main thread can then draw no more.
+ */
+static inline void sdl2_mark_dirty(struct sdl2_console *scon,
+                                   int x, int y, int w, int h)
+{
+    if (!scon->updates) {
+        scon->dirty_x0 = x;
+        scon->dirty_y0 = y;
+        scon->dirty_x1 = x + w;
+        scon->dirty_y1 = y + h;
+    } else {
+        scon->dirty_x0 = MIN(scon->dirty_x0, x);
+        scon->dirty_y0 = MIN(scon->dirty_y0, y);
+        scon->dirty_x1 = MAX(scon->dirty_x1, x + w);
+        scon->dirty_y1 = MAX(scon->dirty_y1, y + h);
+    }
+    scon->updates++;
+}
 
 void sdl2_2d_update(DisplayChangeListener *dcl,
                     int x, int y, int w, int h);

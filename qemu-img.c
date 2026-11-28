@@ -2,6 +2,7 @@
  * QEMU disk image utility
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,7 +28,7 @@
 
 #include "qemu/help-texts.h"
 #include "qemu/qemu-progress.h"
-#include "qemu/version.h"
+#include "qemu-version.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-block-core.h"
 #include "qapi/qapi-visit-block-core.h"
@@ -2347,7 +2348,7 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
 "  --target-is-zero\n"
 "     indicates that the target volume is pre-zeroed\n"
 "  -c, --compress\n"
-"     create compressed output image (qcow and qcow2 formats only)\n"
+"     create compressed output image (qcow, qcow2 and aaruformat formats only)\n"
 "  -U, --force-share\n"
 "     open images in shared mode for concurrent access\n"
 "  -r, --rate-limit RATE\n"

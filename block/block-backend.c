@@ -2,6 +2,7 @@
  * QEMU Block backends
  *
  * Copyright (C) 2014-2016 Red Hat, Inc.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Authors:
  *  Markus Armbruster <armbru@redhat.com>,
@@ -1802,6 +1803,59 @@ BlockAIOCB *blk_aio_ioctl(BlockBackend *blk, unsigned long int req, void *buf,
     return blk_aio_prwv(blk, req, 0, buf, blk_aio_ioctl_entry, 0, cb, opaque);
 }
 
+typedef struct BlkCdRawRequest {
+    uint8_t *raw;
+    uint8_t *subchannel;
+} BlkCdRawRequest;
+
+static void coroutine_fn blk_aio_read_cd_raw_entry(void *opaque)
+{
+    BlkAioEmAIOCB *acb = opaque;
+    BlkRwCo *rwco = &acb->rwco;
+    BlkCdRawRequest *req = rwco->iobuf;
+    BlockBackend *blk = rwco->blk;
+    int ret = 0;
+
+    blk_wait_while_drained(blk, 0);
+
+    WITH_GRAPH_RDLOCK_GUARD() {
+        BlockDriverState *bs = blk_bs(blk);
+
+        if (!bs || !bdrv_co_is_inserted(bs)) {
+            ret = -ENOMEDIUM;
+        }
+
+        for (int64_t i = 0; ret >= 0 && i < acb->bytes; i++) {
+            int r = bdrv_co_read_cd_raw(bs, rwco->offset + i,
+                                        req->raw + i * BLOCK_CD_RAW_SECTOR,
+                                        req->subchannel ?
+                                        req->subchannel +
+                                        i * BLOCK_CD_SUBCHANNEL : NULL);
+            ret = r < 0 ? r : MAX(ret, r);
+        }
+    }
+
+    g_free(req);
+    rwco->ret = ret;
+    blk_aio_complete(acb);
+}
+
+BlockAIOCB *blk_aio_read_cd_raw(BlockBackend *blk, int64_t lba,
+                                int nb_sectors, uint8_t *raw,
+                                uint8_t *subchannel,
+                                BlockCompletionFunc *cb, void *opaque)
+{
+    BlkCdRawRequest *req = g_new(BlkCdRawRequest, 1);
+
+    IO_CODE();
+    req->raw = raw;
+    req->subchannel = subchannel;
+
+    /* offset is the first LBA, bytes the number of sectors */
+    return blk_aio_prwv(blk, lba, nb_sectors, req, blk_aio_read_cd_raw_entry,
+                        0, cb, opaque);
+}
+
 /* To be called between exactly one pair of blk_inc/dec_in_flight() */
 static int coroutine_fn
 blk_co_do_pdiscard(BlockBackend *blk, int64_t offset, int64_t bytes,
@@ -2269,6 +2323,19 @@ bool coroutine_fn blk_co_is_inserted(BlockBackend *blk)
     assert_bdrv_graph_readable();
 
     return bs && bdrv_co_is_inserted(bs);
+}
+
+int coroutine_fn blk_co_get_cd_toc(BlockBackend *blk, BlockCdToc *toc)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+    assert_bdrv_graph_readable();
+
+    if (!bs || !bdrv_co_is_inserted(bs)) {
+        return -ENOMEDIUM;
+    }
+
+    return bdrv_co_get_cd_toc(bs, toc);
 }
 
 bool coroutine_fn blk_co_is_available(BlockBackend *blk)

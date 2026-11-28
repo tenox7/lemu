@@ -99,9 +99,9 @@ A disk installed without the card needs three changes. Make them once, with the 
   buffer, as on the B160L. The expansion ROM holds the STI ROM. The ROM also shows at the
   start of BAR 0: the STI region list puts region 0 (the ROM) there, and HP-UX finds the
   card's display by that address.
-- **Power button in snapshots** (`target/hppa/machine.c`). The firmware's soft power word
-  (`env.power_btn`) was not saved. loadvm resets the machine first, and 0 there means
-  "button pressed", so HP-UX powered off after each loadvm.
+- **Power button in snapshots.** The firmware's soft power word was not saved while it
+  was in the CPU I/O region, so HP-UX powered off after each loadvm. QEMU moved it back
+  into firmware memory (9eb788b8ce), which snapshots keep, so LEMU's fix went away.
 - Debug aid: the trace event `hppa_tlb_ar_fault` shows access-rights faults.
 
 ## Firmware
@@ -128,10 +128,107 @@ LEMU's SeaBIOS-hppa 27 with eight changes, from github.com/tenox7/seabios-hppa b
 8. `opt/console=graphics` also works with the PCI card on the Astro machines: the STI
    console on the card, as above.
 
+## HP-UX 11i v3 (B.11.31) on the A400
+
+11.31 on PA-RISC supports only zx1, REO and PAT machines. `-M A400,pluto=on` shows the
+A400's Astro as a Pluto (zx1) SBA. The MCOE June 2007 DVDs (2 discs) install and boot to
+login:
+
+```
+qemu-system-hppa -M A400,pluto=on -m 2048 -smp 1 -nographic \
+  -drive if=scsi,bus=0,index=6,file=hpux1131.qcow2,format=qcow2 \
+  -drive if=scsi,bus=0,index=2,media=cdrom,file=hp-ux-11.31-mcoe-06.2007-dvd1.iso \
+  -boot d -nic user,model=tulip
+```
+
+At about fileset 1125 of 1197 Ignite asks for media 2: in the monitor,
+`change scsi0-cd2 hp-ux-11.31-mcoe-06.2007-dvd2.iso raw read-only`, then answer 1.
+
+With `pluto=on`:
+- The firmware gives the SBA the Pluto IODC (hv 0x880). The IOC registers are also at
+  0x2000, as on a Pluto. IBASE and IMASK start as a 1 GB IOVA window at 1 GB, and the I/O
+  PDIR index is the page inside that window.
+- The SCSI card is a 53C875 (`lsi53c875`): the 11.31 c8xx driver takes the 53C875, 53C896
+  and 53C1010-66, but not the 53C895 or 53C895A.
+- The Diva serial card has the UART interrupt status byte at BAR 0 + 0x1b. 11.31 asio0_intr
+  reads it.
+- fcnv from a doubleword reads fr0 as zero (`target/hppa`, for all machines). Before, it
+  read the FP status: the aC++ library sized a string from it, `operator new` threw in a
+  static constructor, and evmd aborted at boot (S020evm FAILED).
+- PAT firmware (branch `hpux1131`): 32-bit LMMIO ranges in the I/O view, -7 (PDC_NE_CELL_MOD)
+  at the end of the module list, PDC_PAT_IO 0, the hint table and the hard-fail calls, and
+  PDC_IODC_READ of a PCI function by its config address (else lvlnboot stops with "IODC
+  max address", as on 11.23 before fix 2).
+
+### CDE on 11.31
+
+The 11.31 PA X server has no Artist driver. It has the XFree86 4.2 radeon driver, and the
+gvid driver takes a Radeon 7500. Add the card (the console stays on the serial port):
+
+```
+  -device ati-vga,model=rv200,x-linear-aper-size=0x4000000,guest_hwcursor=true \
+  -serial mon:stdio
+```
+
+- `model=rv200` is 1002:5157, emulated as the RV100. gvid maps 64 MB from every memory BAR
+  of this card, so the aperture is 64 MB too.
+- `guest_hwcursor=true`: QEMU draws the mouse pointer into the screen. Without it, SDL and
+  cocoa show a host cursor and move the host pointer to where X put its pointer. X doubles
+  fast moves, so the pointer jumps. The AIX ES1000 VMs use it for the same reason.
+- X uses a 32 bpp big endian frame buffer (SURFACE_CNTL swaps), sends images through
+  HOST_DATA with DP_DATATYPE HOST_BIG_ENDIAN_EN, and has a mono hardware cursor that it
+  writes through the swapping aperture.
+- The Elroys are Mercury LBAs (hv 0x783) at SBA + 0x20000 + rope * 0x2000, as on an
+  rp34x0. gvid looks for them there.
+- The firmware puts the small BARs right above the big ones. The kernel refuses gvid's
+  64 MB map of the register BAR if it overlaps the frame buffer or the I/O ports.
+- The PLL registers (CLOCK_CNTL_INDEX and DATA) work. The X server waits for
+  PPLL_REF_DIV.
+- USB is a NEC OHCI: 11.31 does not take the Apple one. Kernel modules: `hcd`, `hub`,
+  `hid`, `usbd`, `gvid`, `gvid_core` (kcmodule ...=static).
+- Install CDE-English from DVD 1: Ignite leaves it out.
+- A boot without a graphics card makes `/usr/dt/config/dtrc.d/20_graph_conf` comment out
+  the Local line in `/etc/dt/config/Xservers`. It does not put it back. Before the next
+  boot with the card: `cp /usr/dt/config/Xservers /etc/dt/config/Xservers`.
+
+### Graphics console on 11.31
+
+With the card ROM `hppa-sti-radeon.rom` and `opt/console=graphics`, the Radeon is the system
+console: the firmware text, the HP-UX boot and rc messages and the console login are on the
+screen, with the USB keyboard. CDE starts as before, and the console text comes back when X
+stops.
+The 11.31 kit (`machines/hppa/hpux11v3/run.sh`) starts this way; `CONSOLE=serial` gives the serial
+console and the plain `vgabios-ati.bin`.
+
+```
+  -device ati-vga,model=rv200,x-linear-aper-size=0x4000000,guest_hwcursor=true,romfile=hppa-sti-radeon.rom \
+  -fw_cfg opt/console,string=graphics -serial mon:stdio
+```
+
+- The ROM is QEMU's x86 VGA BIOS (`vgabios-ati.bin`), then an STI image for the card
+  (SeaBIOS-hppa `stirom.c`, `STI_RADEON`: 1280x1024, 8 bits). X POSTs the card with the x86
+  BIOS (`gvid_him_cons`). `make parisc-qemu-install` in `roms/seabios-hppa` builds it. The
+  64-bit firmware has the same STI image in it, for its own console.
+- gvid takes a card with an STI ROM only if bit 0x04 of `ext_bus_support` (byte 0x37 of the
+  STI header) is set. Else graph3 gets the card, and graph3 does not know the Radeon.
+- Without an STI ROM, gvid gives the console the kernel's own VGA STI image. Its CRC check
+  fails, and HP-UX panics ("CRC check of STI rom failed").
+- STI fonts: `next_font` is an offset from the first font. With an offset from the current
+  font, HP-UX panicked in `sti_get_fontdata`.
+- On a card with an STI ROM, gvid does not load a HIM for X (EACCES), unless the kernel
+  variable `gvid_him_override` is set. X then stops with "Failed to load gvid_him_cons". The
+  rc script [gvidhim](gvidhim) sets it before dtlogin starts. Install it as
+  `/sbin/init.d/gvidhim` (mode 555, owner bin:bin) and link it as `/sbin/rc3.d/S980gvidhim`.
+  It writes the running kernel only:
+  `echo 'gvid_him_override/W 1' | adb -w /stand/vmunix /dev/kmem`. On a card without an STI
+  ROM the variable has no effect.
+- After the boot loader starts, the firmware's own messages ("Unimplemented PDC_PAT_...") go
+  to the serial port only, so they do not write over the HP-UX console.
+
 ## Not working yet
 
-- HP-UX 11i v3 (B.11.31): "ccio/sba driver not found". It needs PAT firmware.
-- A400: PAT is not complete (`pat_init_cell` and others).
+- HP-UX 11.31: PDC_PAT_IO 13 and PDC_PAT_COMPLEX 0 and 13 are not there.
+- A400 without `pluto`: PAT is not complete (`pat_init_cell` and others).
 - With the graphics console, the firmware's boot menu reads only the serial port (no USB
   keyboard in the 64-bit firmware).
 - Crash dumps through IODC: ENTRY_IO on the Elroy returns BAD_OPTION.

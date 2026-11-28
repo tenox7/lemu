@@ -54,6 +54,11 @@ struct ESPState {
 
     ESPDMAMemoryReadWriteFunc dma_memory_read;
     ESPDMAMemoryReadWriteFunc dma_memory_write;
+    /*
+     * Optional: how many bytes dma_memory_read can give now. A DMA write
+     * to the drive waits while it is 0, until the DMA is enabled again.
+     */
+    uint32_t (*dma_read_avail)(void *opaque);
     void *dma_opaque;
     void (*dma_cb)(ESPState *s);
 

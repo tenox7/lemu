@@ -40,7 +40,8 @@ came from QEMU's "hppa-715-2" series (Helge Deller, Keith Monahan).
 
 - **NCR710.** A JUMP without a test is always true, ISTAT writes keep DSTAT and SSTAT0,
   and SIGP ends an idle WAIT RESELECT. Without this the vCPU spun for ever in the script
-  interpreter while the kernel found the disk.
+  interpreter while the kernel found the disk. QEMU's new SCRIPTS engine (f6e107f321)
+  does all three, so LEMU uses it. Snapshots saved before it do not load.
 - **i82596 LAN.** The PORT command is the low four bits, the address the rest; the chip
   interrupts when the command unit goes idle (HP-UX sends a frame as one EL command and
   waits for it); frames in flexible mode have their first bytes in the TCB; NSAI = 0

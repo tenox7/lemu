@@ -419,9 +419,6 @@ static void vmnet_helper_sent(NetClientState *nc, ssize_t len)
 static void vmnet_helper_read(void *opaque)
 {
     VmnetState *s = opaque;
-    uint8_t min_pkt[ETH_ZLEN];
-    size_t min_pktsz, size;
-    const uint8_t *pkt;
     ssize_t len;
     int i;
 
@@ -439,16 +436,8 @@ static void vmnet_helper_read(void *opaque)
         if (len == 0) {
             continue;
         }
-        pkt = s->helper_buf;
-        size = len;
-        if (net_peer_needs_padding(&s->nc)) {
-            min_pktsz = sizeof(min_pkt);
-            if (eth_pad_short_frame(min_pkt, &min_pktsz, pkt, size)) {
-                pkt = min_pkt;
-                size = min_pktsz;
-            }
-        }
-        if (qemu_send_packet_async(&s->nc, pkt, size,
+        /* qemu_send_packet_async() pads short frames */
+        if (qemu_send_packet_async(&s->nc, s->helper_buf, len,
                                    vmnet_helper_sent) == 0) {
             /* The guest is busy: wait for vmnet_helper_sent() */
             vmnet_helper_read_poll(s, false);
@@ -667,22 +656,11 @@ static void vmnet_write_packets_to_qemu(VmnetState *s)
 {
     uint8_t *pkt;
     size_t pktsz;
-    uint8_t min_pkt[ETH_ZLEN];
-    size_t min_pktsz;
     ssize_t size;
 
     while (s->packets_send_current_pos < s->packets_send_end_pos) {
         pkt = s->iov_buf[s->packets_send_current_pos].iov_base;
         pktsz = s->packets_buf[s->packets_send_current_pos].vm_pkt_size;
-
-        if (net_peer_needs_padding(&s->nc)) {
-            min_pktsz = sizeof(min_pkt);
-
-            if (eth_pad_short_frame(min_pkt, &min_pktsz, pkt, pktsz)) {
-                pkt = min_pkt;
-                pktsz = min_pktsz;
-            }
-        }
 
         size = qemu_send_packet_async(&s->nc, pkt, pktsz,
                                       vmnet_send_completed);

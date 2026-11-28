@@ -107,6 +107,7 @@ block_modules = {}
 
 modsrc = []
 foreach m : [
+  [aaruformat, 'aaruformat', files('aaruformat.c', 'aaruformat-lib.c')],
   [blkio, 'blkio', files('blkio.c')],
   [curl, 'curl', files('curl.c')],
   [libiscsi, 'iscsi', files('iscsi.c')],

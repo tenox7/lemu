@@ -2,6 +2,7 @@
  * QEMU Motorola 68k CPU
  *
  * Copyright (c) 2012 SUSE LINUX Products GmbH
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -19,6 +20,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/core/qdev-properties.h"
 #include "accel/tcg/cpu-ops.h"
 #include "fpu/softfloat.h"
 #include "qapi/error.h"
@@ -328,6 +330,8 @@ static void m68020_cpu_initfn(Object *obj)
     m68k_set_feature(env, M68K_FEATURE_UNALIGNED_DATA);
     m68k_set_feature(env, M68K_FEATURE_TRAPCC);
     m68k_set_feature(env, M68K_FEATURE_LINKL);
+    /* with a 68881 or 68882 */
+    m68k_set_feature(env, M68K_FEATURE_FPU_PACKED);
 }
 
 /*
@@ -371,6 +375,8 @@ static void m68040_cpu_initfn(Object *obj)
     m68030_cpu_initfn(obj);
     m68k_unset_feature(env, M68K_FEATURE_M68030);
     m68k_set_feature(env, M68K_FEATURE_M68040);
+    /* packed decimal traps to the FPSP, unless packed-decimal=on */
+    m68k_unset_feature(env, M68K_FEATURE_FPU_PACKED);
 }
 
 /*
@@ -449,6 +455,12 @@ static void m68k_cpu_realizefn(DeviceState *dev, Error **errp)
     M68kCPU *cpu = M68K_CPU(dev);
     M68kCPUClass *mcc = M68K_CPU_GET_CLASS(dev);
     Error *local_err = NULL;
+
+    if (cpu->packed_decimal == ON_OFF_AUTO_ON) {
+        m68k_set_feature(&cpu->env, M68K_FEATURE_FPU_PACKED);
+    } else if (cpu->packed_decimal == ON_OFF_AUTO_OFF) {
+        m68k_unset_feature(&cpu->env, M68K_FEATURE_FPU_PACKED);
+    }
 
     register_m68k_insns(&cpu->env);
 
@@ -615,6 +627,28 @@ const VMStateDescription vmstate_68040_mmu = {
     }
 };
 
+static bool cpu_68030_mmu_needed(void *opaque)
+{
+    M68kCPU *s = opaque;
+
+    return m68k_feature(&s->env, M68K_FEATURE_M68030);
+}
+
+static const VMStateDescription vmstate_68030_mmu = {
+    .name = "cpu/68030_mmu",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = cpu_68030_mmu_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(env.mmu030.tc, M68kCPU),
+        VMSTATE_UINT64(env.mmu030.crp, M68kCPU),
+        VMSTATE_UINT64(env.mmu030.srp, M68kCPU),
+        VMSTATE_UINT32_ARRAY(env.mmu030.tt, M68kCPU, 2),
+        VMSTATE_UINT16(env.mmu030.mmusr, M68kCPU),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static bool cpu_68040_spregs_needed(void *opaque)
 {
     M68kCPU *s = opaque;
@@ -661,6 +695,7 @@ static const VMStateDescription vmstate_m68k_cpu = {
         &vmmstate_fpu,
         &vmstate_cf_spregs,
         &vmstate_68040_mmu,
+        &vmstate_68030_mmu,
         &vmstate_68040_spregs,
         NULL
     },
@@ -716,6 +751,16 @@ static const TCGCPUOps m68k_tcg_ops = {
 #endif /* !CONFIG_USER_ONLY */
 };
 
+static const Property m68k_cpu_properties[] = {
+    /*
+     * on: FMOVE.P and F<op>.P are done by QEMU, as by a 68881 or 68882;
+     * off: they trap as an unimplemented data type, for the guest's FPSP,
+     * as on a 68040 or 68060; auto: as the CPU model does
+     */
+    DEFINE_PROP_ON_OFF_AUTO("packed-decimal", M68kCPU, packed_decimal,
+                            ON_OFF_AUTO_AUTO),
+};
+
 static void m68k_cpu_class_init(ObjectClass *c, const void *data)
 {
     M68kCPUClass *mcc = M68K_CPU_CLASS(c);
@@ -725,6 +770,7 @@ static void m68k_cpu_class_init(ObjectClass *c, const void *data)
 
     device_class_set_parent_realize(dc, m68k_cpu_realizefn,
                                     &mcc->parent_realize);
+    device_class_set_props(dc, m68k_cpu_properties);
     resettable_class_set_parent_phases(rc, NULL, m68k_cpu_reset_hold, NULL,
                                        &mcc->parent_phases);
 

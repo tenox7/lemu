@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2003 Fabrice Bellard
  * Copyright (c) 2006 Openedhand Ltd.
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -47,7 +48,7 @@ static void padstr8(uint8_t *buf, int buf_size, const char *src)
     }
 }
 
-static void lba_to_msf(uint8_t *buf, int lba)
+static void lba_to_msf(uint8_t *buf, int64_t lba)
 {
     lba += 150;
     buf[0] = (lba / 75) / 60;
@@ -71,7 +72,7 @@ static inline int media_is_cd(IDEState *s)
     return (media_present(s) && s->nb_sectors <= CD_MAX_SECTORS);
 }
 
-static void cd_data_to_raw(uint8_t *buf, int lba)
+static void cd_data_to_raw(uint8_t *buf, int64_t lba)
 {
     /* sync bytes */
     buf[0] = 0x00;
@@ -86,6 +87,66 @@ static void cd_data_to_raw(uint8_t *buf, int lba)
     buf += 2048;
     /* XXX: ECC not computed */
     memset(buf, 0, 288);
+}
+
+/*
+ * CD images with tracks: refresh s->cd_toc from the image. False (and no
+ * track list) when the image has none, like a plain ISO image.
+ */
+static bool cd_image_toc(IDEState *s)
+{
+    if (!s->cd_toc) {
+        s->cd_toc = g_new0(BlockCdToc, 1);
+    }
+    if (blk_get_cd_toc(s->blk, s->cd_toc) < 0 || s->cd_toc->n_tracks == 0) {
+        g_free(s->cd_toc);
+        s->cd_toc = NULL;
+        return false;
+    }
+    return true;
+}
+
+static const BlockCdTrack *cd_image_track(IDEState *s, int64_t lba)
+{
+    const BlockCdTrack *t = block_cd_toc_find(s->cd_toc, lba);
+
+    /* a sector in a gap takes the format of the next track */
+    for (int i = 0; !t && i < s->cd_toc->n_tracks; i++) {
+        if (s->cd_toc->tracks[i].start > lba) {
+            t = &s->cd_toc->tracks[i];
+        }
+    }
+    return t ? t : &s->cd_toc->tracks[s->cd_toc->n_tracks - 1];
+}
+
+/* Make room for @nsec raw sectors (and their subchannel) */
+static void cd_raw_reserve(IDEState *s, int nsec)
+{
+    if (nsec > s->cd_raw_buf_sectors) {
+        g_free(s->cd_raw_buf);
+        g_free(s->cd_raw_sub_buf);
+        s->cd_raw_buf = g_malloc(nsec * BLOCK_CD_RAW_SECTOR);
+        s->cd_raw_sub_buf = g_malloc0(nsec * BLOCK_CD_SUBCHANNEL);
+        s->cd_raw_buf_sectors = nsec;
+    }
+}
+
+/* The READ CD sectors from the raw ones read, into @out */
+static void cd_raw_format(IDEState *s, uint8_t *out, int nsec, int ret)
+{
+    bool have_sub = s->cd_raw_sub && ret != BLOCK_CD_NO_SUBCHANNEL;
+
+    for (int i = 0; i < nsec; i++) {
+        int64_t lba = s->lba + i;
+
+        cdrom_read_cd_format(out + i * s->cd_sector_size,
+                             s->cd_raw_buf + i * BLOCK_CD_RAW_SECTOR,
+                             have_sub ? s->cd_raw_sub_buf +
+                                        i * BLOCK_CD_SUBCHANNEL : NULL,
+                             s->cd_toc, cd_image_track(s, lba), lba,
+                             s->cd_raw_fields, s->cd_raw_sub);
+    }
+    s->cd_last_lba = s->lba + nsec - 1;
 }
 
 static void cd_read_sector_cb(void *opaque, int ret)
@@ -107,7 +168,9 @@ static void cd_read_sector_cb(void *opaque, int ret)
 
     block_acct_done(blk_get_stats(s->blk), &s->acct);
 
-    if (s->cd_sector_size == 2352) {
+    if (s->cd_raw) {
+        cd_raw_format(s, s->io_buffer, nsec, ret);
+    } else if (s->cd_sector_size == 2352) {
         /* unpack back-to-front so a sector never clobbers an unmoved one */
         for (i = nsec - 1; i >= 0; i--) {
             memmove(s->io_buffer + i * 2352 + 16, s->io_buffer + i * 2048,
@@ -146,13 +209,24 @@ static int cd_read_sector(IDEState *s)
     int skip = s->io_buffer_index;
     int nsec = DIV_ROUND_UP(skip + et, s->cd_sector_size);
 
-    if (s->cd_sector_size != 2048 && s->cd_sector_size != 2352) {
+    if (!s->cd_raw && s->cd_sector_size != 2048 && s->cd_sector_size != 2352) {
         block_acct_invalid(blk_get_stats(s->blk), BLOCK_ACCT_READ);
         return -EINVAL;
     }
 
     /* a burst is bounded by the byte count limit, so it fits io_buffer */
     assert(nsec * s->cd_sector_size <= s->io_buffer_total_len);
+
+    if (s->cd_raw) {
+        cd_raw_reserve(s, nsec);
+        block_acct_start(blk_get_stats(s->blk), &s->acct,
+                         nsec * BLOCK_CD_RAW_SECTOR, BLOCK_ACCT_READ);
+        ide_buffered_read_cd_raw(s, s->lba, nsec, s->cd_raw_buf,
+                                 s->cd_raw_sub ? s->cd_raw_sub_buf : NULL,
+                                 cd_read_sector_cb, s);
+        s->status |= BUSY_STAT;
+        return 0;
+    }
 
     /*
      * Read the payload packed at the front of io_buffer; the 2352 raw case is
@@ -309,10 +383,10 @@ static void ide_atapi_cmd_reply(IDEState *s, int size, int max_size)
 }
 
 /* start a CD-ROM read command */
-static void ide_atapi_cmd_read_pio(IDEState *s, int lba, int nb_sectors,
-                                   int sector_size)
+static void ide_atapi_cmd_read_pio(IDEState *s, uint32_t lba,
+                                   int nb_sectors, int sector_size)
 {
-    assert(0 <= lba && lba < (s->nb_sectors >> 2));
+    assert(lba < (s->nb_sectors >> 2));
 
     s->lba = lba;
     s->packet_transfer_size = nb_sectors * sector_size;
@@ -357,7 +431,10 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
          * the reply data.
          */
         if (s->lba != -1) {
-            if (s->cd_sector_size == 2352) {
+            if (s->cd_raw) {
+                n = 1;
+                cd_raw_format(s, s->io_buffer, 1, ret);
+            } else if (s->cd_sector_size == 2352) {
                 n = 1;
                 cd_data_to_raw(s->io_buffer, s->lba);
             } else {
@@ -378,7 +455,16 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
     }
 
     s->io_buffer_index = 0;
-    if (s->cd_sector_size == 2352) {
+    if (s->cd_raw) {
+        /* one sector at a time, formatted when it has been read */
+        s->io_buffer_size = s->cd_sector_size;
+        cd_raw_reserve(s, 1);
+        s->bus->dma->aiocb =
+            ide_buffered_read_cd_raw(s, s->lba, 1, s->cd_raw_buf,
+                                     s->cd_raw_sub ? s->cd_raw_sub_buf : NULL,
+                                     ide_atapi_cmd_read_dma_cb, s);
+        return;
+    } else if (s->cd_sector_size == 2352) {
         n = 1;
         s->io_buffer_size = s->cd_sector_size;
         data_offset = 16;
@@ -409,10 +495,10 @@ eot:
 
 /* start a CD-ROM read command with DMA */
 /* XXX: test if DMA is available */
-static void ide_atapi_cmd_read_dma(IDEState *s, int lba, int nb_sectors,
-                                   int sector_size)
+static void ide_atapi_cmd_read_dma(IDEState *s, uint32_t lba,
+                                   int nb_sectors, int sector_size)
 {
-    assert(0 <= lba && lba < (s->nb_sectors >> 2));
+    assert(lba < (s->nb_sectors >> 2));
 
     s->lba = lba;
     s->packet_transfer_size = nb_sectors * sector_size;
@@ -427,7 +513,7 @@ static void ide_atapi_cmd_read_dma(IDEState *s, int lba, int nb_sectors,
     ide_start_dma(s, ide_atapi_cmd_read_dma_cb);
 }
 
-static void ide_atapi_cmd_read(IDEState *s, int lba, int nb_sectors,
+static void ide_atapi_cmd_read(IDEState *s, uint32_t lba, int nb_sectors,
                                int sector_size)
 {
     trace_ide_atapi_cmd_read(s, s->atapi_dma ? "dma" : "pio",
@@ -983,12 +1069,69 @@ static void cmd_read(IDEState *s, uint8_t* buf)
     }
 
     lba = ldl_be_p(buf + 2);
-    if (lba >= total_sectors || lba + nb_sectors - 1 >= total_sectors) {
+    if (lba >= total_sectors || nb_sectors > total_sectors - lba) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
         return;
     }
 
     ide_atapi_cmd_read(s, lba, nb_sectors, 2048);
+}
+
+#define ASC_ILLEGAL_MODE_FOR_THIS_TRACK 0x64
+
+/* READ CD of a CD image with tracks: the fields asked for, from raw sectors */
+static void cmd_read_cd_image(IDEState *s, uint8_t *buf, unsigned int lba,
+                              unsigned int nb_sectors)
+{
+    const BlockCdTrack *first = cd_image_track(s, lba);
+    int expected = (buf[1] >> 2) & 7;
+    uint8_t fields = buf[9] & 0xfe;
+    uint8_t sub = buf[10] & 7;
+    int size;
+
+    size = cdrom_read_cd_sector_size(first, fields, sub);
+    if (size < 0) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+
+    /* every sector must be of the type asked for, and of the same size */
+    for (unsigned int i = 0; i < nb_sectors; i++) {
+        const BlockCdTrack *t = cd_image_track(s, lba + i);
+
+        if (!cdrom_read_cd_type_matches(t, expected) ||
+            cdrom_read_cd_sector_size(t, fields, sub) != size) {
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                                ASC_ILLEGAL_MODE_FOR_THIS_TRACK);
+            return;
+        }
+        /* the next sector after this track */
+        if (t->end > lba + i) {
+            i = MIN(nb_sectors - 1, t->end - lba);
+        }
+    }
+
+    if (size == 0) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+
+    if (!validate_bcl(s)) {
+        return;
+    }
+
+    /* plain user data of data sectors needs no raw read */
+    if (fields == 0x10 && sub == 0 &&
+        (first->mode == BLOCK_CD_TRACK_MODE1 ||
+         first->mode == BLOCK_CD_TRACK_MODE2_FORM1)) {
+        ide_atapi_cmd_read(s, lba, nb_sectors, 2048);
+        return;
+    }
+
+    s->cd_raw = true;
+    s->cd_raw_fields = fields;
+    s->cd_raw_sub = sub;
+    ide_atapi_cmd_read(s, lba, nb_sectors, size);
 }
 
 static void cmd_read_cd(IDEState *s, uint8_t* buf)
@@ -1005,8 +1148,13 @@ static void cmd_read_cd(IDEState *s, uint8_t* buf)
     }
 
     lba = ldl_be_p(buf + 2);
-    if (lba >= total_sectors || lba + nb_sectors - 1 >= total_sectors) {
+    if (lba >= total_sectors || nb_sectors > total_sectors - lba) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
+        return;
+    }
+
+    if (cd_image_toc(s)) {
+        cmd_read_cd_image(s, buf, lba, nb_sectors);
         return;
     }
 
@@ -1107,6 +1255,29 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
     msf = (buf[1] >> 1) & 1;
     start_track = buf[6];
 
+    if (cd_image_toc(s)) {
+        switch (format) {
+        case 0:
+            len = cdrom_read_toc_tracks(s->cd_toc, buf, msf, start_track);
+            break;
+        case 1:
+            len = cdrom_read_session_info(s->cd_toc, buf, msf);
+            break;
+        case 2:
+            len = cdrom_read_toc_raw_tracks(s->cd_toc, buf,
+                                            s->io_buffer_total_len);
+            break;
+        default:
+            len = -1;
+            break;
+        }
+        if (len < 0) {
+            goto error_cmd;
+        }
+        ide_atapi_cmd_reply(s, len, max_len);
+        return;
+    }
+
     switch(format) {
     case 0:
         len = cdrom_read_toc(total_sectors, buf, msf, start_track);
@@ -1133,6 +1304,62 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
                             ASC_INV_FIELD_IN_CMD_PACKET);
     }
+}
+
+/*
+ * READ SUB-CHANNEL of a CD image with tracks: the position of the last
+ * sector read. There is no audio playback, so audio status is "none".
+ */
+static void cmd_read_subchannel(IDEState *s, uint8_t *buf)
+{
+    int max_len = lduw_be_p(buf + 7);
+    bool msf = (buf[1] >> 1) & 1;
+    bool subq = buf[2] & 0x40;
+    int format = buf[3];
+    const BlockCdTrack *t;
+    int64_t lba;
+    int len = 4;
+
+    if (!cd_image_toc(s)) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_ILLEGAL_OPCODE);
+        return;
+    }
+
+    memset(buf, 0, 24);
+    buf[1] = 0x15; /* no audio status */
+
+    if (subq) {
+        switch (format) {
+        case 1: /* current position */
+            lba = s->cd_last_lba;
+            t = cd_image_track(s, lba);
+            buf[4] = 1;
+            buf[5] = 0x10 | (t->control & 0x0f);
+            buf[6] = t->number;
+            buf[7] = lba >= t->start ? 1 : 0;
+            if (msf) {
+                lba_to_msf(buf + 9, lba);
+                lba_to_msf(buf + 13, lba - t->start - 150);
+            } else {
+                stl_be_p(buf + 8, lba);
+                stl_be_p(buf + 12, lba - t->start);
+            }
+            len = 16;
+            break;
+        case 2: /* media catalogue number: none */
+        case 3: /* track ISRC: none */
+            buf[4] = format;
+            len = 24;
+            break;
+        default:
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
+                                ASC_INV_FIELD_IN_CMD_PACKET);
+            return;
+        }
+    }
+
+    stw_be_p(buf + 2, len - 4);
+    ide_atapi_cmd_reply(s, len, max_len);
 }
 
 static void cmd_read_cdvd_capacity(IDEState *s, uint8_t* buf)
@@ -1166,6 +1393,24 @@ static void cmd_read_disc_information(IDEState *s, uint8_t* buf)
     buf[6] = 1;   /* last track of last session */
     buf[7] = 0x20; /* unrestricted use */
     buf[8] = 0x00; /* CD-ROM or DVD-ROM */
+
+    if (cd_image_toc(s)) {
+        const BlockCdToc *toc = s->cd_toc;
+        const BlockCdTrack *last = &toc->tracks[toc->n_tracks - 1];
+        int first_last = last->number;
+
+        for (int i = 0; i < toc->n_tracks; i++) {
+            if (toc->tracks[i].session == toc->last_session) {
+                first_last = toc->tracks[i].number;
+                break;
+            }
+        }
+        buf[3] = toc->tracks[0].number;
+        buf[4] = toc->last_session - toc->first_session + 1;
+        buf[5] = first_last;
+        buf[6] = last->number;
+        buf[8] = toc->disc_type;
+    }
     /* 9-10-11: most significant byte corresponding bytes 4-5-6 */
     /* 12-23: not meaningful for CD-ROM or DVD-ROM */
     /* 24-31: disc bar code */
@@ -1277,6 +1522,7 @@ static const struct AtapiCmd {
     [ 0x25 ] = { cmd_read_cdvd_capacity,            CHECK_READY },
     [ 0x28 ] = { cmd_read, /* (10) */               CHECK_READY },
     [ 0x2b ] = { cmd_seek,                          CHECK_READY | NONDATA },
+    [ 0x42 ] = { cmd_read_subchannel,               CHECK_READY },
     [ 0x43 ] = { cmd_read_toc_pma_atip,             CHECK_READY },
     [ 0x46 ] = { cmd_get_configuration,             ALLOW_UA },
     [ 0x4a ] = { cmd_get_event_status_notification, ALLOW_UA },
@@ -1296,6 +1542,9 @@ void ide_atapi_cmd(IDEState *s)
     const struct AtapiCmd *cmd = &atapi_cmd_table[s->io_buffer[0]];
 
     trace_ide_atapi_cmd(s, s->io_buffer[0]);
+
+    /* only READ CD of a CD image with tracks reads raw sectors */
+    s->cd_raw = false;
 
     if (trace_event_get_state_backends(TRACE_IDE_ATAPI_CMD_PACKET)) {
         g_autoptr(GString) str =

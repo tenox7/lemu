@@ -1,0 +1,32 @@
+#!/sbin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# LEMU: let X start on a graphics card whose console uses STI.
+# HP-UX gvid refuses to load a HIM (gvid_him_cons) for X on a card that
+# has an STI ROM, unless the kernel variable gvid_him_override is set.
+# LEMU's Radeon 7500 has an STI ROM for the graphics console.
+# The variable has no effect on cards without an STI ROM.
+#
+PATH=/usr/sbin:/usr/bin:/sbin
+export PATH
+
+case "$1" in
+start_msg)
+	echo "Allow X on the STI graphics console"
+	;;
+start)
+	echo 'gvid_him_override/W 1' | adb -w /stand/vmunix /dev/kmem >/dev/null 2>&1
+	exit $?
+	;;
+stop_msg)
+	echo "Allow X on the STI graphics console"
+	;;
+stop)
+	exit 0
+	;;
+*)
+	echo "usage: $0 {start|stop|start_msg|stop_msg}"
+	exit 1
+	;;
+esac
+exit 0
