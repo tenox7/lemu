@@ -1861,6 +1861,11 @@ if test "$skip_meson" = no; then
   echo "widl = [$(meson_quote $widl)]" >> $cross
   echo "windres = [$(meson_quote $windres)]" >> $cross
   echo "windmc = [$(meson_quote $windmc)]" >> $cross
+  # in a cross build meson uses CMake (the libaaruformat subproject) only
+  # if the cross file names it
+  if test "$cross_compile" = "yes" && has "${CMAKE-cmake}"; then
+    echo "cmake = [$(meson_quote ${CMAKE-cmake})]" >> $cross
+  fi
   if test "$cross_compile" = "yes"; then
     echo "[host_machine]" >> $cross
     echo "system = '$host_os'" >> $cross
