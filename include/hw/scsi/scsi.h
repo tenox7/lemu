@@ -279,9 +279,10 @@ bool scsi_generic_pr_state_cleanup(SCSIDevice *s, Error **errp);
 #define SCSI_DISK_QUIRK_MODE_PAGE_VENDOR_SPECIFIC_APPLE    2
 #define SCSI_DISK_QUIRK_MODE_PAGE_TRUNCATED                3
 #define SCSI_DISK_QUIRK_MODE_PAGE_SET_BLOCK_SIZE           4
-#define SCSI_DISK_QUIRK_MODE_SELECT_IGNORE                 5
-#define SCSI_DISK_QUIRK_MODE_PAGE_FORMAT_DEVICE            6
-#define SCSI_DISK_QUIRK_MODE_PAGE_RW_ERROR_VMS             7
-#define SCSI_DISK_QUIRK_MODE_SENSE_ROM_WP                  8
+#define SCSI_DISK_QUIRK_MODE_PAGE_NO_FLEXIBLE_DISK         5
+#define SCSI_DISK_QUIRK_MODE_SELECT_IGNORE                 6
+#define SCSI_DISK_QUIRK_MODE_PAGE_FORMAT_DEVICE            7
+#define SCSI_DISK_QUIRK_MODE_PAGE_RW_ERROR_VMS             8
+#define SCSI_DISK_QUIRK_MODE_SENSE_ROM_WP                  9
 
 #endif

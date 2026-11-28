@@ -54,6 +54,8 @@ struct HppaMachineState {
 
 #define MIN_SEABIOS_HPPA_VERSION 26 /* require at least this fw version */
 
+#define HPA_POWER_BUTTON        (FIRMWARE_END - 0x10)
+
 /*
  * SeaBIOS-hppa 25 and older want the CPUs at 0xfffb0000 and the fw_cfg port
  * at 0xfffa0000, as in QEMU 11.1.  Version 26 and later take both addresses
@@ -138,7 +140,6 @@ static time_t rtc_ref;
 
 static uint64_t io_cpu_read(void *opaque, hwaddr addr, unsigned size)
 {
-    HPPACPU *cpu = opaque;
     uint64_t val = 0;
 
     switch (addr) {
@@ -148,8 +149,6 @@ static uint64_t io_cpu_read(void *opaque, hwaddr addr, unsigned size)
         break;
     case 8:             /* DebugOutputPort */
         return 0xe9;    /* readback */
-    case 16:            /* Power switch button */
-        return cpu->env.power_btn;
     }
     return val;
 }
@@ -157,7 +156,6 @@ static uint64_t io_cpu_read(void *opaque, hwaddr addr, unsigned size)
 static void io_cpu_write(void *opaque, hwaddr addr,
                          uint64_t val, unsigned size)
 {
-    HPPACPU *cpu = opaque;
     unsigned char ch;
     Chardev *debugout;
 
@@ -173,9 +171,6 @@ static void io_cpu_write(void *opaque, hwaddr addr,
         } else {
             fprintf(stderr, "%c", ch);
         }
-        break;
-    case 16:
-        cpu->env.power_btn = val;
         break;
     }
 }
@@ -349,6 +344,8 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine,
         ram_max = FIRMWARE_START;  /* 3.75 GB (32-bit CPU) */
     }
 
+    soft_power_reg = translate(NULL, HPA_POWER_BUTTON);
+
     for (unsigned int i = 0; i < smp_cpus; i++) {
         g_autofree char *name = g_strdup_printf("cpu%u-io-eir", i);
         g_autofree char *cflush_name = NULL;
@@ -383,11 +380,10 @@ static TranslateFn *machine_HP_common_init_cpus(MachineState *machine,
     /* RTC and DebugOutputPort on CPU #0 */
     cpu_region = g_new(MemoryRegion, 1);
     memory_region_init_io(cpu_region, OBJECT(cpu[0]), &hppa_io_helper_ops,
-                          cpu[0], "cpu0-io-rtc", 3 * sizeof(uint64_t));
+                          cpu[0], "cpu0-io-rtc", 2 * sizeof(uint64_t));
     memory_region_add_subregion(addr_space,
                                 translate(NULL, cpu[0]->env.cpu_hpa + 16),
                                 cpu_region);
-    soft_power_reg = translate(NULL, cpu[0]->env.cpu_hpa + 16 + 16);
 
     /* Main memory region. */
     if (machine->ram_size > ram_max) {
@@ -670,7 +666,8 @@ static void machine_HP_715_init(MachineState *machine)
     ISABus *isa_bus;
 
     /* Create CPUs and RAM.  */
-    translate = machine_HP_common_init_cpus(machine, 0xfffbe000);
+    translate = machine_HP_common_init_cpus(machine,
+                    machine->smp.cpus <= 2 ? 0xfffbe000 : 0xfffa0000);
 
     if (hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP 715/64 workstation requires a 32-bit "
@@ -757,7 +754,7 @@ static void machine_HP_B160L_init(MachineState *machine)
     PCIBus *pci_bus;
 
     /* Create CPUs and RAM.  */
-    translate = machine_HP_common_init_cpus(machine, 0xfff10000);
+    translate = machine_HP_common_init_cpus(machine, 0xfffa0000);
 
     if (hppa_is_pa20(&cpu[0]->env)) {
         error_report("The HP B160L workstation requires a 32-bit "
@@ -954,6 +951,7 @@ static void hppa_machine_reset(MachineState *ms, ResetType type)
         static const struct { uint32_t start, last; } io_btlb[] = {
             { 0xf0100000, 0xf01fffff },     /* LASI */
             { 0xfff80000, 0xffffffff },     /* central bus */
+            { 0xf00ff000, 0xf00fffff },     /* soft power button register */
         };
         CPUHPPAState *env = &cpu[0]->env;
 
@@ -1140,6 +1138,14 @@ static void HP_A400_machine_init_class_init(ObjectClass *oc, const void *data)
         "Show the Astro as a Pluto (zx1) SBA, as HP-UX 11.31 wants");
 }
 
+/*
+ * HP-UX 9 ioscan sends MODE SENSE page 5 to the open root disk and leaves
+ * the disk out of its listing if the page is returned.
+ */
+static GlobalProperty hp_715_scsi_quirks[] = {
+    { "scsi-hd", "quirk_mode_page_no_flexible_disk", "on" },
+};
+
 static void HP_715_machine_init_class_init(ObjectClass *oc, const void *data)
 {
     static const char * const valid_cpu_types[] = {
@@ -1161,6 +1167,8 @@ static void HP_715_machine_init_class_init(ObjectClass *oc, const void *data)
     mc->max_cpus = MIN_CONST(HPPA_MAX_CPUS, 8);
     mc->default_ram_size = 256 * MiB;
     mc->default_nic = TYPE_LASI_82596;
+    compat_props_add(mc->compat_props, hp_715_scsi_quirks,
+                     G_N_ELEMENTS(hp_715_scsi_quirks));
 }
 
 

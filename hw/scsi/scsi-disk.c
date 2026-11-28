@@ -1230,6 +1230,15 @@ static int mode_sense_page(SCSIDiskState *s, int page, uint8_t **p_outbuf,
     }
 
     /*
+     * The flexible disk page is only implemented by floppy drives.  Some
+     * guests (HP-UX 9 ioscan) take a disk that returns it for a floppy.
+     */
+    if (page == MODE_PAGE_FLEXIBLE_DISK_GEOMETRY &&
+        (s->quirks & (1 << SCSI_DISK_QUIRK_MODE_PAGE_NO_FLEXIBLE_DISK))) {
+        return -1;
+    }
+
+    /*
      * If Changeable Values are requested, a mask denoting those mode parameters
      * that are changeable shall be returned. As we currently don't support
      * parameter changes via MODE_SELECT all bits are returned set to zero.
@@ -3688,6 +3697,8 @@ static const Property scsi_hd_properties[] = {
                     SCSI_DISK_QUIRK_MODE_PAGE_FORMAT_DEVICE, 0),
     DEFINE_PROP_BIT("quirk_mode_page_rw_error_vms", SCSIDiskState, quirks,
                     SCSI_DISK_QUIRK_MODE_PAGE_RW_ERROR_VMS, 0),
+    DEFINE_PROP_BIT("quirk_mode_page_no_flexible_disk", SCSIDiskState,
+                    quirks, SCSI_DISK_QUIRK_MODE_PAGE_NO_FLEXIBLE_DISK, 0),
     DEFINE_BLOCK_CHS_PROPERTIES(SCSIDiskState, qdev.conf),
 };
 
@@ -3773,6 +3784,7 @@ static const TypeInfo scsi_hd_info = {
     .name          = "scsi-hd",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_hd_class_initfn,
+    .secure        = true,
 };
 
 static const Property scsi_cd_properties[] = {
@@ -3801,6 +3813,8 @@ static const Property scsi_cd_properties[] = {
                     SCSI_DISK_QUIRK_MODE_PAGE_RW_ERROR_VMS, 0),
     DEFINE_PROP_BIT("quirk_mode_sense_rom_wp", SCSIDiskState, quirks,
                     SCSI_DISK_QUIRK_MODE_SENSE_ROM_WP, 0),
+    DEFINE_PROP_BIT("quirk_mode_page_no_flexible_disk", SCSIDiskState,
+                    quirks, SCSI_DISK_QUIRK_MODE_PAGE_NO_FLEXIBLE_DISK, 0),
 };
 
 static void scsi_cd_class_initfn(ObjectClass *klass, const void *data)
@@ -3822,6 +3836,7 @@ static const TypeInfo scsi_cd_info = {
     .name          = "scsi-cd",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_cd_class_initfn,
+    .secure        = true,
 };
 
 #ifdef __linux__
@@ -3864,6 +3879,7 @@ static const TypeInfo scsi_block_info = {
     .name          = "scsi-block",
     .parent        = TYPE_SCSI_DISK_BASE,
     .class_init    = scsi_block_class_initfn,
+    .secure        = true,
 };
 #endif
 

@@ -99,9 +99,9 @@ A disk installed without the card needs three changes. Make them once, with the 
   buffer, as on the B160L. The expansion ROM holds the STI ROM. The ROM also shows at the
   start of BAR 0: the STI region list puts region 0 (the ROM) there, and HP-UX finds the
   card's display by that address.
-- **Power button in snapshots** (`target/hppa/machine.c`). The firmware's soft power word
-  (`env.power_btn`) was not saved. loadvm resets the machine first, and 0 there means
-  "button pressed", so HP-UX powered off after each loadvm.
+- **Power button in snapshots.** The firmware's soft power word was not saved while it
+  was in the CPU I/O region, so HP-UX powered off after each loadvm. QEMU moved it back
+  into firmware memory (9eb788b8ce), which snapshots keep, so LEMU's fix went away.
 - Debug aid: the trace event `hppa_tlb_ar_fault` shows access-rights faults.
 
 ## Firmware
