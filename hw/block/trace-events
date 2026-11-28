@@ -105,12 +105,16 @@ m25p80_binding(void *s) "[%p] Binding to IF_MTD drive"
 m25p80_binding_no_bdrv(void *s) "[%p] No BDRV - binding to RAM"
 
 # swim.c
-swim_ismctrl_read(int reg, const char *name, unsigned size, uint64_t value) "reg=%d [%s] size=%u value=0x%"PRIx64
-swim_ismctrl_write(int reg, const char *name, unsigned size, uint64_t value) "reg=%d [%s] size=%u value=0x%"PRIx64
-swim_iwmctrl_read(int reg, const char *name, unsigned size, uint64_t value) "reg=%d [%s] size=%u value=0x%"PRIx64
-swim_iwmctrl_write(int reg, const char *name, unsigned size, uint64_t value) "reg=%d [%s] size=%u value=0x%"PRIx64
-swim_switch_to_ism(void) "switch from IWM to ISM mode"
-swim_switch_to_iwm(void) "switch from ISM to IWM mode"
+swim_read(const char *name, uint8_t value) "%s -> 0x%02x"
+swim_write(const char *name, uint8_t value) "%s <- 0x%02x"
+swim_drive_cmd(int unit, int reg, const char *name) "drive %d command 0x%x %s"
+swim_step(int unit, int cyl) "drive %d cylinder %d"
+swim_media(int unit, const char *layout, int64_t size) "drive %d media %s, %" PRId64 " bytes"
+swim_layout(int unit, const char *from, const char *to) "drive %d reformatted from %s to %s"
+swim_track_load(int unit, int cyl, int head, const char *layout, int len) "drive %d track %d/%d of %s, %d bytes"
+swim_track_flush(int unit, int cyl, int head, int sectors, const char *layout) "drive %d track %d/%d: %d sectors stored, %s"
+swim_rw(const char *what, int unit, int cyl, int head, uint32_t pos) "%s drive %d track %d/%d at %u"
+swim_eject(int unit) "drive %d ejects"
 
 # next-mo.c
 next_mo_reg_read(unsigned reg, uint8_t val) "reg 0x%02x -> 0x%02x"

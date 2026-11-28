@@ -516,6 +516,28 @@ static void q800_machine_init(MachineState *machine)
     sysbus_realize(sysbus, &error_fatal);
     memory_region_add_subregion(&m->macio, SWIM_BASE - IO_BASE,
                                 sysbus_mmio_get_region(sysbus, 0));
+    qdev_connect_gpio_out_named(DEVICE(&m->via1), "headsel", 0,
+                                qdev_get_gpio_in_named(DEVICE(&m->swim),
+                                                       "headsel", 0));
+
+    /*
+     * The internal SuperDrive is always there, empty or not; a second,
+     * external one only when -drive if=floppy,index=1 asks for it.
+     * -device swim-drive adds drives the same way.
+     */
+    for (i = 0; i < SWIM_MAX_FD; i++) {
+        dinfo = drive_get(IF_FLOPPY, 0, i);
+        if (!dinfo && i > 0) {
+            continue;
+        }
+        dev = qdev_new(TYPE_SWIM_DRIVE);
+        qdev_prop_set_int32(dev, "unit", i);
+        if (dinfo) {
+            qdev_prop_set_drive_err(dev, "drive", blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+        }
+        qdev_realize_and_unref(dev, BUS(&m->swim.ctrl.bus), &error_fatal);
+    }
 
     /* NuBus */
 

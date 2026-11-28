@@ -177,6 +177,7 @@ qtests_loongarch64 = qtests_filter + \
 
 qtests_m68k = ['boot-serial-test'] + \
   (config_all_devices.has_key('CONFIG_NEXTCUBE') ? ['next-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_Q800') ? ['q800-swim-test'] : []) + \
   qtests_filter
 
 qtests_microblaze = ['boot-serial-test'] + \

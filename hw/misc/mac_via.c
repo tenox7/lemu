@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2011-2018 Laurent Vivier
  * Copyright (c) 2018 Mark Cave-Ayland
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Some parts from hw/misc/macio/cuda.c
  *
@@ -861,6 +862,18 @@ static void via1_adb_update(MOS6522Q800VIA1State *v1s)
     }
 }
 
+/* PA5 is the SEL line of the floppy drives, through the SWIM */
+static void via1_headsel_update(MOS6522Q800VIA1State *v1s)
+{
+    MOS6522State *s = MOS6522(v1s);
+    int level = ((s->a & s->dira) | ~s->dira) & VIA1A_vHeadSel ? 1 : 0;
+
+    if (level != v1s->last_headsel) {
+        v1s->last_headsel = level;
+        qemu_set_irq(v1s->headsel_irq, level);
+    }
+}
+
 static void via1_auxmode_update(MOS6522Q800VIA1State *v1s)
 {
     MOS6522State *s = MOS6522(v1s);
@@ -1080,6 +1093,12 @@ static void mos6522_q800_via1_write(void *opaque, hwaddr addr, uint64_t val,
     mos6522_write(ms, addr, val, size);
 
     switch (addr) {
+    case VIA_REG_A:
+    case VIA_REG_ANH:
+    case VIA_REG_DIRA:
+        via1_headsel_update(v1s);
+        break;
+
     case VIA_REG_B:
         via1_rtc_update(v1s);
         via1_adb_update(v1s);
@@ -1283,6 +1302,10 @@ static void mos6522_q800_via1_init(Object *obj)
 
     /* A/UX mode */
     qdev_init_gpio_out(DEVICE(obj), &v1s->auxmode_irq, 1);
+
+    /* Floppy head select */
+    qdev_init_gpio_out_named(DEVICE(obj), &v1s->headsel_irq, "headsel", 1);
+    v1s->last_headsel = -1;
 }
 
 static const VMStateDescription vmstate_q800_via1 = {

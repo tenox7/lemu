@@ -1,6 +1,7 @@
 /*
  *
  * Copyright (c) 2011-2018 Laurent Vivier
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -43,6 +44,10 @@ struct MOS6522Q800VIA1State {
 
     qemu_irq auxmode_irq;
     uint8_t last_b;
+
+    /* Floppy head select (PA5) */
+    qemu_irq headsel_irq;
+    int last_headsel;
 
     /* RTC */
     uint8_t PRAM[256];

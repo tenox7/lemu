@@ -115,3 +115,68 @@ Software for Macintosh" 1.81 mounts, reads, writes and formats its discs:
   `change md0 disc.img raw`. A reset puts the last disc back.
 - **A read-only image** is a write-protected disc.
 - **Trace:** `-trace "scsi_md_*"` logs every command and its sense.
+
+## Floppy drive
+
+The q800 has its SWIM2 and an internal Apple SuperDrive (Sony MFD-75W).
+The drive is always there; it starts empty unless a disk is given:
+
+    -drive if=floppy,format=raw,file=disk.img
+
+`index=1` adds a second, external SuperDrive. Change disks with the
+`media` tool or the monitor (`change floppy0 disk.img raw`). Eject from
+the guest first (Put Away, or `eject /dev/rfloppy0` in A/UX): a Mac
+only looks for a new disk once its driver has ejected the old one.
+
+- **The images are raw.** Their size tells the drive what is on them:
+
+  | Size | Media | Layout |
+  |---|---|---|
+  | 409600 | MF1DD | Mac 400K, GCR, one side |
+  | 819200 | MF2DD | Mac 800K, GCR |
+  | 368640 | MF1DD | DOS 360K, MFM, one side, 80 tracks |
+  | 737280 | MF2DD | DOS 720K, MFM |
+  | 1474560 | MF2HD | Mac 1.4 MB or DOS 1.44 MB, MFM |
+
+  Any other size is an unformatted disk: DD up to 819200 bytes, HD
+  above. A blank disk is a file of zeros of one of these sizes, which
+  the Mac offers to initialize.
+- **Formatting resizes the image.** Erasing an 800K disk as DOS 720K
+  makes the file 737280 bytes; a One-Sided format makes it 409600. The
+  SuperDrive, like the real one, does no GCR on HD media.
+- **A read-only image** is a locked disk.
+- **The GCR tag bytes** of 400K and 800K sectors are not kept; they read
+  back as zeros.
+- **Speed** is that of the real drive: data moves at the disk's bit rate.
+- **Trace:** `-trace "swim_*"` logs register access, drive commands,
+  tracks and layout changes.
+
+### Tested
+
+Copies of the VMs of 2026-11-28, with images made on the host by
+hfsutils and mtools. "Copy" is a Finder duplicate of a 300 KB file on
+the disk, checked by MD5 on the host afterwards.
+
+| Guest | 1.44M HFS | 800K HFS | 400K HFS | 720K DOS | 1.44M DOS | Format |
+|---|---|---|---|---|---|---|
+| System 7.1 | | | read, copy | | | 400K→800K erase |
+| System 7.1.1 Pro | read, copy | read, copy | | read, copy | | |
+| System 7.5 | read, copy | read, copy | | read, copy | | |
+| System 7.5.1 | read, copy | read, copy | | read, copy | | |
+| System 7.5.3 | read, copy | read, copy | | read, copy | | |
+| System 7.5.5 | read, copy, locked | read, copy | | read, copy | read, copy | 1.4 MB, 800K, DOS 720K, DOS 1.44 MB |
+| Mac OS 7.6 | read, copy | read, copy | | read, copy | | |
+| Mac OS 7.6.1 | read, copy | read, copy | | read, copy | | |
+| Mac OS 8.0 | read, copy | read, copy | | read, copy | | |
+| Mac OS 8.1 | read, copy | read, copy | | read, copy | | |
+| A/UX 3.0.1 | read, copy | read, copy | | | | |
+| A/UX 3.1 | read, copy | read, copy | | raw `dd`, `tar` | raw `dd` | One-Sided (400K, MFS) |
+| A/UX 3.1.1 | read, copy | read, copy | | | | |
+
+- Swapping disks when the Finder asks for another one works.
+- Mac OS can't read a single-sided DOS disk: its driver treats every
+  MFM DD disk as two-sided, as on a real Mac. The Finders of System 7.1
+  to 8.1 with PC Exchange offer no 400K format for a SuperDrive; the
+  A/UX Finder does (One-Sided).
+- At start-up the ROM looks at a floppy in the drive and ejects it when
+  it does not boot from it. Booting from a floppy is not tested yet.
