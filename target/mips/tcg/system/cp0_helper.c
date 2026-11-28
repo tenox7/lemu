@@ -1183,7 +1183,7 @@ void HELPER(mtc0_status)(CPUMIPSState *env, target_ulong arg1)
      * KSEG0 translations that make the copied ARC code read as zeros.
      */
     if (env->cpu_model->mmu_type == MMU_TYPE_R3000 &&
-        (old & (1 << 16)) && !(val & (1 << 16))) {
+        ((old ^ val) & (1 << 16))) {
         CPUState *cs = env_cpu(env);
 
         tlb_flush(cs);
