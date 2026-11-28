@@ -13,6 +13,8 @@
  *  2009-Oct-13 Artyom Tarasenko : implemented the block descriptor in the
  *                                 MODE SENSE response.
  *
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+ *
  * This code is licensed under the LGPL.
  *
  * Note that this file only handles the SCSI architecture model and device
@@ -114,6 +116,10 @@ struct SCSIDiskState {
     char *device_id;
     char *aix_vscsi_id;
     char *loadparm;     /* only for s390x */
+    /* CD tracks: "0:3402:160186" lists the 2048-byte block of each start */
+    char *tracks;
+    uint32_t *track_starts;
+    int ntracks;
     bool tray_open;
     bool tray_locked;
     /*
@@ -1581,6 +1587,12 @@ static int scsi_disk_emulate_read_toc(SCSIRequest *req, uint8_t *outbuf)
     nb_sectors /= s->qdev.blocksize / BDRV_SECTOR_SIZE;
     switch (format) {
     case 0:
+        if (s->ntracks) {
+            toclen = cdrom_read_toc_starts(nb_sectors, outbuf, msf,
+                                           start_track, s->track_starts,
+                                           s->ntracks);
+            break;
+        }
         toclen = cdrom_read_toc(nb_sectors, outbuf, msf, start_track);
         break;
     case 1:
@@ -1592,6 +1604,12 @@ static int scsi_disk_emulate_read_toc(SCSIRequest *req, uint8_t *outbuf)
         outbuf[3] = 0x01;
         break;
     case 2:
+        if (s->ntracks) {
+            toclen = cdrom_read_toc_raw_starts(nb_sectors, outbuf, msf,
+                                               start_track, s->track_starts,
+                                               s->ntracks);
+            break;
+        }
         toclen = cdrom_read_toc_raw(nb_sectors, outbuf, msf, start_track);
         break;
     default:
@@ -2813,6 +2831,10 @@ static void scsi_cd_realize(SCSIDevice *dev, Error **errp)
     s->qdev.blocksize = blocksize;
     s->qdev.type = TYPE_ROM;
     s->features |= 1 << SCSI_DISK_F_REMOVABLE;
+    if (s->tracks && !cdrom_parse_tracks(s->tracks, &s->track_starts,
+                                         &s->ntracks, errp)) {
+        return;
+    }
     if (!s->product) {
         s->product = g_strdup("QEMU CD-ROM");
     }
@@ -3777,6 +3799,7 @@ static const TypeInfo scsi_hd_info = {
 
 static const Property scsi_cd_properties[] = {
     DEFINE_SCSI_DISK_PROPERTIES(),
+    DEFINE_PROP_STRING("tracks", SCSIDiskState, tracks),
     DEFINE_PROP_UINT64("wwn", SCSIDiskState, qdev.wwn, 0),
     DEFINE_PROP_UINT64("port_wwn", SCSIDiskState, qdev.port_wwn, 0),
     DEFINE_PROP_UINT16("port_index", SCSIDiskState, port_index, 0),

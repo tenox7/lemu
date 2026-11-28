@@ -6,6 +6,7 @@
 #include "qom/object.h"
 
 #define TYPE_TULIP "tulip"
+#define TYPE_TULIP_21041 "tulip-21041"
 OBJECT_DECLARE_SIMPLE_TYPE(TULIPState, TULIP)
 
 #define CSR(_x) ((_x) << 3)

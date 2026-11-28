@@ -2,6 +2,7 @@
  *  PowerPC MMU, TLB, SLB and BAT emulation helpers for QEMU.
  *
  *  Copyright (c) 2003-2007 Jocelyn Mayer
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -37,6 +38,7 @@
 #include "mmu-booke.h"
 #include "exec/helper-proto.h"
 #include "accel/tcg/cpu-ldst.h"
+#include "system/tcg.h"
 
 /* #define FLUSH_ALL_TLBS */
 
@@ -101,6 +103,14 @@ static void ppc6xx_tlb_store(CPUPPCState *env, target_ulong EPN, int way,
                   EPN, pte0, pte1);
     /* Invalidate any pending reference in QEMU for this virtual address */
     ppc6xx_tlb_invalidate_virt2(env, EPN, is_code, 1);
+    /*
+     * The entry this one replaces is gone from the CPU: drop QEMU's copy of
+     * its translation too, or a later tlbie of that page, finding nothing
+     * here, would leave it in place after the OS remaps the page.
+     */
+    if (pte_is_valid(tlb->pte0) && tlb->EPN != EPN) {
+        tlb_flush_page(env_cpu(env), tlb->EPN);
+    }
     tlb->pte0 = pte0;
     tlb->pte1 = pte1;
     tlb->EPN = EPN;
@@ -319,6 +329,15 @@ void ppc_tlb_invalidate_all(CPUPPCState *env)
     }
 }
 
+/* tlbie from another 603, run in this CPU's own thread */
+static void ppc6xx_tlb_invalidate_page_work(CPUState *cs, run_on_cpu_data data)
+{
+    CPUPPCState *env = cpu_env(cs);
+
+    ppc6xx_tlb_invalidate_virt(env, data.target_ptr, 0);
+    ppc6xx_tlb_invalidate_virt(env, data.target_ptr, 1);
+}
+
 void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
 {
 #if !defined(FLUSH_ALL_TLBS)
@@ -335,10 +354,32 @@ void ppc_tlb_invalidate_one(CPUPPCState *env, target_ulong addr)
     } else
 #endif /* defined(TARGET_PPC64) */
     switch (env->mmu_model) {
-    case POWERPC_MMU_SOFT_6xx:
-        ppc6xx_tlb_invalidate_virt(env, addr, 0);
-        ppc6xx_tlb_invalidate_virt(env, addr, 1);
+    case POWERPC_MMU_SOFT_6xx: {
+        CPUState *cs;
+
+        /*
+         * tlbie goes out on the 60x bus, and the other 603s on it drop the
+         * page too (TLBISYNC then tells when they have). With one thread
+         * for all CPUs the others are stopped and their TLBs can be changed
+         * here; with a thread per CPU (MTTCG) each must change its own, so
+         * it gets the work to do before its next instruction.
+         */
+        CPU_FOREACH(cs) {
+            CPUPPCState *other = cpu_env(cs);
+
+            if (other->mmu_model != POWERPC_MMU_SOFT_6xx) {
+                continue;
+            }
+            if (other == env || !qemu_tcg_mttcg_enabled()) {
+                ppc6xx_tlb_invalidate_virt(other, addr, 0);
+                ppc6xx_tlb_invalidate_virt(other, addr, 1);
+            } else {
+                async_run_on_cpu(cs, ppc6xx_tlb_invalidate_page_work,
+                                 RUN_ON_CPU_TARGET_PTR(addr));
+            }
+        }
         break;
+    }
     case POWERPC_MMU_32B:
         /*
          * Actual CPUs invalidate entire congruence classes based on

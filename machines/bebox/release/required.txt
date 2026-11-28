@@ -1,0 +1,24 @@
+# Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+# What qemu-system-ppc must have for the BeBox kits. check.sh fails if one
+# is missing. WHERE is all or a platform (macos, linux).
+#
+# WHERE   KIND     NAME                 # why
+all       version  git-id               # --version names the commit
+all       monitor  hmp                  # run.sh uses -monitor stdio
+all       accel    tcg                  # the only accelerator for the BeBox
+all       netdev   user                 # run.sh uses -netdev user
+all       chardev  vc                   # the kernel debugger's serial port
+macos     audio    coreaudio            # sound on the Mac
+linux     audio    pa                   # the default sound on Linux
+linux     audio    alsa                 # sound on Linux hosts without PulseAudio
+all       format   qcow2                # beos.qcow2
+all       format   raw                  # flash.bin
+all       machine  bebox                # every kit
+all       device   ide-hd               # r3, r45, r5
+all       device   ide-cd               # r3, r45, r5
+all       device   scsi-hd              # 1.1d7, 1.1d7.1, dr8, pr, pr2, r4
+all       device   scsi-cd              # 1.1d7, 1.1d7.1, dr8, pr, pr2, r4
+all       device   tulip-21041          # dr8, pr, pr2, r3, r45, r5
+all       device   ne2k_pci             # r4
+all       device   ne2k_isa             # 1.1d7, 1.1d7.1

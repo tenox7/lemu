@@ -2,6 +2,7 @@
  * QEMU 8259 - internal interfaces
  *
  * Copyright (c) 2011 Jan Kiszka, Siemens AG
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -64,6 +65,8 @@ struct I8259CommonState {
     /* Software-model configuration; not guest registers or migrated state. */
     bool edge_irq_withdrawal;
     bool ltim_supported;
+    /* a slave's INT drops during the acknowledge, then rises again */
+    bool slave_int_drop;
     qemu_irq int_out[1];
     uint32_t master; /* reflects /SP input pin */
     uint32_t iobase;

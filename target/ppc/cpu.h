@@ -2,6 +2,7 @@
  *  PowerPC emulation cpu definitions for qemu.
  *
  *  Copyright (c) 2003-2007 Jocelyn Mayer
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -1440,6 +1441,8 @@ struct CPUArchState {
     bool os_idle;
     int64_t os_idle_since;  /* when the idle loop was entered */
     int64_t os_idle_last;   /* when the idle loop last asked to halt */
+    /* A "b ." gives the host thread to the other CPUs, see trans_B() */
+    bool idle_yield;
 
     /*
      * On powernv, quiesced means the CPU has been stopped using PC direct

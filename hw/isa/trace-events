@@ -6,6 +6,10 @@ superio_create_serial(int id, uint16_t base, unsigned int irq) "id=%d, base 0x%0
 superio_create_floppy(int id, uint16_t base, unsigned int irq) "id=%d, base 0x%03x, irq %u"
 superio_create_ide(int id, uint16_t base, unsigned int irq) "id=%d, base 0x%03x, irq %u"
 
+# i82091aa.c
+i82091aa_io_read(uint64_t addr, uint8_t index, uint8_t val) "read addr=0x%" PRIx64 " index=0x%02x val=0x%02x"
+i82091aa_io_write(uint64_t addr, uint8_t index, uint64_t val) "write addr=0x%" PRIx64 " index=0x%02x val=0x%02" PRIx64
+
 # pc87312.c
 pc87312_io_read(uint32_t addr, uint32_t val) "read addr=0x%x val=0x%x"
 pc87312_io_write(uint32_t addr, uint32_t val) "write addr=0x%x val=0x%x"

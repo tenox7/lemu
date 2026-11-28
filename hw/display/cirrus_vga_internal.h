@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2004 Fabrice Bellard
  * Copyright (c) 2004 Makoto Suzuki (suzu)
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -68,6 +69,10 @@ typedef struct CirrusVGAState {
     uint32_t cirrus_bank_limit[2];
     uint8_t cirrus_hidden_palette[48];
     bool enable_blitter;
+    /* a color-expanding BLT's source is packed bits: check that size */
+    bool colorexpand_packed;
+    /* up to the GD5434 the offset counts twice the bytes in 32 bpp */
+    bool gd5434_pitch32;
     int cirrus_blt_pixelwidth;
     int cirrus_blt_width;
     int cirrus_blt_height;

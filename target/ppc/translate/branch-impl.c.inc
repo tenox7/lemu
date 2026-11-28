@@ -2,6 +2,7 @@
  * Power ISA decode for branch instructions
  *
  *  Copyright IBM Corp. 2021
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Authors:
  *  Daniel Henrique Barboza      <danielhb413@gmail.com>
@@ -44,6 +45,20 @@ static bool trans_B(DisasContext *ctx, arg_I_b *a)
     } else {
         target = li;
     }
+#if !defined(CONFIG_USER_ONLY)
+    /*
+     * "b ." is an idle loop, as in BeOS's idle threads: give the host
+     * thread to the other CPUs until an interrupt takes this one out of
+     * it. With round-robin TCG the CPUs share one thread, and the spin
+     * would take time from the CPU doing the work. Only on the boards
+     * that ask for it (the BeBox), and not while single-stepping or with
+     * icount: see ctx->idle_yield.
+     */
+    if (ctx->idle_yield && !a->lk && target == ctx->cia) {
+        gen_exception_nip(ctx, EXCP_YIELD, ctx->cia);
+        return true;
+    }
+#endif
     if (a->lk) {
         gen_setlr(ctx, ctx->base.pc_next);
         gen_update_branch_history(ctx, ctx->cia, NULL, BHRB_TYPE_CALL);

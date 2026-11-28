@@ -3,6 +3,7 @@
  *
  *  Copyright (c) 2003-2007 Jocelyn Mayer
  *  Copyright (C) 2011 Freescale Semiconductor, Inc.
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -170,6 +171,7 @@ struct DisasContext {
     DisasContextBase base;
     bool fetch_shadow;
     bool os_idle;
+    bool idle_yield;
     target_ulong cia;  /* current instruction address */
     uint32_t opcode;
     /* Routine used to access memory */
@@ -5148,6 +5150,14 @@ static void ppc_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 
     ctx->os_idle = env->os_idle && !ctx->pr && !ctx->singlestep_flags &&
                    !(tb_cflags(ctx->base.tb) & CF_SINGLE_STEP);
+    /*
+     * Not while single-stepping, by MSR[SE]/[BE] or by gdb, or the step
+     * would never end. Not with icount, where the clock only moves as
+     * instructions run.
+     */
+    ctx->idle_yield = env->idle_yield && !ctx->singlestep_flags &&
+                      !(tb_cflags(ctx->base.tb) &
+                        (CF_SINGLE_STEP | CF_USE_ICOUNT));
 }
 
 static void ppc_tr_tb_start(DisasContextBase *db, CPUState *cs)

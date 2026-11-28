@@ -2,6 +2,7 @@
  * QEMU NE2000 emulation -- isa bus windup
  *
  * Copyright (c) 2003-2004 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -89,6 +90,7 @@ static const Property ne2000_isa_properties[] = {
     DEFINE_PROP_UINT32("iobase", ISANE2000State, iobase, 0x300),
     DEFINE_PROP_UINT32("irq",   ISANE2000State, isairq, 9),
     DEFINE_NIC_PROPERTIES(ISANE2000State, ne2000.c),
+    DEFINE_PROP_BOOL("dp8390-rx", ISANE2000State, ne2000.dp8390_rx, false),
 };
 
 static void isa_ne2000_class_initfn(ObjectClass *klass, const void *data)

@@ -77,7 +77,7 @@ struct JensenMachineState {
     I8257State *dma[2];
     MemoryRegion isp_ext;
     int64_t pit2_pause_time;
-    uint8_t dma_count_high[8], dma_ext_mode[8], dma_chain;
+    uint8_t dma_count_high[8], dma_chain;
     uint8_t dma_stop[8][3];
     uint8_t nmi_control, nmi_extended, nmi_mask;
     bool keyboard_locked;
@@ -292,12 +292,10 @@ static void jensen_isp_write(void *opaque, hwaddr addr,
                           "Jensen: chained DMA transfers unsupported\n");
         }
         return;
-    case 0x40b:
-    case 0x4d6:
-        channel = (value & 3) + (addr == 0x4d6 ? 4 : 0);
-        s->dma_ext_mode[channel] = value & 0xfc;
-        s->dma_chain &= ~(1 << channel);
-        return;
+    /*
+     * The extended mode registers at 0x40b and 0x4d6 are ignored: the
+     * common DMA model has them only when its ext-mode property is on.
+     */
     }
     if (addr >= 0x401 && addr <= 0x407 && (addr & 1)) {
         s->dma_count_high[(addr - 0x401) / 2] = value;
@@ -727,7 +725,6 @@ static void jensen_reset(MachineState *ms, ResetType type)
     s->inta_vector = 0;
     s->rtc_index = 0;
     memset(s->dma_count_high, 0, sizeof(s->dma_count_high));
-    memset(s->dma_ext_mode, 0, sizeof(s->dma_ext_mode));
     memset(s->dma_stop, 0, sizeof(s->dma_stop));
     s->dma_chain = 0;
     s->nmi_control = s->nmi_extended = s->nmi_mask = 0;

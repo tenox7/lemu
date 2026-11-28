@@ -177,6 +177,7 @@
 #define PCI_VENDOR_ID_DEC                0x1011
 #define PCI_DEVICE_ID_DEC_21154          0x0026
 #define PCI_DEVICE_ID_DEC_21143          0x0019
+#define PCI_DEVICE_ID_DEC_21041          0x0014
 
 #define PCI_VENDOR_ID_CIRRUS             0x1013
 
@@ -195,6 +196,7 @@
 #define PCI_DEVICE_ID_S3_VISION864       0x88c1
 
 #define PCI_VENDOR_ID_MOTOROLA           0x1057
+#define PCI_DEVICE_ID_MOTOROLA_MPC105    0x0001
 #define PCI_DEVICE_ID_MOTOROLA_MPC106    0x0002
 #define PCI_DEVICE_ID_MOTOROLA_RAVEN     0x4801
 

@@ -27,6 +27,11 @@ config FDC37M81X
     bool
     select ISA_SUPERIO
 
+config I82091AA
+    bool
+    select ISA_SUPERIO
+    select IDE_ISA
+
 config PC87312
     bool
     select ISA_SUPERIO

@@ -37,10 +37,21 @@ struct I8257State {
     I8257Regs regs[4];
     uint8_t counth[4];
     uint8_t stop[4][3];
+    uint8_t ext_mode[4];
+    /* the EISA extended mode register sets each channel's width */
+    bool ext_mode_on;
+    /* 82378/82374 scatter-gather, per channel */
+    uint32_t sg_ptr[4];         /* descriptor table pointer */
+    uint32_t sg_addr[4];        /* current buffer: address */
+    uint32_t sg_len[4];         /* current buffer: length in bytes */
+    uint8_t sg_status[4];       /* S/G status register */
+    uint8_t sg_irq;             /* S/G interrupt status, one bit a channel */
+    qemu_irq sg_irq_out;        /* IRQ13 */
     MemoryRegion channel_io;
     MemoryRegion cont_io;
     MemoryRegion counth_io;
     MemoryRegion stop_io;
+    MemoryRegion ext_mode_io;
 
     QEMUBH *dma_bh;
     bool dma_bh_scheduled;
@@ -50,5 +61,17 @@ struct I8257State {
 };
 
 void i8257_dma_init(Object *parent, ISABus *bus, bool high_page_enable);
+
+/* 82378/82374 scatter-gather, for the EISA DMA registers at 0x410 */
+#define I8257_SG_ACTIVE     0x01
+#define I8257_SG_CURRENT    0x04
+#define I8257_SG_IRQ13      0x20
+#define I8257_SG_LAST       0x80
+
+void i8257_sg_command(I8257State *d, int ichan, uint8_t cmd);
+uint8_t i8257_sg_status(I8257State *d, int ichan);
+void i8257_sg_set_pointer(I8257State *d, int ichan, uint32_t ptr);
+uint32_t i8257_sg_get_pointer(I8257State *d, int ichan);
+uint8_t i8257_sg_irq_status(I8257State *d);
 
 #endif

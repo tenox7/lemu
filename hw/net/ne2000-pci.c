@@ -2,6 +2,7 @@
  * QEMU NE2000 emulation (PCI bus)
  *
  * Copyright (c) 2003-2004 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -98,6 +99,7 @@ static void ne2000_instance_init(Object *obj)
 
 static const Property ne2000_properties[] = {
     DEFINE_NIC_PROPERTIES(PCINE2000State, ne2000.c),
+    DEFINE_PROP_BOOL("dp8390-rx", PCINE2000State, ne2000.dp8390_rx, false),
 };
 
 static void ne2000_class_init(ObjectClass *klass, const void *data)

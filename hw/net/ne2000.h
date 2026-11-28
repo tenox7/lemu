@@ -28,6 +28,12 @@ typedef struct NE2000State {
     uint8_t phys[6]; /* mac address */
     uint8_t curpag;
     uint8_t mult[8]; /* multicast mask array */
+    /*
+     * Receive as the DP8390 does: match unicast frames against PAR, take
+     * queued frames when the chip starts or the ring has room again, and
+     * let BNRY be PSTOP. Off by default; the BeBox turns it on.
+     */
+    bool dp8390_rx;
     qemu_irq irq;
     NICState *nic;
     NICConf c;

@@ -2,6 +2,7 @@
  * QEMU NE2000 emulation
  *
  * Copyright (c) 2003-2004 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -201,13 +202,17 @@ ssize_t ne2000_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
             mcast_idx = net_crc32(buf, ETH_ALEN) >> 26;
             if (!(s->mult[mcast_idx >> 3] & (1 << (mcast_idx & 7))))
                 return size;
-        } else if (s->mem[0] == buf[0] &&
+        } else if (s->dp8390_rx ? !memcmp(buf, s->phys, 6) :
+                   s->mem[0] == buf[0] &&
                    s->mem[2] == buf[1] &&
                    s->mem[4] == buf[2] &&
                    s->mem[6] == buf[3] &&
                    s->mem[8] == buf[4] &&
                    s->mem[10] == buf[5]) {
-            /* match */
+            /*
+             * The DP8390 matches its PAR registers, not the PROM, which
+             * drivers may overwrite through remote DMA.
+             */
         } else {
             return size;
         }
@@ -272,6 +277,10 @@ static void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         s->cmd = val;
         if (!(val & E8390_STOP)) { /* START bit makes no sense on RTL8029... */
             s->isr &= ~ENISR_RESET;
+            /* Frames refused while stopped wait in the queue: take them now */
+            if (s->dp8390_rx) {
+                qemu_flush_queued_packets(qemu_get_queue(s->nic));
+            }
             /* test specific case: zero length transfer */
             if ((val & (E8390_RREAD | E8390_RWRITE)) &&
                 s->rcnt == 0) {
@@ -310,8 +319,17 @@ static void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             }
             break;
         case EN0_BOUNDARY:
-            if (val << 8 < NE2000_PMEM_END) {
+            /*
+             * Only the free space in the ring comes from it, so the page
+             * after the last one is fine: drivers set it to PSTOP.
+             */
+            if (val << 8 < NE2000_PMEM_END ||
+                (s->dp8390_rx && val << 8 == NE2000_PMEM_END)) {
                 s->boundary = val;
+                /* The guest took frames out of the ring: there is room again */
+                if (s->dp8390_rx) {
+                    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+                }
             }
             break;
         case EN0_IMR:

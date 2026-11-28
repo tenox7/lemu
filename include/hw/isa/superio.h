@@ -2,6 +2,7 @@
  * Generic ISA Super I/O
  *
  * Copyright (c) 2018 Philippe Mathieu-Daudé
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
@@ -55,6 +56,7 @@ struct ISASuperIOClass {
 };
 
 #define TYPE_FDC37M81X_SUPERIO  "fdc37m81x-superio"
+#define TYPE_I82091AA_SUPERIO   "i82091aa"
 #define TYPE_SMC37C669_SUPERIO  "smc37c669-superio"
 
 #endif /* HW_ISA_SUPERIO_H */

@@ -10,6 +10,7 @@ compiles the same code 15 times, with slightly different features.
 |---|---|---|
 | qemu-system-ppc | aix415rs6k, aix433rs6k, aix51rs6k, nt351powerpc, nt40powerpc, os2powerpc, sol251powerpc | `../40p/release/mkrelease.sh` |
 | qemu-system-ppc | aix325rs6000 | `../7006/release/mkrelease.sh` |
+| qemu-system-ppc | beos11d7bebox, beos11d71bebox, beosdr8bebox, beosprbebox, beospr2bebox, beosr3bebox, beosr4bebox, beosr45bebox, beosr5bebox | `../bebox/release/mkrelease.sh` |
 | qemu-system-ppc64 | aix53pseries, aix61pseries, aix71pseries, aix72pseries, aix73pseries | `../pseries/release/mkrelease.sh` |
 | qemu-system-alpha | nt31axp, nt351axp, nt40axp, vms15axp | `../jensen/release/pack.sh` |
 | qemu-system-mips64el | nt31mips, nt351-jazz, nt351-rm200, nt4-jazz, nt4-rm200, nt4-rm200-smp, nt4srv-rm300-smp4 | `../rm200/release/pack.sh` |
@@ -83,8 +84,11 @@ what each binary has in `OUT/macos-*.features` and
   `sh ../rm200/release/check.sh macos qemu-system-mips64el OUT/macos-qemu-system-mips64el.features`.
 - NeXT: `sh ../next/release/check.sh macos OUT/macos-qemu-system-m68k.features`
   (and `linux` with the Linux lists) checks what the NeXT kits need.
-- PowerPC has no saved lists yet. Run `features.sh` on the binaries of
-  the last kits and compare: `comm -23 OLD NEW` must print nothing.
+- BeBox: `sh ../bebox/release/check.sh macos OUT/macos-qemu-system-ppc.features`
+  (and `linux` with the Linux lists) checks what the BeBox kits need.
+- The other PowerPC kits have no saved lists yet. Run `features.sh` on
+  the binaries of the last kits and compare: `comm -23 OLD NEW` must
+  print nothing.
 - The Windows build is not run. `build-windows.sh` checks the configure
   summary and the git id instead.
 
@@ -99,6 +103,7 @@ these folders in place of their own build, for example:
 
     sh ../40p/release/mkrelease.sh nt VMDIR STAGE/ppc nt40powerpc-lemu.tar.lz
     sh ../7006/release/mkrelease.sh VMDIR STAGE/ppc aix325rs6000-lemu.tar.lz
+    sh ../bebox/release/mkrelease.sh r45 VMDIR STAGE/ppc beosr45bebox-lemu.tar.lz
     sh ../pseries/release/mkrelease.sh aix53 VMDIR STAGE/ppc64 aix53pseries-lemu.tar.lz
     sh ../jensen/release/pack.sh nt40 SRCDIR STAGE/alpha nt40axp-lemu.tar.lz
     sh ../pc/release/pack.sh nt31 VMDIR STAGE/i386 nt31x86-lemu.tar.lz

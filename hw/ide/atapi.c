@@ -72,7 +72,7 @@ static inline int media_is_cd(IDEState *s)
     return (media_present(s) && s->nb_sectors <= CD_MAX_SECTORS);
 }
 
-static void cd_data_to_raw(uint8_t *buf, int lba)
+void cd_data_to_raw(uint8_t *buf, int lba)
 {
     /* sync bytes */
     buf[0] = 0x00;
@@ -263,6 +263,7 @@ void ide_atapi_cmd_error(IDEState *s, int sense_key, int asc)
     s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO | ATAPI_INT_REASON_CD;
     s->sense_key = sense_key;
     s->asc = asc;
+    s->ua_reported = sense_key == UNIT_ATTENTION;
     ide_transfer_stop(s);
     ide_bus_set_irq(s->bus);
 }
@@ -400,6 +401,7 @@ static void ide_atapi_cmd_read_pio(IDEState *s, int lba, int nb_sectors,
 static void ide_atapi_cmd_check_status(IDEState *s)
 {
     trace_ide_atapi_cmd_check_status(s);
+    s->ua_reported = true;
     s->error = MC_ERR | (UNIT_ATTENTION << 4);
     s->status = ERR_STAT;
     s->nsector = 0;
@@ -1280,7 +1282,12 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
 
     switch(format) {
     case 0:
-        len = cdrom_read_toc(total_sectors, buf, msf, start_track);
+        if (s->ntracks) {
+            len = cdrom_read_toc_starts(total_sectors, buf, msf, start_track,
+                                        s->track_starts, s->ntracks);
+        } else {
+            len = cdrom_read_toc(total_sectors, buf, msf, start_track);
+        }
         if (len < 0)
             goto error_cmd;
         ide_atapi_cmd_reply(s, len, max_len);
@@ -1294,7 +1301,13 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
         ide_atapi_cmd_reply(s, 12, max_len);
         break;
     case 2:
-        len = cdrom_read_toc_raw(total_sectors, buf, msf, start_track);
+        if (s->ntracks) {
+            len = cdrom_read_toc_raw_starts(total_sectors, buf, msf,
+                                            start_track, s->track_starts,
+                                            s->ntracks);
+        } else {
+            len = cdrom_read_toc_raw(total_sectors, buf, msf, start_track);
+        }
         if (len < 0)
             goto error_cmd;
         ide_atapi_cmd_reply(s, len, max_len);
@@ -1556,11 +1569,17 @@ void ide_atapi_cmd(IDEState *s)
      * If there's a UNIT_ATTENTION condition pending, only command flagged with
      * ALLOW_UA are allowed to complete. with other commands getting a CHECK
      * condition response unless a higher priority status, defined by the drive
-     * here, is pending.
+     * here, is pending. As on a drive with UA_INTLCK_CTRL 00b, the default,
+     * the condition goes once a CHECK condition has reported it: a guest that
+     * retries without REQUEST SENSE gets on with the next command.
      */
     if (s->sense_key == UNIT_ATTENTION && !(cmd->flags & ALLOW_UA)) {
-        ide_atapi_cmd_check_status(s);
-        return;
+        if (!s->ua_reported) {
+            ide_atapi_cmd_check_status(s);
+            return;
+        }
+        s->sense_key = NO_SENSE;
+        s->ua_reported = false;
     }
     /*
      * When a CD gets changed, we have to report an ejected state and

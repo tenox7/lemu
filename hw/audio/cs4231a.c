@@ -2,6 +2,7 @@
  * QEMU Crystal CS4231 audio chip emulation
  *
  * Copyright (c) 2006 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -74,6 +75,12 @@ struct CSState {
     qemu_irq pic;
     uint32_t regs[CS_REGS];
     uint8_t dregs[CS_DREGS];
+    /*
+     * The base count holds the number of samples less one, and one-shot
+     * DMA stops at terminal count, as the datasheet has it. Off by default;
+     * the BeBox turns it on.
+     */
+    bool exact_dma;
     uint32_t irq;
     uint32_t dma;
     uint32_t port;
@@ -573,16 +580,29 @@ static int cs_write_audio (CSState *s, int nchan, int dma_pos,
 static int cs_dma_read (void *opaque, int nchan, int dma_pos, int dma_len)
 {
     CSState *s = opaque;
+    IsaDmaClass *k = ISADMA_GET_CLASS(s->isa_dma);
+    bool autoinit = !s->exact_dma ||
+                    k->has_autoinitialization(s->isa_dma, nchan);
     int copy, written;
     int till = -1;
 
     copy = s->voice ? (s->audio_free >> (s->tab != NULL)) : dma_len;
 
     if (s->dregs[Pin_Control] & IEN) {
-        till = (s->dregs[Playback_Lower_Base_Count]
-            | (s->dregs[Playback_Upper_Base_Count] << 8)) << s->shift;
+        /* with exact-dma, the base count holds the samples less one */
+        till = ((s->dregs[Playback_Lower_Base_Count]
+                 | (s->dregs[Playback_Upper_Base_Count] << 8)) +
+                s->exact_dma) << s->shift;
         till -= s->transferred;
         copy = MIN (till, copy);
+    }
+
+    /*
+     * Without autoinitialization the DMA channel stops at terminal count
+     * until the driver gives it the next buffer: don't go round again.
+     */
+    if (!autoinit) {
+        copy = MIN (copy, dma_len - dma_pos);
     }
 
     if ((copy <= 0) || (dma_len <= 0)) {
@@ -591,7 +611,10 @@ static int cs_dma_read (void *opaque, int nchan, int dma_pos, int dma_len)
 
     written = cs_write_audio (s, nchan, dma_pos, dma_len, copy);
 
-    dma_pos = (dma_pos + written) % dma_len;
+    dma_pos += written;
+    if (autoinit) {
+        dma_pos %= dma_len;
+    }
     s->audio_free -= (written << (s->tab != NULL));
 
     if (written == till) {
@@ -698,6 +721,7 @@ static const Property cs4231a_properties[] = {
     DEFINE_PROP_UINT32 ("iobase",  CSState, port, 0x534),
     DEFINE_PROP_UINT32 ("irq",     CSState, irq,  9),
     DEFINE_PROP_UINT32 ("dma",     CSState, dma,  3),
+    DEFINE_PROP_BOOL ("exact-dma", CSState, exact_dma, false),
 };
 
 static void cs4231a_class_initfn(ObjectClass *klass, const void *data)

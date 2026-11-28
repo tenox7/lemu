@@ -123,6 +123,15 @@ extern const VMStateDescription vmstate_scsi_device;
 /* cdrom.c */
 int cdrom_read_toc(int nb_sectors, uint8_t *buf, int msf, int start_track);
 int cdrom_read_toc_raw(int nb_sectors, uint8_t *buf, int msf, int session_num);
+/* Discs made of data tracks that start at @starts (the tracks property) */
+int cdrom_read_toc_starts(int nb_sectors, uint8_t *buf, int msf,
+                          int start_track, const uint32_t *starts,
+                          int ntracks);
+int cdrom_read_toc_raw_starts(int nb_sectors, uint8_t *buf, int msf,
+                              int session_num, const uint32_t *starts,
+                              int ntracks);
+bool cdrom_parse_tracks(const char *tracks, uint32_t **starts, int *ntracks,
+                        Error **errp);
 /* Discs with a real track list (block/cdrom-image.h) */
 int cdrom_read_toc_tracks(const BlockCdToc *toc, uint8_t *buf, int msf,
                           int start_track);

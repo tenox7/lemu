@@ -2,6 +2,7 @@
  * QEMU TULIP Emulation
  *
  * Copyright (c) 2019 Sven Schnelle <svens@stackframe.org>
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This work is licensed under the GNU GPL license version 2 or later.
  */
@@ -27,6 +28,7 @@ struct TULIPState {
     qemu_irq irq;
     NICState *nic;
     eeprom_t *eeprom;
+    bool is_21041;
     char *srom_name;
     uint32_t csr[16];
 
@@ -532,7 +534,9 @@ static uint32_t tulip_csr9_read(TULIPState *s)
         }
     }
 
-    tulip_mii(s);
+    if (!s->is_21041) {
+        tulip_mii(s);
+    }
     return s->csr[9];
 }
 
@@ -750,6 +754,10 @@ static void tulip_reset(TULIPState *s)
     s->csr[13] = 0xffff0000;
     s->csr[14] = 0xffffffff;
     s->csr[15] = 0x8ff00000;
+    if (s->is_21041) {
+        /* MOD low: a serial ROM, not the 21040's address ROM */
+        s->csr[9] &= ~CSR9_MOD;
+    }
 }
 
 static void tulip_qdev_reset(DeviceState *dev)
@@ -836,7 +844,11 @@ static void tulip_write(void *opaque, hwaddr addr,
         /* don't clear MII read data */
         s->csr[9] &= CSR9_MDI;
         s->csr[9] |= (data & ~CSR9_MDI);
-        tulip_mii(s);
+        if (s->is_21041) {
+            s->csr[9] &= ~CSR9_MOD;     /* a pin, read-only */
+        } else {
+            tulip_mii(s);
+        }
         s->old_csr9 = s->csr[9];
         break;
 
@@ -959,6 +971,24 @@ static const uint8_t eeprom_default[128] = {
 };
 
 /*
+ * A 21041 card's serial ROM, format version 1: one controller, its
+ * address at byte 20 and its info leaf at byte 30. The leaf picks
+ * autosense and lists 10BASE-T, 10BASE-T full duplex and BNC, without
+ * SIA register values of its own.
+ */
+static const uint8_t eeprom_21041[128] = {
+    [18] = 0x01,                /* SROM format version */
+    [19] = 0x01,                /* one controller */
+    [26] = 0x00,                /* controller 0: device number */
+    [27] = 0x1e, [28] = 0x00,   /* controller 0: info leaf offset */
+    [30] = 0x00, [31] = 0x08,   /* selected connection: autosense */
+    [32] = 0x03,                /* three media */
+    [33] = 0x00,                /* 10BASE-T */
+    [34] = 0x04,                /* 10BASE-T full duplex */
+    [35] = 0x01,                /* BNC */
+};
+
+/*
  * DEC's SROM format puts the board name right after the controller
  * entries: at byte 26 + 3 * 1 with one controller. Drivers such as DG/UX's
  * dpen and Linux's de4x5 tell DEC boards apart by it. The default image
@@ -984,7 +1014,7 @@ static void tulip_set_srom_name(TULIPState *s, uint8_t *srom)
 static void tulip_fill_eeprom(TULIPState *s)
 {
     uint16_t *eeprom = eeprom93xx_data(s->eeprom);
-    memcpy(eeprom, eeprom_default, 128);
+    memcpy(eeprom, s->is_21041 ? eeprom_21041 : eeprom_default, 128);
     if (s->srom_name) {
         tulip_set_srom_name(s, (uint8_t *)eeprom);
     }
@@ -993,7 +1023,9 @@ static void tulip_fill_eeprom(TULIPState *s)
     eeprom[10] = cpu_to_le16(s->c.macaddr.a[0] | (s->c.macaddr.a[1] << 8));
     eeprom[11] = cpu_to_le16(s->c.macaddr.a[2] | (s->c.macaddr.a[3] << 8));
     eeprom[12] = cpu_to_le16(s->c.macaddr.a[4] | (s->c.macaddr.a[5] << 8));
-    tulip_idblock_crc(s, eeprom);
+    if (!s->is_21041) {
+        tulip_idblock_crc(s, eeprom);
+    }
     eeprom[63] = cpu_to_le16(tulip_srom_crc(s, (uint8_t *)eeprom, 126));
 }
 
@@ -1012,6 +1044,8 @@ static void pci_tulip_realize(PCIDevice *pci_dev, Error **errp)
     pci_conf[PCI_INTERRUPT_PIN] = 1; /* interrupt pin A */
 
     qemu_macaddr_default_if_unset(&s->c.macaddr);
+    s->is_21041 = PCI_DEVICE_GET_CLASS(pci_dev)->device_id ==
+                  PCI_DEVICE_ID_DEC_21041;
 
     s->eeprom = eeprom93xx_new(&pci_dev->qdev, 64);
     tulip_fill_eeprom(s);
@@ -1089,9 +1123,33 @@ static const TypeInfo tulip_info = {
     },
 };
 
+/*
+ * The DECchip 21041 "Tulip Plus": a 10 Mbit/s Tulip with the SIA for
+ * 10BASE-T, AUI and BNC built in and no MII. Its DMA and descriptors are
+ * those of the 21143.
+ */
+static void tulip_21041_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+
+    k->device_id = PCI_DEVICE_ID_DEC_21041;
+    k->revision = 0x21;
+    k->subsystem_vendor_id = 0;
+    k->subsystem_id = 0;
+    dc->desc = "DECchip 21041 Tulip Plus";
+}
+
+static const TypeInfo tulip_21041_info = {
+    .name          = TYPE_TULIP_21041,
+    .parent        = TYPE_TULIP,
+    .class_init    = tulip_21041_class_init,
+};
+
 static void tulip_register_types(void)
 {
     type_register_static(&tulip_info);
+    type_register_static(&tulip_21041_info);
 }
 
 type_init(tulip_register_types)

@@ -67,6 +67,10 @@ struct IDEState {
     char drive_serial_str[21];
     char drive_model_str[41];
     bool win2k_install_hack;
+    bool ua_reported;           /* the pending unit attention was reported */
+    bool no_udma;               /* a drive from before Ultra DMA */
+    uint32_t *track_starts;     /* CD tracks, from the tracks property */
+    int ntracks;
     uint64_t wwn;
     /* ide regs */
     uint8_t feature;
@@ -176,6 +180,8 @@ struct IDEDevice {
      */
     uint16_t rotation_rate;
     bool win2k_install_hack;
+    char *tracks;
+    bool udma;
 };
 
 typedef struct IDEDrive {

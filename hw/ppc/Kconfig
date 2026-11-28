@@ -118,6 +118,20 @@ config PREP
     select FW_CFG_PPC
     select VMMOUSE_MMIO
 
+config BEBOX
+    bool
+    default y
+    depends on PPC
+    imply LSI_SCSI_PCI
+    imply VGA_CIRRUS
+    select MPC105_PCI
+    select I82378
+    select I82091AA
+    select MC146818RTC
+    select SERIAL_MM
+    select CS4231A
+    select PFLASH_CFI02
+
 config RS6000_MC
     bool
 

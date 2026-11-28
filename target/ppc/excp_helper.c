@@ -2,6 +2,7 @@
  *  PowerPC exception emulation helpers for QEMU.
  *
  *  Copyright (c) 2003-2007 Jocelyn Mayer
+ *  Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -579,6 +580,7 @@ static void powerpc_excp_6xx(PowerPCCPU *cpu, int excp)
         msr |= env->error_code;
         break;
     case POWERPC_EXCP_EXTERNAL:  /* External input                           */
+    case POWERPC_EXCP_SMI:       /* System management interrupt              */
         break;
     case POWERPC_EXCP_ALIGN:     /* Alignment exception                      */
         /* Get rS/rD and rA from faulting opcode */
@@ -664,7 +666,6 @@ static void powerpc_excp_6xx(PowerPCCPU *cpu, int excp)
     case POWERPC_EXCP_FPA:       /* Floating-point assist exception          */
     case POWERPC_EXCP_DABR:      /* Data address breakpoint                  */
     case POWERPC_EXCP_IABR:      /* Instruction address breakpoint           */
-    case POWERPC_EXCP_SMI:       /* System management interrupt              */
     case POWERPC_EXCP_MEXTBR:    /* Maskable external breakpoint             */
     case POWERPC_EXCP_NMEXTBR:   /* Non maskable external breakpoint         */
         cpu_abort(env_cpu(env), "%s exception not implemented\n",
@@ -723,6 +724,7 @@ static void powerpc_excp_7xx(PowerPCCPU *cpu, int excp)
         msr |= env->error_code;
         break;
     case POWERPC_EXCP_EXTERNAL:  /* External input                           */
+    case POWERPC_EXCP_SMI:       /* System management interrupt              */
         break;
     case POWERPC_EXCP_ALIGN:     /* Alignment exception                      */
         /* Get rS/rD and rA from faulting opcode */
@@ -818,7 +820,6 @@ static void powerpc_excp_7xx(PowerPCCPU *cpu, int excp)
         msr |= ((env->last_way + 1) & (env->nb_ways - 1)) << 17;
         break;
     case POWERPC_EXCP_IABR:      /* Instruction address breakpoint           */
-    case POWERPC_EXCP_SMI:       /* System management interrupt              */
     case POWERPC_EXCP_THERM:     /* Thermal interrupt                        */
     case POWERPC_EXCP_PERFM:     /* Embedded performance monitor interrupt   */
         cpu_abort(env_cpu(env), "%s exception not implemented\n",
@@ -2238,6 +2239,10 @@ static int ppc_next_unmasked_interrupt(CPUPPCState *env)
         }
     }
     if (async_deliver != 0) {
+        /* System management interrupt (603, 7xx), gated like external */
+        if (pending_interrupts & PPC_INTERRUPT_SMI) {
+            return PPC_INTERRUPT_SMI;
+        }
         /* Watchdog timer on embedded PowerPC */
         if (pending_interrupts & PPC_INTERRUPT_WDT) {
             return PPC_INTERRUPT_WDT;
@@ -2567,6 +2572,9 @@ static void ppc_deliver_interrupt(CPUPPCState *env, int interrupt)
         break;
     case PPC_INTERRUPT_CEXT: /* External critical interrupt */
         powerpc_excp(cpu, POWERPC_EXCP_CRITICAL);
+        break;
+    case PPC_INTERRUPT_SMI: /* System management interrupt, level */
+        powerpc_excp(cpu, POWERPC_EXCP_SMI);
         break;
 
     case PPC_INTERRUPT_WDT: /* Watchdog timer on embedded PowerPC */

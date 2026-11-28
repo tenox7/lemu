@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2004 Fabrice Bellard
  * Copyright (c) 2004 Makoto Suzuki (suzu)
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -184,6 +185,7 @@ typedef void (*cirrus_fill_t)(struct CirrusVGAState *s,
 struct PCICirrusVGAState {
     PCIDevice dev;
     CirrusVGAState cirrus_vga;
+    uint32_t bar_mb;
     MemoryRegion aperture[3];
 };
 
@@ -248,6 +250,20 @@ static bool blit_is_unsafe(struct CirrusVGAState *s, bool dst_only)
     }
     if (dst_only) {
         return false;
+    }
+    /*
+     * Color expansion reads its source as packed bits, a whole number of
+     * bytes per line, whatever the source pitch: drivers leave it at 0.
+     * Only with colorexpand-packed (the BeBox); others keep the pitch
+     * check below.
+     */
+    if (s->colorexpand_packed &&
+        (s->cirrus_blt_mode & CIRRUS_BLTMODE_COLOREXPAND)) {
+        int64_t bits = (s->vga.gr[0x2f] & 0x07) +
+                       s->cirrus_blt_width / s->cirrus_blt_pixelwidth;
+
+        return s->cirrus_blt_srcaddr +
+               (bits + 7) / 8 * s->cirrus_blt_height > s->vga.vram_size;
     }
     if (blit_region_is_unsafe(s, s->cirrus_blt_srcpitch,
                               s->cirrus_blt_srcaddr)) {
@@ -1114,6 +1130,8 @@ static void cirrus_write_bitblt(CirrusVGAState * s, unsigned reg_value)
  *
  ***************************************/
 
+static int cirrus_get_bpp(VGACommonState *s1);
+
 static void cirrus_get_params(VGACommonState *s1,
                               VGADisplayParams *params)
 {
@@ -1123,6 +1141,15 @@ static void cirrus_get_params(VGACommonState *s1,
     line_offset = s->vga.cr[0x13]
         | ((s->vga.cr[0x1b] & 0x10) << 4);
     line_offset <<= 3;
+    /*
+     * Up to the GD5434, the offset counts in twice the bytes in 32 bpp, as
+     * in 86Box: BeOS programs 0xa0 for 640 pixels of 4 bytes. Only with
+     * gd5434-pitch32 (the BeBox).
+     */
+    if (s->gd5434_pitch32 && s->device_id < CIRRUS_ID_CLGD5436 &&
+        cirrus_get_bpp(s1) == 32) {
+        line_offset <<= 1;
+    }
     params->line_offset = line_offset;
 
     params->start_addr = (s->vga.cr[0x0c] << 8)
@@ -3121,6 +3148,10 @@ static void pci_cirrus_vga_realize(PCIDevice *dev, Error **errp)
                    s->vga.vram_size_mb);
         return;
     }
+    if (d->bar_mb != 16 && d->bar_mb != 32) {
+        error_setg(errp, "cirrus-vga: bar0-mb must be 16 or 32");
+        return;
+    }
     /* setup VGA */
     if (!vga_common_init(&s->vga, OBJECT(dev), errp)) {
         return;
@@ -3130,12 +3161,19 @@ static void pci_cirrus_vga_realize(PCIDevice *dev, Error **errp)
     s->vga.con = qemu_graphic_console_create(DEVICE(dev), 0, s->vga.hw_ops, &s->vga);
 
     /* setup PCI */
-    memory_region_init(&s->pci_bar, OBJECT(dev), "cirrus-pci-bar0", 0x2000000);
+    memory_region_init(&s->pci_bar, OBJECT(dev), "cirrus-pci-bar0",
+                       d->bar_mb * MiB);
 
     /* XXX: add byte swapping apertures */
     memory_region_add_subregion(&s->pci_bar, 0, &s->cirrus_linear_io);
-    memory_region_add_subregion(&s->pci_bar, 0x1000000,
-                                &s->cirrus_linear_bitblt_io);
+    /*
+     * The blitter aperture at 16 MiB is QEMU's own; a 16 MiB BAR, as
+     * firmware that packs BARs without aligning them needs, has none.
+     */
+    if (d->bar_mb == 32) {
+        memory_region_add_subregion(&s->pci_bar, 0x1000000,
+                                    &s->cirrus_linear_bitblt_io);
+    }
 
     /* setup memory space */
     /* memory #0 LFB */
@@ -3170,6 +3208,11 @@ static const Property pci_vga_cirrus_properties[] = {
                      cirrus_vga.enable_blitter, true),
     DEFINE_PROP_BOOL("partial-init", struct PCICirrusVGAState,
                      cirrus_vga.vga.partial_init, false),
+    DEFINE_PROP_UINT32("bar0-mb", struct PCICirrusVGAState, bar_mb, 32),
+    DEFINE_PROP_BOOL("colorexpand-packed", struct PCICirrusVGAState,
+                     cirrus_vga.colorexpand_packed, false),
+    DEFINE_PROP_BOOL("gd5434-pitch32", struct PCICirrusVGAState,
+                     cirrus_vga.gd5434_pitch32, false),
 };
 
 static void cirrus_vga_class_init(ObjectClass *klass, const void *data)

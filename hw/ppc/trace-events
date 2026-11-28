@@ -229,3 +229,14 @@ rs6k_mse_write(uint64_t addr, unsigned size, uint64_t val) "+0x%" PRIx64 " size 
 # rs6k_panel.c
 rs6k_led(uint32_t code) "LED 0x%03x"
 rs6k_key(const char *pos) "key %s"
+
+# bebox_glue.c
+bebox_glue_read(int cpu, uint64_t addr, uint32_t val) "cpu%d 0x%03" PRIx64 " -> 0x%08x"
+bebox_glue_write(int cpu, uint64_t addr, uint64_t val) "cpu%d 0x%03" PRIx64 " <- 0x%08" PRIx64
+bebox_glue_disk_led(int on) "disk LED %d"
+bebox_io_read(uint32_t port, uint64_t val) "port 0x%03x -> 0x%" PRIx64
+bebox_io_write(uint32_t port, uint64_t val) "port 0x%03x <- 0x%" PRIx64
+bebox_io_led(unsigned left, unsigned right) "front panel LEDs left %u right %u"
+
+# bebox.c
+bebox_cpu1_reset(int hreset, int sreset) "CPU1 HRESET %d SRESET %d"

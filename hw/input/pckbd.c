@@ -2,6 +2,7 @@
  * QEMU PC keyboard emulation
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -89,6 +90,9 @@
 #define KBD_STAT_OBF           0x01
 /* Keyboard input buffer full */
 #define KBD_STAT_IBF           0x02
+
+/* How long the controller takes to pick up a byte the host wrote */
+#define KBD_IBF_NS             (50 * SCALE_US)
 /* Self test successful */
 #define KBD_STAT_SELFTEST      0x04
 /* Last write was a command write (0=data) */
@@ -274,6 +278,16 @@ static uint64_t kbd_read_status(void *opaque, hwaddr addr,
     KBDState *s = opaque;
     int val;
     val = s->status;
+    /*
+     * The controller's firmware takes a moment to pick up a byte the host
+     * wrote; some firmware waits to see IBF set, then clear again.
+     */
+    if (s->ibf_read &&
+        (!s->ibf_seen ||
+         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) < s->ibf_until)) {
+        s->ibf_seen = true;
+        val |= KBD_STAT_IBF;
+    }
     trace_pckbd_kbd_read_status(val);
     return val;
 }
@@ -333,6 +347,8 @@ static void kbd_write_command(void *opaque, hwaddr addr,
     KBDState *s = opaque;
 
     trace_pckbd_kbd_write_command(val);
+    s->ibf_until = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + KBD_IBF_NS;
+    s->ibf_seen = false;
 
     /*
      * Bits 3-0 of the output port P2 of the keyboard controller may be pulsed
@@ -373,6 +389,19 @@ static void kbd_write_command(void *opaque, hwaddr addr,
         break;
     case KBD_CCMD_SELF_TEST:
         s->status |= KBD_STAT_SELFTEST;
+        if (s->selftest_reset) {
+            /*
+             * The controller's firmware starts over, as on a PS/2
+             * controller: keyboard and mouse interfaces disabled, no
+             * interrupts, no translation, and the output port as after a
+             * reset. Guests that expect the command byte to stay as it was
+             * lose their keyboard interrupts, so only boards that need it
+             * (the BeBox) turn it on.
+             */
+            s->mode = KBD_MODE_DISABLE_KBD | KBD_MODE_DISABLE_MOUSE;
+            s->outport = KBD_OUT_RESET | KBD_OUT_A20 | KBD_OUT_ONES;
+            s->write_cmd = 0;
+        }
         if (s->selftest_reply_first) {
             kbd_ctrl_reset(s);
         }
@@ -445,6 +474,8 @@ static void kbd_write_data(void *opaque, hwaddr addr,
     KBDState *s = opaque;
 
     trace_pckbd_kbd_write_data(val);
+    s->ibf_until = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + KBD_IBF_NS;
+    s->ibf_seen = false;
 
     switch (s->write_cmd) {
     case 0:
@@ -493,10 +524,11 @@ static void kbd_reset(void *opaque)
 {
     KBDState *s = opaque;
 
-    s->mode = KBD_MODE_KBD_INT | KBD_MODE_MOUSE_INT;
+    s->mode = s->reset_mode;
     s->status = KBD_STAT_CMD | KBD_STAT_UNLOCKED;
     s->outport = KBD_OUT_RESET | KBD_OUT_A20 | KBD_OUT_ONES;
     s->pending = 0;
+    s->ibf_seen = true;
     kbd_deassert_irq(s);
     if (s->throttle_timer) {
         timer_del(s->throttle_timer);
@@ -756,6 +788,10 @@ static void i8042_mmio_init(Object *obj)
 
 static const Property i8042_mmio_properties[] = {
     DEFINE_PROP_UINT64("mask", MMIOKBDState, kbd.mask, UINT64_MAX),
+    DEFINE_PROP_UINT8("reset-mode", MMIOKBDState, kbd.reset_mode,
+                      KBD_MODE_KBD_INT | KBD_MODE_MOUSE_INT),
+    DEFINE_PROP_BOOL("selftest-reset", MMIOKBDState, kbd.selftest_reset,
+                     false),
     DEFINE_PROP_UINT32("size", MMIOKBDState, size, -1),
 };
 
@@ -956,8 +992,13 @@ static const Property i8042_properties[] = {
     DEFINE_PROP_BOOL("kbd-throttle", ISAKBDState, kbd_throttle, false),
     DEFINE_PROP_BOOL("selftest-reply-first", ISAKBDState,
                      kbd.selftest_reply_first, false),
+    DEFINE_PROP_BOOL("selftest-reset", ISAKBDState, kbd.selftest_reset,
+                     false),
     DEFINE_PROP_BOOL("ctrl-reply-first", ISAKBDState,
                      kbd.ctrl_reply_first, false),
+    DEFINE_PROP_BOOL("ibf-read", ISAKBDState, kbd.ibf_read, false),
+    DEFINE_PROP_UINT8("reset-mode", ISAKBDState, kbd.reset_mode,
+                      KBD_MODE_KBD_INT | KBD_MODE_MOUSE_INT),
     DEFINE_PROP_UINT8("kbd-irq", ISAKBDState, kbd_irq, 1),
     DEFINE_PROP_UINT8("mouse-irq", ISAKBDState, mouse_irq, 12),
 };

@@ -24,3 +24,6 @@
 
 # For PReP
 # CONFIG_PREP=n
+
+# For the BeBox
+# CONFIG_BEBOX=n

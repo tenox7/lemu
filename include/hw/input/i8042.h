@@ -2,6 +2,7 @@
  * QEMU PS/2 Controller
  *
  * Copyright (c) 2003 Fabrice Bellard
+ * Copyright (c) 2026 Natalia Portillo <claunia@claunia.com>
  *
  * SPDX-License-Identifier: MIT
  */
@@ -27,7 +28,15 @@ typedef struct KBDState {
     bool extended_state;
     bool extended_state_loaded;
     bool selftest_reply_first;
+    /* the self-test starts the controller over, as a PS/2 controller does */
+    bool selftest_reset;
     bool ctrl_reply_first;
+    /* show IBF after a host write, to the first status read and a while */
+    bool ibf_read;
+    bool ibf_seen;
+    /* command byte after reset */
+    uint8_t reset_mode;
+    int64_t ibf_until;
     /* Bitmask of devices with data available.  */
     uint8_t pending;
     uint8_t obdata;
