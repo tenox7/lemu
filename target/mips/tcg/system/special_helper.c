@@ -122,6 +122,14 @@ void HELPER(eret)(CPUMIPSState *env)
     env->lladdr = 1;
 }
 
+void HELPER(rfe)(CPUMIPSState *env)
+{
+    /* MIPS-I returns by rotating the current/previous/old KU/IE pairs. */
+    env->CP0_Status = (env->CP0_Status & ~0x3f) |
+                      ((env->CP0_Status >> 2) & 0x0f);
+    compute_hflags(env);
+}
+
 void HELPER(eretnc)(CPUMIPSState *env)
 {
     exception_return(env);

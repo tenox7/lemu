@@ -4960,6 +4960,11 @@ static inline void gen_mtc0_store32(TCGv arg, target_ulong off)
     tcg_gen_st_i32(t0, tcg_env, off);
 }
 
+static inline bool disas_r3000_mmu(DisasContext *ctx)
+{
+    return ctx->mmu_type == MMU_TYPE_R3000;
+}
+
 #define CP0_CHECK(c)                            \
     do {                                        \
         if (!(c)) {                             \
@@ -5200,7 +5205,11 @@ static void gen_mfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
         switch (sel) {
         case CP0_REG01__RANDOM:
             CP0_CHECK(!(ctx->insn_flags & ISA_MIPS_R6));
-            gen_helper_mfc0_random(arg, tcg_env);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mfc0_random_r3000(arg, tcg_env);
+            } else {
+                gen_helper_mfc0_random(arg, tcg_env);
+            }
             register_name = "Random";
             break;
         case CP0_REG01__VPECONTROL:
@@ -5926,7 +5935,11 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_00:
         switch (sel) {
         case CP0_REG00__INDEX:
-            gen_helper_mtc0_index(tcg_env, arg);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mtc0_index_r3000(tcg_env, arg);
+            } else {
+                gen_helper_mtc0_index(tcg_env, arg);
+            }
             register_name = "Index";
             break;
         case CP0_REG00__MVPCONTROL:
@@ -6003,7 +6016,11 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_02:
         switch (sel) {
         case CP0_REG02__ENTRYLO0:
-            gen_helper_mtc0_entrylo0(tcg_env, arg);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mtc0_entrylo_r3000(tcg_env, arg);
+            } else {
+                gen_helper_mtc0_entrylo0(tcg_env, arg);
+            }
             register_name = "EntryLo0";
             break;
         case CP0_REG02__TCSTATUS:
@@ -6063,7 +6080,11 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_04:
         switch (sel) {
         case CP0_REG04__CONTEXT:
-            gen_helper_mtc0_context(tcg_env, arg);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mtc0_context_r3000(tcg_env, arg);
+            } else {
+                gen_helper_mtc0_context(tcg_env, arg);
+            }
             register_name = "Context";
             break;
         case CP0_REG04__CONTEXTCONFIG:
@@ -6219,7 +6240,11 @@ static void gen_mtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_10:
         switch (sel) {
         case CP0_REG10__ENTRYHI:
-            gen_helper_mtc0_entryhi(tcg_env, arg);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mtc0_entryhi_r3000(tcg_env, arg);
+            } else {
+                gen_helper_mtc0_entryhi(tcg_env, arg);
+            }
             register_name = "EntryHi";
             break;
         default:
@@ -6707,7 +6732,11 @@ static void gen_dmfc0(DisasContext *ctx, TCGv arg, int reg, int sel)
         switch (sel) {
         case CP0_REG01__RANDOM:
             CP0_CHECK(!(ctx->insn_flags & ISA_MIPS_R6));
-            gen_helper_mfc0_random(arg, tcg_env);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mfc0_random_r3000(arg, tcg_env);
+            } else {
+                gen_helper_mfc0_random(arg, tcg_env);
+            }
             register_name = "Random";
             break;
         case CP0_REG01__VPECONTROL:
@@ -7393,7 +7422,11 @@ static void gen_dmtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_00:
         switch (sel) {
         case CP0_REG00__INDEX:
-            gen_helper_mtc0_index(tcg_env, arg);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mtc0_index_r3000(tcg_env, arg);
+            } else {
+                gen_helper_mtc0_index(tcg_env, arg);
+            }
             register_name = "Index";
             break;
         case CP0_REG00__MVPCONTROL:
@@ -7530,7 +7563,11 @@ static void gen_dmtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_04:
         switch (sel) {
         case CP0_REG04__CONTEXT:
-            gen_helper_mtc0_context(tcg_env, arg);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mtc0_context_r3000(tcg_env, arg);
+            } else {
+                gen_helper_mtc0_context(tcg_env, arg);
+            }
             register_name = "Context";
             break;
         case CP0_REG04__CONTEXTCONFIG:
@@ -7687,7 +7724,11 @@ static void gen_dmtc0(DisasContext *ctx, TCGv arg, int reg, int sel)
     case CP0_REGISTER_10:
         switch (sel) {
         case CP0_REG10__ENTRYHI:
-            gen_helper_mtc0_entryhi(tcg_env, arg);
+            if (disas_r3000_mmu(ctx)) {
+                gen_helper_mtc0_entryhi_r3000(tcg_env, arg);
+            } else {
+                gen_helper_mtc0_entryhi(tcg_env, arg);
+            }
             register_name = "EntryHi";
             break;
         default:
@@ -8672,6 +8713,14 @@ static void gen_cp0(CPUMIPSState *env, DisasContext *ctx, uint32_t opc,
             goto die;
         }
         gen_helper_tlbr(tcg_env);
+        break;
+    case OPC_RFE:
+        if (!disas_r3000_mmu(ctx)) {
+            goto die;
+        }
+        opn = "rfe";
+        gen_helper_rfe(tcg_env);
+        ctx->base.is_jmp = DISAS_EXIT;
         break;
     case OPC_ERET: /* OPC_ERETNC */
         if ((ctx->insn_flags & ISA_MIPS_R6) &&
@@ -15146,6 +15195,7 @@ static void mips_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
     ctx->page_start = ctx->base.pc_first & TARGET_PAGE_MASK;
     ctx->saved_pc = -1;
     ctx->insn_flags = env->insn_flags;
+    ctx->mmu_type = env->cpu_model->mmu_type;
     ctx->CP0_Config0 = env->CP0_Config0;
     ctx->CP0_Config1 = env->CP0_Config1;
     ctx->CP0_Config2 = env->CP0_Config2;

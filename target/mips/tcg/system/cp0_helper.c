@@ -28,6 +28,7 @@
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
+#include "exec/tb-flush.h"
 #include "exec/translation-block.h"
 #include "exec/target_page.h"
 
@@ -249,6 +250,12 @@ target_ulong HELPER(mfc0_mvpconf1)(CPUMIPSState *env)
 target_ulong HELPER(mfc0_random)(CPUMIPSState *env)
 {
     return (int32_t)cpu_mips_get_random(env);
+}
+
+target_ulong HELPER(mfc0_random_r3000)(CPUMIPSState *env)
+{
+    /* MIPS-I places the random TLB index in bits 13:8. */
+    return (int32_t)((cpu_mips_get_random(env) & 0x3f) << 8);
 }
 
 target_ulong HELPER(mfc0_tcstatus)(CPUMIPSState *env)
@@ -516,6 +523,12 @@ void HELPER(mtc0_index)(CPUMIPSState *env, target_ulong arg1)
     }
 }
 
+void HELPER(mtc0_index_r3000)(CPUMIPSState *env, target_ulong arg1)
+{
+    /* MIPS-I Index.P is bit 31 and the index itself lives in bits 13:8. */
+    env->CP0_Index = arg1 & (0x80000000 | 0x3f00);
+}
+
 void HELPER(mtc0_mvpcontrol)(CPUMIPSState *env, target_ulong arg1)
 {
     MIPSCPU *cpu = env_archcpu(env);
@@ -657,6 +670,17 @@ void HELPER(mtc0_entrylo0)(CPUMIPSState *env, target_ulong arg1)
     target_ulong rxi = arg1 & (env->CP0_PageGrain & (3u << CP0PG_XIE));
     env->CP0_EntryLo0 = (arg1 & MTC0_ENTRYLO_MASK(env))
                         | (rxi << (CP0EnLo_XI - 30));
+}
+
+void HELPER(mtc0_entrylo_r3000)(CPUMIPSState *env, target_ulong arg1)
+{
+    /*
+     * MIPS-I EntryLo has its PFN in bits 31:12 and N/D/V/G in bits 11:8.
+     * There is no EntryLo1 or PageMask to interpret.
+     */
+    env->CP0_EntryLo0 = arg1 & 0xffffff00;
+    env->CP0_EntryLo1 = 0;
+    env->CP0_PageMask = 0;
 }
 
 #if defined(TARGET_MIPS64)
@@ -860,6 +884,12 @@ void HELPER(dmtc0_entrylo1)(CPUMIPSState *env, uint64_t arg1)
 void HELPER(mtc0_context)(CPUMIPSState *env, target_ulong arg1)
 {
     env->CP0_Context = (env->CP0_Context & 0x007FFFFF) | (arg1 & ~0x007FFFFF);
+}
+
+void HELPER(mtc0_context_r3000)(CPUMIPSState *env, target_ulong arg1)
+{
+    /* MIPS-I Context only has a writable PTEBase in bits 31:21. */
+    env->CP0_Context = arg1 & 0xffe00000;
 }
 
 void HELPER(mtc0_memorymapid)(CPUMIPSState *env, target_ulong arg1)
@@ -1073,6 +1103,20 @@ void HELPER(mtc0_count)(CPUMIPSState *env, target_ulong arg1)
     cpu_mips_store_count(env, arg1);
 }
 
+void HELPER(mtc0_entryhi_r3000)(CPUMIPSState *env, target_ulong arg1)
+{
+    target_ulong old, val;
+    target_ulong mask = 0xfffff000 | env->CP0_EntryHi_ASID_mask;
+
+    old = env->CP0_EntryHi;
+    val = (arg1 & mask) | (old & ~mask);
+    env->CP0_EntryHi = val;
+    if ((old & env->CP0_EntryHi_ASID_mask) !=
+        (val & env->CP0_EntryHi_ASID_mask)) {
+        tlb_flush(env_cpu(env));
+    }
+}
+
 void HELPER(mtc0_entryhi)(CPUMIPSState *env, target_ulong arg1)
 {
     target_ulong old, val, mask;
@@ -1129,6 +1173,22 @@ void HELPER(mtc0_status)(CPUMIPSState *env, target_ulong arg1)
     old = env->CP0_Status;
     cpu_mips_store_status(env, arg1);
     val = env->CP0_Status;
+
+    /*
+     * MIPS-I Status.IsC redirects data accesses into the private shadow range
+     * installed by the R3000 Jazz machine.  The shadow mapping lives in the
+     * same CPUTLB entries that instruction fetches use, so both the TLB and
+     * the translated code have to be discarded when isolate-cache mode is
+     * entered or left.  Otherwise the PROM's cache-zeroing loop leaves stale
+     * KSEG0 translations that make the copied ARC code read as zeros.
+     */
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000 &&
+        ((old ^ val) & (1 << 16))) {
+        CPUState *cs = env_cpu(env);
+
+        tlb_flush(cs);
+        queue_tb_flush(cs);
+    }
 
     /*
      * R4x00 CP0 hazard: the instruction after MTC0 Status completes before

@@ -359,13 +359,26 @@ static void mips_cpu_reset_hold(Object *obj, ResetType type)
     env->CP0_Random = env->tlb->nb_tlb - 1;
     env->tlb->tlb_in_use = env->tlb->nb_tlb;
     env->CP0_Wired = 0;
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /*
+         * The R3000 PROM installs eight wired mappings and expects random
+         * TLB writes to stay above them.  MAME's MIPS-I core hardcodes the
+         * same split; QEMU's generic Random helper honours CP0_Wired.
+         */
+        env->CP0_Wired = 8;
+    }
     env->CP0_GlobalNumber = (cs->cpu_index & 0xFF) << CP0GN_VPId;
     env->CP0_EBase = KSEG0_BASE | (cs->cpu_index & 0x3FF);
     if (env->CP0_Config3 & (1 << CP0C3_CMGCR)) {
         env->CP0_CMGCRBase = 0x1fbf8000 >> 4;
     }
-    env->CP0_EntryHi_ASID_mask = (env->CP0_Config5 & (1 << CP0C5_MI)) ?
-            0x0 : (env->CP0_Config4 & (1 << CP0C4_AE)) ? 0x3ff : 0xff;
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /* MIPS-I EntryHi.ASID occupies bits 11:6. */
+        env->CP0_EntryHi_ASID_mask = 0xfc0;
+    } else {
+        env->CP0_EntryHi_ASID_mask = (env->CP0_Config5 & (1 << CP0C5_MI)) ?
+                0x0 : (env->CP0_Config4 & (1 << CP0C4_AE)) ? 0x3ff : 0xff;
+    }
     env->CP0_Status = (1 << CP0St_BEV) | (1 << CP0St_ERL);
     if (env->insn_flags & INSN_LOONGSON2F) {
         /* Loongson-2F has those bits hardcoded to 1 */

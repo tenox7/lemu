@@ -113,6 +113,125 @@ static void r4k_helper_tlbinvf(CPUMIPSState *env)
     cpu_mips_tlb_flush(env);
 }
 
+/* MIPS-I/R3000 TLB.  Unlike R4000 it has one EntryLo and single pages. */
+#define R3000_EH_VPN  0xfffff000U
+#define R3000_EH_ASID 0x00000fc0U
+#define R3000_EL_PFN  0xfffff000U
+#define R3000_EL_N    0x00000800U
+#define R3000_EL_D    0x00000400U
+#define R3000_EL_V    0x00000200U
+#define R3000_EL_G    0x00000100U
+#define R3000_PAGE_MASK 0x00000fffU
+
+static void r3000_flush_tlb_entry(CPUMIPSState *env, int idx)
+{
+    r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[idx];
+
+    if (tlb->V0 && !tlb->EHINV) {
+        tlb_flush_page(env_cpu(env), tlb->VPN);
+    }
+}
+
+static void r3000_fill_tlb(CPUMIPSState *env, int idx)
+{
+    r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[idx];
+    uint32_t entrylo = env->CP0_EntryLo0;
+
+    tlb->VPN = env->CP0_EntryHi & R3000_EH_VPN;
+    tlb->ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    tlb->MMID = env->CP0_MemoryMapID;
+    tlb->PageMask = 0;
+    tlb->G = (entrylo & R3000_EL_G) != 0;
+    tlb->V0 = (entrylo & R3000_EL_V) != 0;
+    tlb->D0 = (entrylo & R3000_EL_D) != 0;
+    /* LEMU does not emulate caches; mark MIPS-I non-cachable pages. */
+    tlb->C0 = (entrylo & R3000_EL_N) ? 2 : 3;
+    tlb->C1 = 0;
+    tlb->V1 = 0;
+    tlb->D1 = 0;
+    tlb->XI0 = tlb->XI1 = tlb->RI0 = tlb->RI1 = 0;
+    tlb->EHINV = 0;
+    tlb->PFN[0] = entrylo & R3000_EL_PFN;
+    tlb->PFN[1] = 0;
+}
+
+static void r3000_helper_tlbwi(CPUMIPSState *env)
+{
+    int idx = (env->CP0_Index >> 8) % env->tlb->nb_tlb;
+
+    r3000_flush_tlb_entry(env, idx);
+    r3000_fill_tlb(env, idx);
+}
+
+static void r3000_helper_tlbwr(CPUMIPSState *env)
+{
+    int idx = cpu_mips_get_random(env) % env->tlb->nb_tlb;
+
+    r3000_flush_tlb_entry(env, idx);
+    r3000_fill_tlb(env, idx);
+}
+
+static void r3000_helper_tlbp(CPUMIPSState *env)
+{
+    uint32_t key = env->CP0_EntryHi & (R3000_EH_VPN | R3000_EH_ASID);
+    int i;
+
+    env->CP0_Index = 0x80000000;
+    for (i = 0; i < env->tlb->nb_tlb; i++) {
+        r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
+        uint32_t mask = R3000_EH_VPN | (tlb->G ? 0 : R3000_EH_ASID);
+
+        if (!tlb->EHINV && (tlb->VPN & mask) == (key & mask)) {
+            env->CP0_Index = i << 8;
+            break;
+        }
+    }
+}
+
+static void r3000_helper_tlbr(CPUMIPSState *env)
+{
+    int idx = (env->CP0_Index >> 8) % env->tlb->nb_tlb;
+    r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[idx];
+
+    if (tlb->EHINV) {
+        env->CP0_EntryHi = 0;
+        env->CP0_EntryLo0 = 0;
+    } else {
+        env->CP0_EntryHi = (tlb->VPN & R3000_EH_VPN) |
+                           (tlb->ASID & env->CP0_EntryHi_ASID_mask);
+        env->CP0_EntryLo0 = (tlb->PFN[0] & R3000_EL_PFN) |
+                            (tlb->C0 == 2 ? R3000_EL_N : 0) |
+                            (tlb->D0 ? R3000_EL_D : 0) |
+                            (tlb->V0 ? R3000_EL_V : 0) |
+                            (tlb->G ? R3000_EL_G : 0);
+    }
+}
+
+static void r3000_helper_tlbinv(CPUMIPSState *env)
+{
+    uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    int i;
+
+    for (i = 0; i < env->tlb->nb_tlb; i++) {
+        r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
+
+        if (!tlb->G && tlb->ASID == ASID) {
+            tlb->EHINV = 1;
+        }
+    }
+    cpu_mips_tlb_flush(env);
+}
+
+static void r3000_helper_tlbinvf(CPUMIPSState *env)
+{
+    int i;
+
+    for (i = 0; i < env->tlb->nb_tlb; i++) {
+        env->tlb->mmu.r4k.tlb[i].EHINV = 1;
+    }
+    cpu_mips_tlb_flush(env);
+}
+
 static void r4k_helper_tlbwi(CPUMIPSState *env)
 {
     bool mi = !!((env->CP0_Config5 >> CP0C5_MI) & 1);
@@ -390,6 +509,40 @@ static int fixed_mmu_map_address(const CPUMIPSState *env, hwaddr *physical,
     return TLBRET_MATCH;
 }
 
+/* MIPS-I/R3000 MMU emulation */
+static int r3000_map_address(const CPUMIPSState *env, hwaddr *physical,
+                             int *prot, target_ulong address,
+                             MMUAccessType access_type)
+{
+    uint16_t ASID = env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask;
+    int i;
+
+    for (i = 0; i < env->tlb->tlb_in_use; i++) {
+        r4k_tlb_t *tlb = &env->tlb->mmu.r4k.tlb[i];
+
+        if (tlb->EHINV || (address & R3000_EH_VPN) != tlb->VPN) {
+            continue;
+        }
+        if (!tlb->G && tlb->ASID != ASID) {
+            continue;
+        }
+        if (!tlb->V0) {
+            return TLBRET_INVALID;
+        }
+        if (access_type == MMU_DATA_STORE && !tlb->D0) {
+            return TLBRET_DIRTY;
+        }
+
+        *physical = tlb->PFN[0] | (address & R3000_PAGE_MASK);
+        *prot = PAGE_READ | PAGE_EXEC;
+        if (tlb->D0) {
+            *prot |= PAGE_WRITE;
+        }
+        return TLBRET_MATCH;
+    }
+    return TLBRET_NOMATCH;
+}
+
 /* MIPS32/MIPS64 R4000-style MMU emulation */
 static int r4k_map_address(const CPUMIPSState *env, hwaddr *physical, int *prot,
                            target_ulong address, MMUAccessType access_type)
@@ -468,6 +621,18 @@ static void r4k_mmu_init(CPUMIPSState *env, const mips_def_t *def)
     env->tlb->helper_tlbinvf = r4k_helper_tlbinvf;
 }
 
+static void r3000_mmu_init(CPUMIPSState *env, const mips_def_t *def)
+{
+    env->tlb->nb_tlb = 64;
+    env->tlb->map_address = &r3000_map_address;
+    env->tlb->helper_tlbwi = r3000_helper_tlbwi;
+    env->tlb->helper_tlbwr = r3000_helper_tlbwr;
+    env->tlb->helper_tlbp = r3000_helper_tlbp;
+    env->tlb->helper_tlbr = r3000_helper_tlbr;
+    env->tlb->helper_tlbinv = r3000_helper_tlbinv;
+    env->tlb->helper_tlbinvf = r3000_helper_tlbinvf;
+}
+
 void mmu_init(CPUMIPSState *env, const mips_def_t *def)
 {
     env->tlb = g_malloc0(sizeof(CPUMIPSTLBContext));
@@ -483,6 +648,8 @@ void mmu_init(CPUMIPSState *env, const mips_def_t *def)
         fixed_mmu_init(env, def);
         break;
     case MMU_TYPE_R3000:
+        r3000_mmu_init(env, def);
+        break;
     case MMU_TYPE_R6000:
     case MMU_TYPE_R8000:
     default:
@@ -560,11 +727,19 @@ static void raise_mmu_exception(CPUMIPSState *env, target_ulong address,
     if (!(env->hflags & MIPS_HFLAG_DM)) {
         env->CP0_BadVAddr = address;
     }
-    env->CP0_Context = (env->CP0_Context & ~0x007fffff) |
-                       ((address >> 9) & 0x007ffff0);
-    env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
-                       (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
-                       (address & (TARGET_PAGE_MASK << 1));
+    if (env->cpu_model->mmu_type == MMU_TYPE_R3000) {
+        /* MIPS-I Context.BadVPN2 holds VPN bits 31:12 in bits 21:2. */
+        env->CP0_Context = (env->CP0_Context & 0xffe00000) |
+                           ((address >> 10) & 0x001ffffc);
+        env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
+                           (address & R3000_EH_VPN);
+    } else {
+        env->CP0_Context = (env->CP0_Context & ~0x007fffff) |
+                           ((address >> 9) & 0x007ffff0);
+        env->CP0_EntryHi = (env->CP0_EntryHi & env->CP0_EntryHi_ASID_mask) |
+                           (env->CP0_EntryHi & (1 << CP0EnHi_EHINV)) |
+                           (address & (TARGET_PAGE_MASK << 1));
+    }
 #if defined(TARGET_MIPS64)
     env->CP0_EntryHi &= env->SEGMask;
     env->CP0_XContext =
@@ -1047,9 +1222,33 @@ void mips_cpu_do_interrupt(CPUState *cs)
     MIPSCPU *cpu = MIPS_CPU(cs);
     CPUMIPSState *env = &cpu->env;
     bool update_badinstr = 0;
+    bool r3000 = env->cpu_model->mmu_type == MMU_TYPE_R3000;
+    bool r3000_refill = false;
     target_ulong offset;
     int cause = -1;
     uint64_t last_pc = env->active_tc.PC;
+
+    if (r3000) {
+        /*
+         * MIPS-I faults use the three-level Status pipeline rather than the
+         * MIPS32 EXL/ERL model.  The refill vector is selected by the fault
+         * address, not by EXL, and EPC is always overwritten.
+         */
+        r3000_refill = (cs->exception_index == EXCP_TLBL ||
+                        cs->exception_index == EXCP_TLBS) &&
+                       (env->error_code & EXCP_TLB_NOMATCH) &&
+                       !(env->CP0_BadVAddr & 0x80000000);
+        env->CP0_EPC = exception_resume_pc(env);
+        if (env->hflags & MIPS_HFLAG_BMASK) {
+            env->CP0_Cause |= 1U << CP0Ca_BD;
+        } else {
+            env->CP0_Cause &= ~(1U << CP0Ca_BD);
+        }
+        env->CP0_Status = (env->CP0_Status & ~0x3f) |
+                          ((env->CP0_Status << 2) & 0x3c);
+        env->hflags |= MIPS_HFLAG_CP0;
+        env->hflags &= ~MIPS_HFLAG_KSU;
+    }
 
     if (qemu_loglevel_mask(CPU_LOG_INT)
         && cs->exception_index != EXCP_EXT_INTERRUPT) {
@@ -1305,7 +1504,7 @@ void mips_cpu_do_interrupt(CPUState *cs)
         cause = 30;
         offset = 0x100;
  set_EPC:
-        if (!(env->CP0_Status & (1 << CP0St_EXL))) {
+        if (!r3000 && !(env->CP0_Status & (1 << CP0St_EXL))) {
             env->CP0_EPC = exception_resume_pc(env);
             if (update_badinstr) {
                 set_badinstr_registers(env);
@@ -1338,6 +1537,18 @@ void mips_cpu_do_interrupt(CPUState *cs)
         }
 
         env->active_tc.PC += offset;
+        if (r3000) {
+            /*
+             * MIPS-I refill/general vectors are 0x80000000/0x80000080 with
+             * BEV=0 and 0xBFC00000/0xBFC00180 with BEV=1, unlike MIPS32's
+             * 0x80000100/0x80000180 and 0xBFC00200/0xBFC00380.
+             */
+            bool bev = env->CP0_Status & (1 << CP0St_BEV);
+            target_ulong base = bev ? env->exception_base : 0x80000000u;
+
+            env->active_tc.PC = base + (r3000_refill ? 0 :
+                                        (bev ? 0x180 : 0x80));
+        }
         set_hflags_for_handler(env);
         env->CP0_Cause = (env->CP0_Cause & ~(0x1f << CP0Ca_EC)) |
                          (cause << CP0Ca_EC);

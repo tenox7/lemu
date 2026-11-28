@@ -18,6 +18,9 @@ config VGA_CIRRUS
 config G364FB
     bool
 
+config G300FB
+    bool
+
 config JAZZ_LED
     bool
 
